@@ -28,7 +28,7 @@ vLLM、llama.cpp、ollama 不會送這種標記。檢查做在這個引擎裡，
 
 引擎不另外叫一個模型來審查很長的思考。那是呼叫端的 `loop_review`，預設關。它是旁邊的決策呼叫，不是這份檢查。
 
-重複懲罰仍是抽樣前對 logits 的 scatter，見 [runtime.md](runtime.md)。它改的是下一個 token 的分數。這份檢查看的是已經寫出的 token。兩件事都在 host，都不進 forward，也不進 CUDA graph。
+重複懲罰仍是抽樣前對 logits 的 scatter，見 [runtime.md](runtime.md)。它改的是下一個 token 的分數。這份檢查看的是已經寫出的 token。懲罰是 GPU kernel，檢查在 CPU 上看 token id。兩件事都由 Rust 排程，都不進 forward，也不進 CUDA graph。
 
 ## 放在哪
 

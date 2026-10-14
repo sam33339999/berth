@@ -7,6 +7,8 @@
 
 Rust 寫 host。已經在 exllamav3 量過的 kernel 用 nvcc 編成 cubin 或靜態庫，由 Rust 用 driver API launch。
 
+「exllamav3」指 `~/qwen38-exl3-dflash2/exllamav3`（`community` 分支），也就是服務實際載入的那份 fork，不是 `~/exllamav3`。這些 kernel 的外層 launcher 吃 `at::Tensor`，Rust 這邊要寫一層吃裸指標的 shim。逐支清單見 [kernels.md](kernels.md)。
+
 cuda-oxide（NVIDIA/cuda-rust，調查時的 commit `bc46b1f`，2026-10-12）用來核對 sm_86 指令能不能表達。它是早期專案，要 pinned nightly，API 還會變。缺的指令用 `ptx_asm!`。`__CUDA_ARCH__ == 860` 這類切換用 `--device-cfg` 配 `#[cfg]`，並且和 `--arch` 維持一致。
 
 不要用 cuda-oxide 重寫 int8 GEMV、cq4 paged attention、GDN。那些 kernel 的速度在 device 碼裡。熱路徑是 inline PTX，最後都進 ptxas，decode 卡在頻寬。重寫會丟掉 wave 對齊、融合 norm 和 cq4。
@@ -19,7 +21,7 @@ cuda-oxide（NVIDIA/cuda-rust，調查時的 commit `bc46b1f`，2026-10-12）用
 - 每一塊 trellis 的泊位：VRAM、pinned RAM、SSD。搬運不改量化
 - CUDA graph 的 capture 和 launch
 - KV、GDN、PLE 的 checkpoint 和 rewind
-- 重複懲罰和抽樣。懲罰是抽樣前對 logits 的 scatter，不進 forward，也不進 graph
+- 重複懲罰和抽樣。懲罰是抽樣前對 logits 的 scatter，不進 forward，也不進 graph。懲罰和抽樣都留在 GPU，沿用 exllamav3 的 kernel（`rep_pen.cu`、`dry.cu`、`sampling_fused.cu`），由 Rust 在 graph 外面 launch。logits 不搬回 CPU，回到 host 的只有抽中的 token id
 - 生成重複檢查。抽樣後看已接受的 token，規格見 [repetition.md](repetition.md)
 - 草稿的提出、逐位置比對、退回。位置 i 的懲罰看得到同一塊裡已經接受的 token
 - Flash-Next 的 n-gram hash，和按列從 SSD 預讀
@@ -27,9 +29,17 @@ cuda-oxide（NVIDIA/cuda-rust，調查時的 commit `bc46b1f`，2026-10-12）用
 
 ## 留在 nvcc 的 kernel
 
-- int8 GEMV：sq、multi、SiLU、fused norm
-- cq4 paged attention
-- GDN recurrent，和寬讀取 b/a GEMV
+- EXL3 GEMV / GEMM：int8 GEMV（m=1 時的 `sq` kernel）、QTIP 式 GEMV、協作式 GEMM，以及合包投影用的 `mgemm`。SiLU 是另一個 launch（`silu_mul`），殘差加 norm 是 `rms_norm_res_in`
+- cq 頁寫入（`quant_cache_paged`）、RoPE
+- GDN recurrent、causal conv1d update，和寬讀取 b/a GEMV
+
+## decode attention：建置時預編的 Triton cubin
+
+cq4 paged attention 原本列在上一節。實際上 decode attention 是 Triton：`_paged_attn_decode_split_kernel` 加 `_paged_attn_decode_combine_kernel`，執行時才編成 cubin。exllamav3 裡沒有對應的 nvcc kernel。
+
+建置時用 Triton 把這兩支 kernel 預先編成 cubin，Rust 用 driver API 直接 launch，執行時不帶 Python。要編的組合是 head dim 256、這份 cache 的 cq bit，以及 split 上限（`splits_cap`）。grid 固定開到上限；實際的 split 數由 `libtorch/attention.cpp:388` 的 `split_config` 從 block table 寬度算出，和 block table、seqlens 一樣是 kernel 參數，捕捉後改參數更新，不重編。
+
+建置因此要有 Python 和 Triton。速度沿用現在的服務，不另寫 nvcc 版本。
 
 骨架、熱專家、從 RAM 或 SSD 補上來的冷專家，走的是同一支 kernel。冷專家搬的是該 expert 的 `trellis`、`suh`、`svh`。檔案裡這幾塊連續排列，miss 時一次 DMA。不另做一種量化。
 
