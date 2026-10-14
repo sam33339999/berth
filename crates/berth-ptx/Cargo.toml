@@ -1,0 +1,9 @@
+[package]
+name = "berth-ptx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "sm_86 PTX instruction catalog for the berth runtime"
+
+[dependencies]

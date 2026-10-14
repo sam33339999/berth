@@ -1,0 +1,4 @@
+/target
+ptx/out/
+**/*.cubin
+**/*.o
