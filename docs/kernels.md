@@ -62,7 +62,7 @@ q/k/v/z、o 的投影走上一節的 EXL3 Linear。
 | `_paged_attn_decode_combine_kernel` | Triton，`triton_paged.py:999` |
 | `mul_sigmoid__gr`，輸出 gate | `activation.cu` |
 
-兩支 Triton kernel 在執行時用 `triton.compile` 編成 cubin（`bc_attn.py:64`），交給 C++ 的 `TritonKernel` launch。shape 和 split 設定是 constexpr。block table 變寬時只重新捕捉；split 數變了要重新編譯。
+兩支 Triton kernel 在執行時用 `triton.compile` 編成 cubin（`bc_attn.py:64`），交給 C++ 的 `TritonKernel` launch。形狀和 cq bit 是 constexpr，split 數不是。`bc_attn.py` 檔頭註解說「split 數變了要重編」，和 `_configure` 的簽名對不上；以程式為準。splits_cap 的算法見 [runtime.md](runtime.md)。
 
 ## MLP（64 層）
 
@@ -115,6 +115,6 @@ kernel 本體（`.cuh`）大多吃裸指標。外層 launcher 吃 `at::Tensor`�
 
 ## 下一輪要對的
 
-- 預編 Triton cubin 的 `splits_cap` 取多少。262144 的 context 上限要用到的最大 split 數，從 `libtorch/attention.cpp:388` 的 `split_config` 算出來。
-- 停下服務後用 `nsys` 跑一段短 decode，對每個 token 實際 launch 的 kernel 名稱，以及每條張量走的是 int8 GEMV、GEMV 還是 GEMM。
+- 用 `nsys` 跑一段短 decode，對每個 token 實際 launch 的 kernel 名稱，以及每條張量走的是 int8 GEMV、GEMV 還是 GEMM。`hgemm`（cuBLAS）有沒有出現也一起看。要等 `:8889` 的服務停下來才跑：它佔著約 22 GB VRAM，再開一個 27B 會 OOM，也會把服務拖垮。
+- 82 個 SM 是 3090 的規格值，沒有在這台機器上讀 `multi_processor_count`。和上一項一起確認。
 - 這份只涵蓋 27B。另外三個目標要加的 kernel（MoE、QSA、PLE、視覺塔）見 [models.md](models.md)，還沒有清單。

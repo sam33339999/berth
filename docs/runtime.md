@@ -37,7 +37,9 @@ cuda-oxide（NVIDIA/cuda-rust，調查時的 commit `bc46b1f`，2026-10-12）用
 
 cq4 paged attention 原本列在上一節。實際上 decode attention 是 Triton：`_paged_attn_decode_split_kernel` 加 `_paged_attn_decode_combine_kernel`，執行時才編成 cubin。exllamav3 裡沒有對應的 nvcc kernel。
 
-建置時用 Triton 把這兩支 kernel 預先編成 cubin，Rust 用 driver API 直接 launch，執行時不帶 Python。要編的組合是 head dim 256、這份 cache 的 cq bit，以及 split 上限（`splits_cap`）。grid 固定開到上限；實際的 split 數由 `libtorch/attention.cpp:388` 的 `split_config` 從 block table 寬度算出，和 block table、seqlens 一樣是 kernel 參數，捕捉後改參數更新，不重編。
+建置時用 Triton 把這兩支 kernel 預先編成 cubin，Rust 用 driver API 直接 launch，執行時不帶 Python。cubin 裡的 constexpr 是形狀和 cache 設定：head dim 256、24 Q head、4 KV head、`q_len`、K 和 V 的 cq bit。27B 自回歸只要一支 split 加一支 combine；換 cq bit 就再編一份。DFlash2 驗證窗的 `q_len` 不同，到時候另編。
+
+split 數不進 cubin。`splits_cap` 只決定 grid 和 partial buffer 的大小，公式在 `bc_attn.py` 的 `_configure`：`min(2 × SM 數 / programs, 128)`。3090 有 82 個 SM，27B decode 的 programs 是 4，所以上限是 41，grid 是 4 × 41。實際的 split 數由 `libtorch/attention.cpp:388` 的 `split_config` 從 block table 寬度算出：`ceil((頁數 × 256 + 1) / 128)`，再夾到 41。超過約 5200 token 就固定是 41。它和 block table、seqlens 一樣是 kernel 參數，捕捉後改參數更新，不重編。
 
 建置因此要有 Python 和 Triton。速度沿用現在的服務，不另寫 nvcc 版本。
 
