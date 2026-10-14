@@ -60,10 +60,20 @@ LayerPlan
 
 ## 順序
 
-1. Qwen3.8-27B，自回歸。鎖頻 1500 MHz 對上短 context 約 49 tok/s，262k、cq4、沒有草稿約 25 tok/s。decode KL 低於約 5e-4 當雜訊。對不上就先修 runtime。
-2. 同一條 target 加 frozen SAM。走通 accept、rewind、逐位置懲罰。
-3. DFlash2。target 在指定層留下 activation，草稿用自己的 cache。
-4. MoE schedule。MiniCPM 在這張卡上先整包進 VRAM。
-5. Flash-Next 的三層泊位。等 27B 的 rewind 是對的再做。
+按架構搬，名稱是 exllamav3 fork 的 `arch_string`：
+
+| 階段 | 架構 | 模型 |
+|---|---|---|
+| 1 | `Qwen3_5ForConditionalGeneration` | Qwen3.8-27B |
+| 2 | `Qwen3_5MoeForConditionalGeneration` | Qwen3.6-35B-A3B |
+| 3 | `MiniCPMV4_7ForConditionalGeneration` | MiniCPM-V 4.7 35B-A3B |
+| 4 | `Qwen4ExpForConditionalGeneration` | Qwen3.8-Flash-Next |
+
+1. Qwen3.8-27B，自回歸。鎖頻 1500 MHz 對上短 context 約 49 tok/s，262k、cq4、沒有草稿約 25 tok/s。decode KL 低於約 5e-4 當雜訊。對不上就先修 runtime。shim、graph、抽樣都在這一步對過，因為只有 27B 有正在跑的服務和量過的數字可以比。kernel 清單見 [kernels.md](kernels.md)
+   - 同一條 target 加 frozen SAM。走通 accept、rewind、逐位置懲罰
+   - DFlash2。target 在指定層留下 activation，草稿用自己的 cache
+2. Qwen3.6-35B-A3B。GDN 和 attention 沿用第 1 步，GatedMLP 換成 MoE 加 shared expert。新的只有 MoE kernel 和專家排程。這台機器上只有它的 GGUF，EXL3 要先轉或下載
+3. MiniCPM-V 4.7。文字堆疊和第 2 步同形，多一個 SigLIP2 視覺塔，只在 prefill 跑。這張卡上先整包進 VRAM。本機還沒有這份 checkpoint
+4. Flash-Next 的三層泊位。QSA、hyper-connection、PLE n-gram 表。等 27B 的 rewind 是對的再做
 
 CPU 上的 MoE 路徑只會是 AVX2+FMA+F16C。這顆 CPU 沒有 AVX-512，也不要把 miss 的 expert 改在 CPU 上算。
