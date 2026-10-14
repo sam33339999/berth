@@ -1,6 +1,6 @@
 # 模型
 
-四個目標都走同一份 `LayerPlan`。數字是 2026-10-14 的估算，實作時以各 checkpoint 的 `config.json` 為準。
+四個目標都走同一份 `LayerPlan`，權重都是 EXL3，見 [exl3.md](exl3.md)。下面的體積是 `參數數 × bpw / 8` 的 trellis 主體估算，不含 `suh` / `svh`。實作時以該 checkpoint 的張量為準。Strata 的 GGUF 體積不在這裡用。
 
 ## Qwen3.8-27B
 
@@ -30,7 +30,7 @@ OpenBMB 的 checkpoint，不是 Qwen 的權重。外層類別 `MiniCPMV4_7ForCon
 
 文字堆疊：40 層、hidden 2048、256 expert、每 token 開 8 個、intermediate 512、每層一個 shared expert。30 層 GDN、10 層 full attention。
 
-| 部分 | 參數 | 4-bit | 每 token |
+| 部分 | 參數 | EXL3 4 bpw 估算 | 每 token |
 |---|---|---|---|
 | Routed experts | 32.2B | 16.1 GB | 8/256，約 0.50 GB |
 | 骨架（GDN、attention、shared、router、embedding、lm_head） | 約 2.4B | 約 1.2 GB | 整份 |
@@ -39,7 +39,7 @@ OpenBMB 的 checkpoint，不是 Qwen 的權重。外層類別 `MiniCPMV4_7ForCon
 
 「A3B」是約 2.4B 的常駐骨架，加上當下選中、每個 token 會換的約 1.0B expert。
 
-4-bit 整包約 17.6 GB。full attention 只有 10 層、2 個 KV head、head dim 256，fp16 KV 約 20 KB/token，128k 約 2.5 GB。加起來約 20 GB，放得進 24 GB。embedding 和 lm_head 若維持 fp16 會再多約 1.5 GB。GDN 狀態約 60 MB。
+EXL3 4 bpw 的主體估算約 17.6 GB。full attention 只有 10 層、2 個 KV head、head dim 256，fp16 KV 約 20 KB/token，128k 約 2.5 GB。加起來約 20 GB，放得進 24 GB。embedding 和 lm_head 的預設是 fp16（`--embed_bits 16`），約再多 1 GB 的表，加上同樣大小的 `lm_head` 若用預設 6 bit 則比 4 bpw 略大。GDN 狀態約 60 MB。
 
 這張卡的預設是整包住 VRAM。RAM 只在桌面吃掉 VRAM、或專家用更高 bit 時當溢位。專家若留在 RAM，40 層 × 8 × 約 1.6 MB ≈ 500 MB/token，PCIe 3.0 上拷貝就要約 40 ms。
 
@@ -51,7 +51,7 @@ OpenBMB 的 checkpoint，不是 Qwen 的權重。外層類別 `MiniCPMV4_7ForCon
 
 這張表是模型本體的 PLE。它不是草稿模型，也不是 frozen SAM 語料。
 
-Q2 專家合計約 34 GB，一個約 1.5 MB，共 24,576 個。n-gram 表約 29 GB。常駐骨架只有幾個 GB。32 GB 記憶體 pin 不住全部專家，實用上限約 18–20 GB。專家全放 RAM 要 48 GB 起。
+專家是 EXL3 Linear（或融合後的 `gate_up_proj` / `down_proj`），n-gram 是同一目錄裡的 `ngram_embedding.safetensors`（`exl3_ngram_trellis`，`--ngram_bits`）。主體 125B 在 4 bpw 約 62 GB，2 bpw 仍約 31 GB，都超過這台 32 GB 記憶體能 pin 的 18–20 GB。表的大小是 `51e9 × ngram_bits / 8` 加上每列的 scale 和 head bias。具體泊位看那一份 checkpoint 的 `K`，不看 Strata 的 Q2。
 
 泊位見 [memory.md](memory.md)。MTP 約 6 GB，會和專家的 RAM 預算搶，這台先不要加。
 

@@ -15,8 +15,8 @@ cuda-oxide（NVIDIA/cuda-rust，調查時的 commit `bc46b1f`，2026-10-12）用
 
 ## Rust 擁有
 
-- safetensors 和 `config.json`，編成層計畫
-- 每一塊權重的泊位：VRAM、pinned RAM、SSD
+- EXL3 的 safetensors 和 `config.json`，編成層計畫。格式見 [exl3.md](exl3.md)
+- 每一塊 trellis 的泊位：VRAM、pinned RAM、SSD。搬運不改量化
 - CUDA graph 的 capture 和 launch
 - KV、GDN、PLE 的 checkpoint 和 rewind
 - 重複懲罰和抽樣。懲罰是抽樣前對 logits 的 scatter，不進 forward，也不進 graph
@@ -30,7 +30,7 @@ cuda-oxide（NVIDIA/cuda-rust，調查時的 commit `bc46b1f`，2026-10-12）用
 - cq4 paged attention
 - GDN recurrent，和寬讀取 b/a GEMV
 
-骨架和熱專家走這條路。冷專家是一段連續、好 DMA 的 bytes，搬上 GPU 再解。EXL3 trellis 適合常駐權重，不適合約 1.5 MB 的 PCIe 搬運。
+骨架、熱專家、從 RAM 或 SSD 補上來的冷專家，走的是同一支 kernel。冷專家搬的是該 expert 的 `trellis`、`suh`、`svh`。檔案裡這幾塊連續排列，miss 時一次 DMA。不另做一種量化。
 
 ## Schedule
 

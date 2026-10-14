@@ -1,11 +1,16 @@
 # berth
 
-這台機器（一張 RTX 3090、32 GB 記憶體）的推論 runtime。Rust 決定每一塊權重的泊位，CUDA kernel 負責計算。
+這台機器（一張 RTX 3090、32 GB 記憶體）的推論 runtime。服務的權重是 exllamav3 的 EXL3。Rust 決定每一塊 trellis 的泊位，CUDA kernel 直接對那些張量做計算。
 
-泊位有三層：VRAM、pinned RAM、SSD。名字來自這裡。Qwen3.8-27B 整包在 VRAM。MiniCPM-V 4.7 35B-A3B 的 4-bit 也放得進這張卡。Qwen3.8-Flash-Next 的專家和 n-gram 表才需要三層一起用。
+## 名稱
+
+berth 是船隻靠岸時分配到的泊位。這個 runtime 第一件要決定的事，就是每塊權重停在哪一層：VRAM、pinned RAM，還是 SSD。
+
+取這個名字是為了這條放置規則。Qwen3.8-27B 的 EXL3 整包停在 VRAM。MiniCPM-V 4.7 35B-A3B 在 4 bpw 也停得進這張卡。Qwen3.8-Flash-Next 的專家 trellis 和 n-gram 表才要三層一起排。家目錄裡沒有同名目錄，也避開了當時在看的 Strata。
 
 ## 規格
 
+- [docs/exl3.md](docs/exl3.md)：服務格式。EXL3 trellis，含 n-gram 表和 KV cache
 - [docs/runtime.md](docs/runtime.md)：Rust 寫 host，已量過的 kernel 繼續用 nvcc
 - [docs/models.md](docs/models.md)：Qwen3.8-27B、Qwen3.6-35B-A3B、MiniCPM-V 4.7 35B-A3B、Qwen3.8-Flash-Next
 - [docs/memory.md](docs/memory.md)：三層泊位
