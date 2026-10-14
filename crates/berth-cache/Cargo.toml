@@ -1,0 +1,9 @@
+[package]
+name = "berth-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Paged KV prefix table for the berth runtime"
+
+[dependencies]

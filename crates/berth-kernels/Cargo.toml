@@ -1,0 +1,10 @@
+[package]
+name = "berth-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "exllamav3 kernel bindings for the berth runtime"
+
+[dependencies]
+berth-cuda = { path = "../berth-cuda" }

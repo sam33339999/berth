@@ -1,0 +1,9 @@
+[package]
+name = "berth-repetition"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Generation repetition check for the berth runtime"
+
+[dependencies]

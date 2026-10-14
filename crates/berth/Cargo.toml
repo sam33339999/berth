@@ -1,0 +1,10 @@
+[package]
+name = "berth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "berth inference server"
+
+[dependencies]
+berth-engine = { path = "../berth-engine" }

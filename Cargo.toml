@@ -1,6 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/berth-ptx"]
+members = [
+    "crates/berth-ptx",
+    "crates/berth-exl3",
+    "crates/berth-plan",
+    "crates/berth-cache",
+    "crates/berth-repetition",
+    "crates/berth-cuda",
+    "crates/berth-kernels",
+    "crates/berth-engine",
+    "crates/berth",
+]
 
 [workspace.package]
 version = "0.1.0"

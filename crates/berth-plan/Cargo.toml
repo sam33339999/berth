@@ -1,0 +1,10 @@
+[package]
+name = "berth-plan"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Layer plan and tensor placement for the berth runtime"
+
+[dependencies]
+berth-exl3 = { path = "../berth-exl3" }

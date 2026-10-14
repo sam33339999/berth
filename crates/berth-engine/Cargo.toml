@@ -1,0 +1,15 @@
+[package]
+name = "berth-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Forward pass and decode loop for the berth runtime"
+
+[dependencies]
+berth-exl3 = { path = "../berth-exl3" }
+berth-plan = { path = "../berth-plan" }
+berth-cache = { path = "../berth-cache" }
+berth-repetition = { path = "../berth-repetition" }
+berth-cuda = { path = "../berth-cuda" }
+berth-kernels = { path = "../berth-kernels" }

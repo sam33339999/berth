@@ -17,6 +17,7 @@ berth 是船隻靠岸時分配到的泊位。這個 runtime 第一件要決定�
 - [docs/memory.md](docs/memory.md)：三層泊位
 - [docs/cache.md](docs/cache.md)：多人共用一塊頁池時，前綴怎麼留
 - [docs/ptx.md](docs/ptx.md)：sm_86 要組過的指令，和 cuda-oxide 還沒有的那些
+- [docs/workspace.md](docs/workspace.md)：工作區怎麼切 crate，每個 crate 放什麼
 - [docs/kernels.md](docs/kernels.md)：27B decode 每個 token 呼叫的 kernel，以及 Rust shim 要換掉的那一層
 
 ## 測試

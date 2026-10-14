@@ -3,5 +3,54 @@
 version = 4
 
 [[package]]
+name = "berth"
+version = "0.1.0"
+dependencies = [
+ "berth-engine",
+]
+
+[[package]]
+name = "berth-cache"
+version = "0.1.0"
+
+[[package]]
+name = "berth-cuda"
+version = "0.1.0"
+
+[[package]]
+name = "berth-engine"
+version = "0.1.0"
+dependencies = [
+ "berth-cache",
+ "berth-cuda",
+ "berth-exl3",
+ "berth-kernels",
+ "berth-plan",
+ "berth-repetition",
+]
+
+[[package]]
+name = "berth-exl3"
+version = "0.1.0"
+
+[[package]]
+name = "berth-kernels"
+version = "0.1.0"
+dependencies = [
+ "berth-cuda",
+]
+
+[[package]]
+name = "berth-plan"
+version = "0.1.0"
+dependencies = [
+ "berth-exl3",
+]
+
+[[package]]
 name = "berth-ptx"
+version = "0.1.0"
+
+[[package]]
+name = "berth-repetition"
 version = "0.1.0"
