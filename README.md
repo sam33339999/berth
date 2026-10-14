@@ -12,8 +12,10 @@ berth 是船隻靠岸時分配到的泊位。這個 runtime 第一件要決定�
 
 - [docs/exl3.md](docs/exl3.md)：服務格式。EXL3 trellis，含 n-gram 表和 KV cache
 - [docs/runtime.md](docs/runtime.md)：Rust 寫 host，已量過的 kernel 繼續用 nvcc
+- [docs/repetition.md](docs/repetition.md)：抽樣後檢查已接受的 token，串流裡送重複標記
 - [docs/models.md](docs/models.md)：Qwen3.8-27B、Qwen3.6-35B-A3B、MiniCPM-V 4.7 35B-A3B、Qwen3.8-Flash-Next
 - [docs/memory.md](docs/memory.md)：三層泊位
+- [docs/cache.md](docs/cache.md)：多人共用一塊頁池時，前綴怎麼留
 - [docs/ptx.md](docs/ptx.md)：sm_86 要組過的指令，和 cuda-oxide 還沒有的那些
 
 ## 測試

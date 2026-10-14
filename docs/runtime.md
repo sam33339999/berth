@@ -20,6 +20,7 @@ cuda-oxide（NVIDIA/cuda-rust，調查時的 commit `bc46b1f`，2026-10-12）用
 - CUDA graph 的 capture 和 launch
 - KV、GDN、PLE 的 checkpoint 和 rewind
 - 重複懲罰和抽樣。懲罰是抽樣前對 logits 的 scatter，不進 forward，也不進 graph
+- 生成重複檢查。抽樣後看已接受的 token，規格見 [repetition.md](repetition.md)
 - 草稿的提出、逐位置比對、退回。位置 i 的懲罰看得到同一塊裡已經接受的 token
 - Flash-Next 的 n-gram hash，和按列從 SSD 預讀
 - 對外的服務

@@ -42,4 +42,4 @@ MoE 的一個 expert 是三條 EXL3 Linear（gate、up、down），或已經融�
 
 ## KV
 
-cache 沿用 exllamav3 的量化 cache（`-cq`，2 到 8 bit）。這台機器上 Qwen3.8-27B 已量過的部署選擇是 cq4。KV 量化不是權重格式，但它是同一套服務設定，不另發明一種 cache。
+cache 沿用 exllamav3 的量化 cache（`-cq`，2 到 8 bit）。這台機器上 Qwen3.8-27B 已量過的部署選擇是 cq4。KV 量化不是權重格式，但它是同一套服務設定，不另發明一種 cache。多人怎麼共用這塊 cache，見 [cache.md](cache.md)。
