@@ -28,7 +28,7 @@ crates/
 | crate | 內容 | 規格 | 預計的外部依賴 |
 |---|---|---|---|
 | `berth-exl3` | `config.json` 和 `.safetensors`。每條 Linear 的 `trellis`、`suh` / `svh`、bias、mcg 或 mul1、K。打包的 `su` / `sv` 在這裡解開 | [exl3.md](exl3.md) | `serde_json`、`thiserror`。safetensors header 自己解，沒用 `safetensors` crate |
-| `berth-plan` | 依 `arch_string` 建 `LayerPlan`。決定每塊張量停 VRAM、pinned RAM 還是 SSD | [runtime.md](runtime.md)、[memory.md](memory.md) | `thiserror` |
+| `berth-plan` | 依 `arch_string` 建 `LayerPlan`。決定每塊張量停 VRAM、pinned RAM 還是 SSD | [runtime.md](runtime.md)、[memory.md](memory.md) | `thiserror`。`from_exl3` 把 checkpoint 轉成 `ModelShape` 和 `TensorBytes`，視覺塔（`model.visual.`）和 MTP（`mtp.`）不算進 decode |
 | `berth-cache` | 滿頁的 blake2b-128 鏈式 hash、`ref_count`、以根的 `access_serial` 做樹狀驅逐、GDN checkpoint 的鍵、rewind 的記帳。只處理頁號，不碰 GPU 記憶體 | [cache.md](cache.md) | `blake2` |
 | `berth-repetition` | `thinking` / `response` 兩個緩衝區、尾端和原樣檢查、標記字串、256 byte 和 64 條的上限 | [repetition.md](repetition.md) | 無 |
 | `berth-cuda` | device 和 pinned 記憶體、stream、event。捕捉後能改 kernel 參數的 graph，取代 `graph.cu`。cubin 載入，取代 `TritonKernel`。SM 數和 GEMM locks，取代 `DevCtx` | [kernels.md](kernels.md) | `cudarc` |
@@ -84,7 +84,6 @@ shim 放在 `crates/berth-kernels` 裡，只 include fork 的 `.cuh`。fork 外�
 
 ## 純 Rust 四個的待辦
 
-- `berth-plan` 還不依賴 `berth-exl3`，用自己的 `ModelShape` 當輸入。從 checkpoint 的 config 轉成 `ModelShape` 的那層還沒寫
 - `berth-repetition`：原樣重複每長一輪送一條 `64x2`、`64x3`……，長迴圈可能把 64 條標記用完，之後的尾端標記送不出去。這是照 [repetition.md](repetition.md) 字面寫的，要不要改還沒定
 - `berth-cache`：驅逐時「斷掉的鏈」那段沒有專門的測試。要補一個和 Python 頁表並排跑的對照測試
 - `thiserror` 用的是 1.x，之後統一版本

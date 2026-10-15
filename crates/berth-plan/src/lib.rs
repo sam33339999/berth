@@ -19,6 +19,7 @@
 //! * Dense MLP intermediate width is not on [`ModelShape`]. [`Ffn::DenseMlp`]
 //!   records the module kind; the checkpoint reader owns the width.
 
+pub mod from_exl3;
 mod place;
 mod plan;
 mod shape;

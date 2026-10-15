@@ -1,8 +1,7 @@
 //! Checkpoint shape that [`crate::build_plan`] consumes.
 //!
-//! `berth-exl3` is not a dependency of this crate yet. The reader maps
-//! `config.json` onto [`ModelShape`] and the safetensors byte sizes onto
-//! [`crate::TensorBytes`].
+//! [`crate::from_exl3::model_shape`] builds one from `berth-exl3`'s
+//! `ModelConfig`. The plan itself does not read the checkpoint.
 
 use std::fmt;
 

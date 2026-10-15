@@ -51,6 +51,7 @@ dependencies = [
 name = "berth-plan"
 version = "0.1.0"
 dependencies = [
+ "berth-exl3",
  "thiserror",
 ]
 
