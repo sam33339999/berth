@@ -23,9 +23,11 @@ berth 是船隻靠岸時分配到的泊位。這個 runtime 第一件要決定�
 ## 測試
 
 ```bash
-cargo test -p berth-ptx
+cargo test
 ```
 
-`ptx/sm86_probes.cu` 的每一條 `// PROBE` 都要被 `nvcc -arch=sm_86` 組進 cubin。`add.rn.f32.f16` 必須被 ptxas 拒絕。目錄在 `crates/berth-ptx`，和探针註解不一致時測試會失敗。
+整個工作區的測試都不碰 GPU。`berth-exl3` 的 27B 測試讀 `BERTH_27B_DIR`（預設 `~/qwen38-exl3-dflash2/models/qwen38-27b-exl3`）的 checkpoint header，目錄不在就跳過。
+
+`ptx/sm86_probes.cu` 的每一條 `// PROBE` 都要被 `nvcc -arch=sm_86` 組進 cubin。`add.rn.f32.f16` 必須被 ptxas 拒絕。這部分在 `crates/berth-ptx`，和探针註解不一致時測試會失敗。
 
 cuda-oxide 還沒有接進這個 crate。調查時的 commit 是 `bc46b1f`，它要 nightly。缺的指令以後用 `ptx_asm!` 補，見規格。

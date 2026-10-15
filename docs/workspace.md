@@ -1,6 +1,6 @@
 # 工作區
 
-日期：2026-10-15。這份寫 Rust 工作區怎麼切 crate、每個 crate 放什麼。現在每個 crate 只有骨架，`cargo build` 會過，沒有實作。
+日期：2026-10-15。這份寫 Rust 工作區怎麼切 crate、每個 crate 放什麼。純 Rust 的四個（`berth-exl3`、`berth-plan`、`berth-cache`、`berth-repetition`）已經實作並有測試。碰 GPU 的三個和 `berth` 還是骨架。
 
 ## 切法
 
@@ -27,8 +27,8 @@ crates/
 
 | crate | 內容 | 規格 | 預計的外部依賴 |
 |---|---|---|---|
-| `berth-exl3` | `config.json` 和 `.safetensors`。每條 Linear 的 `trellis`、`suh` / `svh`、bias、mcg 或 mul1、K。打包的 `su` / `sv` 在這裡解開 | [exl3.md](exl3.md) | `safetensors`、`serde_json` |
-| `berth-plan` | 依 `arch_string` 建 `LayerPlan`。決定每塊張量停 VRAM、pinned RAM 還是 SSD | [runtime.md](runtime.md)、[memory.md](memory.md) | 無 |
+| `berth-exl3` | `config.json` 和 `.safetensors`。每條 Linear 的 `trellis`、`suh` / `svh`、bias、mcg 或 mul1、K。打包的 `su` / `sv` 在這裡解開 | [exl3.md](exl3.md) | `serde_json`、`thiserror`。safetensors header 自己解，沒用 `safetensors` crate |
+| `berth-plan` | 依 `arch_string` 建 `LayerPlan`。決定每塊張量停 VRAM、pinned RAM 還是 SSD | [runtime.md](runtime.md)、[memory.md](memory.md) | `thiserror` |
 | `berth-cache` | 滿頁的 blake2b-128 鏈式 hash、`ref_count`、以根的 `access_serial` 做樹狀驅逐、GDN checkpoint 的鍵、rewind 的記帳。只處理頁號，不碰 GPU 記憶體 | [cache.md](cache.md) | `blake2` |
 | `berth-repetition` | `thinking` / `response` 兩個緩衝區、尾端和原樣檢查、標記字串、256 byte 和 64 條的上限 | [repetition.md](repetition.md) | 無 |
 | `berth-cuda` | device 和 pinned 記憶體、stream、event。捕捉後能改 kernel 參數的 graph，取代 `graph.cu`。cubin 載入，取代 `TritonKernel`。SM 數和 GEMM locks，取代 `DevCtx` | [kernels.md](kernels.md) | `cudarc` |
@@ -36,7 +36,7 @@ crates/
 | `berth-engine` | 照 `LayerPlan` 跑 forward、捕捉 graph、decode 迴圈、GPU 上的懲罰和抽樣，把接受的 token 交給重複檢查。之後的草稿 accept / rewind 也在這裡 | [runtime.md](runtime.md) | 無 |
 | `berth` | OpenAI 相容的 HTTP、SSE（含 `response.repetition_check`）、tokenizer、chat template、CLI | [cache.md](cache.md)、[repetition.md](repetition.md) | `axum`、`tokenizers`、`minijinja`、`clap` |
 
-外部依賴等寫到那段程式時才加。骨架裡只有 crate 之間的 path 依賴。
+外部依賴等寫到那段程式時才加。
 
 ## 依賴方向
 
@@ -81,3 +81,10 @@ shim 放在 `crates/berth-kernels` 裡，只 include fork 的 `.cuh`。fork 外�
 3. `berth-cache`、`berth-repetition`：照規格寫，加單元測試
 4. `berth-cuda`、`berth-kernels`：先只 shim 一支 `exl3_gemm`。服務停下來時，拿一條張量和 exllamav3 的輸出對
 5. `berth-engine`、`berth`：一個 token 跑通，再接成迴圈
+
+## 純 Rust 四個的待辦
+
+- `berth-plan` 還不依賴 `berth-exl3`，用自己的 `ModelShape` 當輸入。從 checkpoint 的 config 轉成 `ModelShape` 的那層還沒寫
+- `berth-repetition`：原樣重複每長一輪送一條 `64x2`、`64x3`……，長迴圈可能把 64 條標記用完，之後的尾端標記送不出去。這是照 [repetition.md](repetition.md) 字面寫的，要不要改還沒定
+- `berth-cache`：驅逐時「斷掉的鏈」那段沒有專門的測試。要補一個和 Python 頁表並排跑的對照測試
+- `thiserror` 用的是 1.x，之後統一版本

@@ -7,3 +7,4 @@ publish.workspace = true
 description = "Paged KV prefix table for the berth runtime"
 
 [dependencies]
+blake2 = "0.10"

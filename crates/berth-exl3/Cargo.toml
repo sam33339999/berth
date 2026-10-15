@@ -7,3 +7,5 @@ publish.workspace = true
 description = "EXL3 checkpoint reader for the berth runtime"
 
 [dependencies]
+serde_json = "1"
+thiserror = "1"
