@@ -31,7 +31,7 @@ crates/
 | `berth-plan` | 依 `arch_string` 建 `LayerPlan`。決定每塊張量停 VRAM、pinned RAM 還是 SSD | [runtime.md](runtime.md)、[memory.md](memory.md) | `thiserror`。`from_exl3` 把 checkpoint 轉成 `ModelShape` 和 `TensorBytes`，視覺塔（`model.visual.`）和 MTP（`mtp.`）不算進 decode |
 | `berth-cache` | 滿頁的 blake2b-128 鏈式 hash、`ref_count`、以根的 `access_serial` 做樹狀驅逐、GDN checkpoint 的鍵、rewind 的記帳。只處理頁號，不碰 GPU 記憶體 | [cache.md](cache.md) | `blake2` |
 | `berth-repetition` | `thinking` / `response` 兩個緩衝區、尾端和原樣檢查、標記字串、256 byte 和 64 條的上限 | [repetition.md](repetition.md) | 無 |
-| `berth-cuda` | device 和 pinned 記憶體、stream、event。捕捉後能改 kernel 參數的 graph，取代 `graph.cu`。cubin 載入，取代 `TritonKernel`。SM 數和 GEMM locks，取代 `DevCtx` | [kernels.md](kernels.md) | `cudarc` |
+| `berth-cuda` | device 和 pinned 記憶體、stream、event。捕捉後能改 kernel 參數的 graph，取代 `graph.cu`。cubin 載入，取代 `TritonKernel`。SM 數和 GEMM locks，取代 `DevCtx` | [kernels.md](kernels.md) | `cuda-core =0.4.0`，見下一節 |
 | `berth-kernels` | `build.rs` 用 nvcc 把 shim 和 fork 的 `.cuh` 編成靜態庫。`extern "C"` 宣告和安全包裝。執行時載入預編的 attention cubin | [kernels.md](kernels.md) | `cc` |
 | `berth-engine` | 照 `LayerPlan` 跑 forward、捕捉 graph、decode 迴圈、GPU 上的懲罰和抽樣，把接受的 token 交給重複檢查。之後的草稿 accept / rewind 也在這裡 | [runtime.md](runtime.md) | 無 |
 | `berth` | OpenAI 相容的 HTTP、SSE（含 `response.repetition_check`）、tokenizer、chat template、CLI | [cache.md](cache.md)、[repetition.md](repetition.md) | `axum`、`tokenizers`、`minijinja`、`clap` |
@@ -50,6 +50,22 @@ berth
 ```
 
 依賴只往下指。純 Rust 的四個不依賴 `berth-cuda`。
+
+## berth-cuda 的底層
+
+底下用 `cuda-core`，版本鎖死 `=0.4.0`。它是 `NVIDIA/cuda-rust` 的 host 端 runtime，和寫 device 碼的 cuda-oxide 同一個 repo（調查時是 `bc46b1f`）。host 端這幾個 crate 走 stable，不用 nightly。建置時 `cuda-bindings` 用 bindgen 讀 `cuda.h`，要 libclang。
+
+它已經有的：device 記憶體、`PinnedHostBuffer`、stream、event、從檔案或位元組載 cubin、吃原始參數陣列的 `launch_kernel`、`multiprocessor_count`。
+
+它沒有的：graph 只到 `begin_capture` / `end_capture`，拿回原始的 `CUgraph`。instantiate、launch、捕捉後改 kernel 參數（`cuGraphExecKernelNodeSetParams`），要在 `berth-cuda` 裡用 `cuda_core::sys` 自己包。這就是取代 `graph.cu` 的那一段。
+
+cuda-core 自己寫明是早期研究專案，API 會改。`berth-cuda` 是隔開它的那一層：
+
+- 公開 API 不露出 `cuda_core` 的任何型別。上層只看到 `berth-cuda` 自己的型別，例如 `DevicePtr`、`Stream`、`Event`、`Graph`、`Cubin`、`PinnedBuf`
+- 錯誤轉成 `berth-cuda` 自己的錯誤型別，不讓 `DriverError` 漏出去
+- 不 `pub use cuda_core::sys`。上層要原始呼叫，就在 `berth-cuda` 裡包一支
+
+這樣 cuda-core 改版，只改 `berth-cuda`。要換回 `cudarc`，或直接用 bindgen 綁 driver API，影響也只在這個 crate 裡。`cudarc` 有沒有包「捕捉後改參數」沒有查過；先用 cuda-core 寫，以後要換再比。
 
 ## exllamav3 原始碼
 
@@ -86,4 +102,3 @@ shim 放在 `crates/berth-kernels` 裡，只 include fork 的 `.cuh`。fork 外�
 
 - `berth-repetition`：原樣重複每長一輪送一條 `64x2`、`64x3`……，長迴圈可能把 64 條標記用完，之後的尾端標記送不出去。這是照 [repetition.md](repetition.md) 字面寫的，要不要改還沒定
 - `berth-cache`：驅逐時「斷掉的鏈」那段沒有專門的測試。要補一個和 Python 頁表並排跑的對照測試
-- `thiserror` 用的是 1.x，之後統一版本
