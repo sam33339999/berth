@@ -7,21 +7,22 @@ with the same `triton.compile` arguments `BCAttn._configure` uses
 num_stages. The slot is autoregressive decode, q_len 1, causal, cq3 K and V.
 `splits_cap` is not a constexpr.
 
-Also JIT-captures `_paged_attn_prefill_kernel` by calling
-`paged_attn_triton_prefill` (`triton_paged.py`) with `EXL3_QC_STAGING=1`,
-once for every specialization class the 27B full-attention prefill can
-launch while it stays unsplit. Triton specializes each integer runtime
-argument of that kernel: value 1 becomes a constexpr (the parameter drops
+Also JIT-captures `_paged_attn_prefill_kernel` and, when `num_splits > 1`,
+`_paged_attn_prefill_combine_kernel`, by calling `paged_attn_triton_prefill`
+(`triton_paged.py`) with `EXL3_QC_STAGING=1`, once for every specialization
+class the 27B full-attention prefill can launch. Triton specializes each
+integer runtime argument: value 1 becomes a constexpr (the parameter drops
 out of the launch), a value divisible by 16 is a separate cubin with
 `tt.divisibility = 16`, and any other value is a plain i32. The specialized
-integers are `num_splits`, `q_len`, `kv_append_len`, `num_pages_per_seq`,
-`WINDOW_LEFT`, and `WINDOW_RIGHT`. On this path `kv_append_len` equals
-`q_len`, both windows are -1, and `num_splits` is 1, so the captured product
-is the qc path and the fp16 staging path, each over the q_len classes and
-page-count classes those calls can actually take. Cubins are named by that
-class and the class key is recorded in manifest.json. Decode cubin bytes
-are checked against the files already in the output directory and are not
-replaced when they differ.
+integers of the prefill kernel are `num_splits`, `q_len`, `kv_append_len`,
+`num_pages_per_seq`, `WINDOW_LEFT`, and `WINDOW_RIGHT`. On this path
+`kv_append_len` equals `q_len` and both windows are -1. `num_splits` is 1
+below the 8192-token bound and 2..8 above it, so a split cubin's
+`num_splits` class is `other` for every count. The combine kernel
+specializes `num_splits` and `q_len` the same way, and `QCV` (0 on the fp16
+path, 3 on qc) is a constexpr. Cubins are named by class. Decode cubin
+bytes, and unsplit prefill cubin bytes already in the output directory, are
+checked and are not replaced when they differ.
 
 Does not load the model. `triton.compile` needs a CUDA device; if anything is
 listening on :8889 the script exits before touching the GPU.
@@ -37,6 +38,7 @@ Fork is `BERTH_EXL3_SRC` (default `~/qwen38-exl3-dflash2/exllamav3`).
 
 import importlib.util
 import json
+import math
 import os
 import re
 import subprocess
@@ -599,8 +601,7 @@ SPECIALIZED_INTS = [
 # pages * 256 + q_len < 8192 for every row. q_len == 1 is the decode kernel
 # (prefill starts at q_len > 16). A staging chunk cannot have a 1-page table
 # unless q_len == 256, which is the div16 class, so (staging, q other, pages
-# eq1) is not a call this path can make. Split counts above 1 are a different
-# constexpr (IS_SPLIT) plus the combine kernel; they are not captured here.
+# eq1) is not a call this path can make.
 PREFILL_CAPTURES = [
     # qc, q_len other
     (47, 1),
@@ -617,6 +618,24 @@ PREFILL_CAPTURES = [
     (256, 1),
     (1280, 6),
     (1280, 16),
+]
+
+# One representative call per reachable split class. num_splits is 2..8, so
+# its class is always "other": one cubin covers every count. Model chunks are
+# page-aligned (staging, q_len a multiple of 256) or a tail shorter than one
+# page (qc). qc does not split below 32 pages (31 * 256 + 255 = 8191). A
+# staging q_len that is not a multiple of 16 is not a chunk_bounds cut.
+# eq1 pages cannot reach the 8192 bound.
+SPLIT_CAPTURES = [
+    # staging, q div16, pages other (33) and div16 (32)
+    (2048, 33),
+    (2048, 32),
+    # qc, q other, pages other and div16
+    (207, 33),
+    (47, 32),
+    # qc, q div16, pages other and div16
+    (240, 33),
+    (240, 32),
 ]
 
 
@@ -746,25 +765,66 @@ def prefill_class_key(path: str, classes: dict) -> str:
     return "_".join(parts)
 
 
-def _classes_for(q_len: int, pages: int) -> tuple[str, dict]:
-    """Class of one capture. kv_append_len is q_len; windows are -1; splits are 1."""
+def combine_class_key(path: str, classes: dict) -> str:
+    """Combine-kernel key. Only `num_splits` and `q_len` specialize."""
+    for name in ("num_splits", "q_len"):
+        kind = classes[name]
+        if kind not in ("eq1", "div16", "other"):
+            raise SystemExit(f"{name} class {kind!r} is not eq1, div16, or other")
+    return (
+        f"_paged_attn_prefill_combine_kernel_{path}"
+        f"_ns-{classes['num_splits']}_q-{classes['q_len']}"
+    )
+
+
+def _num_splits(q_len: int, pages: int, sms: int, n_q_heads: int, hd_pad: int) -> int:
+    """`paged_attn_triton_prefill`'s split count. page_size and BLOCK_M are 256 and 64."""
+    page_size = 256
+    block_m = 64
+    bound = pages * page_size + q_len
+    q_blocks = (q_len + block_m - 1) // block_m
+    programs = q_blocks * n_q_heads
+    num_splits = 1
+    if bound >= 8192 and programs:
+        best = None
+        for cand in (1, 2, 3, 4, 5, 6, 8):
+            cost = math.ceil(programs * cand / sms) / cand + 0.03 * (cand - 1)
+            if best is None or cost < best[0]:
+                best = (cost, cand)
+        num_splits = best[1]
+        max_partial_bytes = 128 * 1024 * 1024
+        denom = programs * block_m * hd_pad * 4
+        max_splits = max(1, max_partial_bytes // denom)
+        num_splits = min(num_splits, max_splits)
+    return num_splits
+
+
+def _wide_index(q_len: int, num_splits: int, n_q_heads: int, head_dim: int, hd_pad: int) -> bool:
+    """Same threshold the wrapper uses before setting WIDE_INDEX."""
+    block_m = 64
+    q_blocks = (q_len + block_m - 1) // block_m
+    q_elems = q_len * n_q_heads * head_dim
+    partial = q_blocks * n_q_heads * num_splits * block_m * hd_pad
+    return max(q_elems, partial) >= (1 << 31)
+
+
+def _classes_for(q_len: int, pages: int, sms: int, n_q_heads: int, hd_pad: int) -> tuple[str, dict, int]:
+    """Class of one capture. kv_append_len is q_len and both windows are -1."""
     if pages < 1 or q_len < 1:
         raise SystemExit(f"bad capture q_len {q_len} pages {pages}")
     if q_len > pages * 256:
         raise SystemExit(f"q_len {q_len} does not fit in {pages} pages")
-    bound = pages * 256 + q_len
-    if bound >= 8192:
-        raise SystemExit(f"q_len {q_len} pages {pages} wants splits (bound {bound})")
+    splits = _num_splits(q_len, pages, sms, n_q_heads, hd_pad)
     path = "fp16" if q_len >= 256 else "qc"
     classes = {
-        "num_splits": int_class(1),
+        "num_splits": int_class(splits),
         "q_len": int_class(q_len),
         "kv_append_len": int_class(q_len),
         "num_pages_per_seq": int_class(pages),
         "WINDOW_LEFT": int_class(-1),
         "WINDOW_RIGHT": int_class(-1),
     }
-    return path, classes
+    return path, classes, splits
 
 
 def _div16_indexes(attrs) -> set[int]:
@@ -804,11 +864,19 @@ def _jit_keys(fn) -> dict:
 
 
 def _capture_prefill(paged, shape: dict, q_len: int, pages: int):
-    """One real paged_attn_triton_prefill call. Returns the new CompiledKernel."""
+    """One real `paged_attn_triton_prefill` call.
+
+    Returns the new prefill CompiledKernel and, when this call is the first
+    in-process launch of a combine specialization, that CompiledKernel too.
+    A cache hit on the combine kernel returns None for it. An unsplit call
+    must not compile the combine kernel.
+    """
     import torch
 
     fn = paged._paged_attn_prefill_kernel
+    combine_fn = paged._paged_attn_prefill_combine_kernel
     before = set(_jit_keys(fn))
+    before_combine = set(_jit_keys(combine_fn))
     device = torch.device("cuda", 0)
     n_q = shape["n_q_heads"]
     n_kv = shape["n_kv_heads"]
@@ -842,17 +910,24 @@ def _capture_prefill(paged, shape: dict, q_len: int, pages: int):
         raise SystemExit(
             f"q_len {q_len} pages {pages}: expected 1 new prefill cubin, got {len(new)}"
         )
+    after_combine = _jit_keys(combine_fn)
+    new_combine = [key for key in after_combine if key not in before_combine]
+    if len(new_combine) > 1:
+        raise SystemExit(
+            f"q_len {q_len} pages {pages}: expected at most 1 new combine cubin, "
+            f"got {len(new_combine)}"
+        )
     ck = after[new[0]]
+    combine = after_combine[new_combine[0]] if new_combine else None
     del q, k_cache, v_cache, k_scales, v_scales, block_table, cache_seqlens
-    return ck
+    return ck, combine
 
 
-def _cache_matches(cubin: bytes, fork_marker: str) -> list[dict]:
+def _cache_matches(cubin: bytes, fork_marker: str, name: str) -> list[dict]:
     cache_root = Path(os.path.expanduser("~/.triton/cache"))
     hits = []
     if not cache_root.is_dir():
         return hits
-    name = "_paged_attn_prefill_kernel"
     for path in cache_root.glob(f"*/{name}.cubin"):
         if not path.is_file() or path.read_bytes() != cubin:
             continue
@@ -947,20 +1022,30 @@ def _record_prefill(ck, fn, consts_expect: dict, classes: dict, key: str, q_len:
     cubin = ck.asm["cubin"]
     if not isinstance(cubin, (bytes, bytearray)) or len(cubin) == 0:
         raise SystemExit(f"{key} cubin is empty")
-    # Pointer dtypes the tests rely on. Partials are fp16 because num_splits is 1
-    # and the wrapper passes `q` for every unused tensor.
+    # Unsplit passes `q` (fp16) for the unused partials. A split stores real
+    # fp32 partials; IS_SPLIT is the constexpr form of num_splits > 1.
+    is_split = bool(consts_expect["IS_SPLIT"])
+    partial_ty = "*fp32" if is_split else "*fp16"
     cache_ty = "*i32" if consts_expect["QCK"] else "*fp16"
     by_name = {p["name"]: p["type"] for p in params}
     for name in ("k_cache", "v_cache"):
         if by_name[name] != cache_ty:
             raise SystemExit(f"{key} {name} type {by_name[name]} != {cache_ty}")
-    for name in ("partial_o", "partial_ml", "k_new", "v_new", "sinks", "h32", "k_scales", "v_scales", "q", "out"):
+    for name in ("partial_o", "partial_ml"):
+        if by_name[name] != partial_ty:
+            raise SystemExit(f"{key} {name} type {by_name[name]} != {partial_ty}")
+    for name in ("k_new", "v_new", "sinks", "h32", "k_scales", "v_scales", "q", "out"):
         if by_name[name] != "*fp16":
             raise SystemExit(f"{key} {name} type {by_name[name]} != *fp16")
     path = "qc" if consts_expect["QCK"] else "fp16"
     if prefill_class_key(path, classes) != key:
         raise SystemExit(f"class key drifted: {prefill_class_key(path, classes)} != {key}")
     desc = ", ".join(f"{name}={classes[name]}" for name in SPECIALIZED_INTS)
+    split_note = (
+        "IS_SPLIT is true and partial_o/partial_ml are fp32."
+        if is_split
+        else "num_splits is 1 and IS_SPLIT is false; partials are the fp16 dummy `q`."
+    )
     return bytes(cubin), {
         "name": ck.metadata.name,
         "num_warps": ck.metadata.num_warps,
@@ -979,8 +1064,7 @@ def _record_prefill(ck, fn, consts_expect: dict, classes: dict, key: str, q_len:
             "eq1 is a constexpr and the argument is omitted from the launch. "
             "div16 is the same i32 parameter with tt.divisibility 16. "
             "other is a plain i32. "
-            "num_splits follows paged_attn_triton_prefill and is 1 "
-            "(IS_SPLIT false) for this cubin."
+            f"num_splits follows paged_attn_triton_prefill. {split_note}"
         ),
         "triton_version": triton_version,
         "ext_tree": ext_tree,
@@ -989,10 +1073,119 @@ def _record_prefill(ck, fn, consts_expect: dict, classes: dict, key: str, q_len:
     }
 
 
-def build_prefill_cubins(paged, shape: dict, out: Path, fork_marker: str, ext_tree: str, triton_version: str) -> list[str]:
-    """JIT every unsplit 27B prefill class and append it to manifest.json.
+# Runtime pointer args of _paged_attn_prefill_combine_kernel, definition order.
+_COMBINE_PREFIX = ["partial_o", "partial_ml", "out", "h32", "sinks"]
+COMBINE_INTS = ["num_splits", "q_len"]
 
-    Decode kernel records already in the manifest are left as they were.
+
+def _record_combine(ck, fn, consts_expect: dict, classes: dict, key: str, q_len: int, pages: int, ext_tree: str, triton_version: str):
+    """Record one `_paged_attn_prefill_combine_kernel` specialization."""
+    consts = _constexprs_from(ck, fn)
+    for name, want in consts_expect.items():
+        _expect_const(consts, name, want)
+    div16 = _div16_indexes(ck.src.attrs)
+    for name in COMBINE_INTS:
+        kind = classes[name]
+        idx = fn.arg_names.index(name)
+        runtime = _is_runtime_sig(ck, name)
+        if kind == "eq1":
+            raise SystemExit(f"{key}: {name} is eq1; the wrapper only launches combine when num_splits > 1 and q_len > 1")
+        if name in consts:
+            raise SystemExit(f"{key}: {name} class {kind} was baked as {consts[name]!r}")
+        if not runtime:
+            raise SystemExit(f"{key}: {name} class {kind} is missing from the runtime signature")
+        got_ty = _sig_text(ck, name)
+        if _type_name(got_ty) != "i32":
+            raise SystemExit(f"{key}: {name} type {got_ty!r} != i32")
+        got = idx in div16
+        if kind == "div16" and not got:
+            raise SystemExit(f"{key}: {name} is div16 but Triton did not set tt.divisibility 16")
+        if kind == "other" and got:
+            raise SystemExit(f"{key}: {name} is other but Triton set tt.divisibility 16")
+    for name in _COMBINE_PREFIX:
+        idx = fn.arg_names.index(name)
+        if idx not in div16:
+            raise SystemExit(
+                f"{key}: pointer {name} is not tt.divisibility 16 "
+                f"(attrs={ck.src.attrs!r})"
+            )
+    if ck.metadata.target.arch != 86:
+        raise SystemExit(f"{key} targeted sm_{ck.metadata.target.arch}, want sm_86")
+    if ck.metadata.num_warps != 8:
+        raise SystemExit(f"{key} num_warps {ck.metadata.num_warps} != 8")
+    stages = getattr(ck.metadata, "num_stages", None)
+    if stages != 1:
+        raise SystemExit(f"{key} num_stages {stages} != 1")
+    expected_runtime = _COMBINE_PREFIX + [name for name in COMBINE_INTS if classes[name] != "eq1"]
+    params = _runtime_from(ck, fn, expected_runtime)
+    ptx = ck.asm["ptx"]
+    if not isinstance(ptx, str):
+        ptx = ptx.decode()
+    launch_params = check_against_ptx(ck.metadata.name, params, ptx)
+    cubin = ck.asm["cubin"]
+    if not isinstance(cubin, (bytes, bytearray)) or len(cubin) == 0:
+        raise SystemExit(f"{key} cubin is empty")
+    by_name = {p["name"]: p["type"] for p in params}
+    for name in ("partial_o", "partial_ml"):
+        if by_name[name] != "*fp32":
+            raise SystemExit(f"{key} {name} type {by_name[name]} != *fp32")
+    for name in ("out", "h32", "sinks"):
+        if by_name[name] != "*fp16":
+            raise SystemExit(f"{key} {name} type {by_name[name]} != *fp16")
+    qcv = consts_expect["QCV"]
+    path = "fp16" if qcv == 0 else "qc"
+    if combine_class_key(path, classes) != key:
+        raise SystemExit(f"combine class key drifted: {combine_class_key(path, classes)} != {key}")
+    desc = ", ".join(f"{name}={classes[name]}" for name in COMBINE_INTS)
+    return bytes(cubin), {
+        "name": ck.metadata.name,
+        "num_warps": ck.metadata.num_warps,
+        "num_stages": stages,
+        "shared": ck.metadata.shared,
+        "global_scratch_size": ck.metadata.global_scratch_size,
+        "profile_scratch_size": ck.metadata.profile_scratch_size,
+        "parameters": launch_params,
+        "constexprs": jsonable_constexprs(consts),
+        "specialization": {name: classes[name] for name in COMBINE_INTS},
+        "path": path,
+        "grid": (
+            "grid (cdiv(q_len, BLOCK_M), bsz * n_q_heads), "
+            "block (32 * num_warps, 1, 1), num_warps 8, num_stages 1. "
+            f"Specialization {key}: {desc}. "
+            "Launched only when num_splits > 1, before mul_sigmoid. "
+            "QCV is 0 on the fp16 staging path and 3 on qc."
+        ),
+        "triton_version": triton_version,
+        "ext_tree": ext_tree,
+        "capture_q_len": q_len,
+        "capture_pages": pages,
+    }
+
+
+def _store_cubin(dest: Path, cubin: bytes, label: str) -> None:
+    """Write `cubin` unless `dest` already holds those bytes.
+
+    A different existing file is an error. Decode and unsplit prefill cubins
+    already on disk must not be replaced by a drifted JIT.
+    """
+    if dest.is_file():
+        old = dest.read_bytes()
+        if old != cubin:
+            raise SystemExit(
+                f"{label} cubin bytes differ from the existing {dest} "
+                f"({len(old)} on disk, {len(cubin)} newly JIT). "
+                "Refusing to overwrite."
+            )
+        return
+    dest.write_bytes(cubin)
+
+
+def build_prefill_cubins(paged, shape: dict, out: Path, fork_marker: str, ext_tree: str, triton_version: str) -> list[str]:
+    """JIT every reachable 27B prefill class and append it to manifest.json.
+
+    Unsplit rows stay `num_splits == 1`. Split rows launch the combine kernel
+    as well. Decode kernel records already in the manifest are left as they
+    were. An existing cubin file whose bytes differ is not overwritten.
     """
     import torch
 
@@ -1002,14 +1195,27 @@ def build_prefill_cubins(paged, shape: dict, out: Path, fork_marker: str, ext_tr
         raise SystemExit(
             f"two-pass threshold is {paged._qc_prefill_two_pass_min_q}, want 256"
         )
+    if (
+        shape["head_dim"] != 256
+        or shape["n_q_heads"] != 24
+        or shape["n_kv_heads"] != 4
+        or shape["page_size"] != 256
+    ):
+        raise SystemExit(f"prefill captures are the 27B shape, got {shape}")
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if sms != 82:
+        raise SystemExit(f"this 3090 capture expects 82 SMs, got {sms}")
+    hd_pad = 1
+    while hd_pad < shape["head_dim"]:
+        hd_pad *= 2
+    n_q = shape["n_q_heads"]
     common = dict(
-        IS_SPLIT=False,
         NEW_KV=0,
-        n_q_heads=shape["n_q_heads"],
+        n_q_heads=n_q,
         n_kv_heads=shape["n_kv_heads"],
         page_size=shape["page_size"],
         head_dim=shape["head_dim"],
-        HD_PAD=256,
+        HD_PAD=hd_pad,
         scale=0.0625,
         CAUSAL=True,
         HAS_WINDOW_LEFT=False,
@@ -1020,67 +1226,153 @@ def build_prefill_cubins(paged, shape: dict, out: Path, fork_marker: str, ext_tr
         BLOCK_M=64,
     )
     fn = paged._paged_attn_prefill_kernel
+    combine_fn = paged._paged_attn_prefill_combine_kernel
     notes = []
     written = []
+    combine_written = []
     seen = {}
-    for q_len, pages in PREFILL_CAPTURES:
-        path, classes = _classes_for(q_len, pages)
+    seen_combine = {}
+
+    def capture_row(q_len: int, pages: int, require_split: bool) -> None:
+        path, classes, splits = _classes_for(q_len, pages, sms, n_q, hd_pad)
+        if require_split:
+            if classes["num_splits"] == "eq1":
+                raise SystemExit(
+                    f"q_len {q_len} pages {pages} stayed at num_splits {splits}"
+                )
+        elif classes["num_splits"] != "eq1" or splits != 1:
+            raise SystemExit(
+                f"unsplit capture q_len {q_len} pages {pages} wants {splits} splits"
+            )
+        if _wide_index(q_len, splits, n_q, shape["head_dim"], hd_pad):
+            raise SystemExit(
+                f"q_len {q_len} splits {splits} would set WIDE_INDEX; berth has no such cubin"
+            )
         key = prefill_class_key(path, classes)
         if key in seen:
             raise SystemExit(f"{key} captured twice ({seen[key]} and q_len {q_len} pages {pages})")
         seen[key] = (q_len, pages)
         if path == "qc":
-            expect = {**common, "QCK": 3, "QCV": 3, "BLOCK_N": 64}
+            expect = {**common, "IS_SPLIT": splits > 1, "QCK": 3, "QCV": 3, "BLOCK_N": 64}
         else:
-            expect = {**common, "QCK": 0, "QCV": 0, "BLOCK_N": 32}
-        ck = _capture_prefill(paged, shape, q_len, pages)
+            expect = {**common, "IS_SPLIT": splits > 1, "QCK": 0, "QCV": 0, "BLOCK_N": 32}
+        ck, combine_ck = _capture_prefill(paged, shape, q_len, pages)
         cubin, record = _record_prefill(
             ck, fn, expect, classes, key, q_len, pages, ext_tree, triton_version
         )
         filename = f"{key}.cubin"
         record["cubin"] = filename
-        hits = _cache_matches(cubin, fork_marker)
+        record["capture_num_splits"] = splits
+        hits = _cache_matches(cubin, fork_marker, "_paged_attn_prefill_kernel")
         if not hits:
             raise SystemExit(
                 f"{key} cubin has no matching ~/.triton/cache entry whose source "
                 "names triton_paged.py"
             )
-        (out / filename).write_bytes(cubin)
+        _store_cubin(out / filename, cubin, key)
         written.append((key, record))
         hit = hits[0]
         notes.append(
-            f"{key}: q_len {q_len} pages {pages} symbol {record['name']} "
+            f"{key}: q_len {q_len} pages {pages} splits {splits} symbol {record['name']} "
             f"warps {record['num_warps']} stages {record['num_stages']} "
             f"shared {record['shared']} "
             f"scratch {record['global_scratch_size']}/{record['profile_scratch_size']} "
             f"bytes {len(cubin)} cache {hit['path']}"
         )
+        c_classes = {"num_splits": classes["num_splits"], "q_len": classes["q_len"]}
+        ckey = combine_class_key(path, c_classes)
+        if splits == 1:
+            if combine_ck is not None:
+                raise SystemExit(f"{key}: unsplit launch JIT'd the combine kernel")
+        elif ckey not in seen_combine:
+            if combine_ck is None:
+                raise SystemExit(f"{key}: split launch did not JIT {ckey}")
+            c_expect = {
+                "QCV": expect["QCV"],
+                "HAS_SINKS": False,
+                "n_q_heads": n_q,
+                "head_dim": shape["head_dim"],
+                "HD_PAD": hd_pad,
+                "WIDE_INDEX": False,
+                "BLOCK_M": 64,
+            }
+            c_cubin, c_record = _record_combine(
+                combine_ck, combine_fn, c_expect, c_classes, ckey,
+                q_len, pages, ext_tree, triton_version,
+            )
+            c_filename = f"{ckey}.cubin"
+            c_record["cubin"] = c_filename
+            c_record["capture_num_splits"] = splits
+            c_hits = _cache_matches(c_cubin, fork_marker, "_paged_attn_prefill_combine_kernel")
+            if not c_hits:
+                raise SystemExit(
+                    f"{ckey} cubin has no matching ~/.triton/cache entry whose source "
+                    "names triton_paged.py"
+                )
+            _store_cubin(out / c_filename, c_cubin, ckey)
+            combine_written.append((ckey, c_record))
+            seen_combine[ckey] = (q_len, pages)
+            c_hit = c_hits[0]
+            notes.append(
+                f"{ckey}: q_len {q_len} pages {pages} splits {splits} "
+                f"symbol {c_record['name']} warps {c_record['num_warps']} "
+                f"stages {c_record['num_stages']} shared {c_record['shared']} "
+                f"scratch {c_record['global_scratch_size']}/{c_record['profile_scratch_size']} "
+                f"bytes {len(c_cubin)} cache {c_hit['path']}"
+            )
+            del combine_ck
+        elif combine_ck is not None:
+            raise SystemExit(f"{key}: {ckey} was JIT'd again after {seen_combine[ckey]}")
         del ck
         torch.cuda.empty_cache()
+
+    for q_len, pages in PREFILL_CAPTURES:
+        capture_row(q_len, pages, False)
+    for q_len, pages in SPLIT_CAPTURES:
+        capture_row(q_len, pages, True)
     torch.cuda.synchronize()
     used = torch.cuda.memory_allocated()
     if used > 1 << 30:
         raise SystemExit(f"GPU allocation {used} bytes exceeds 1 GiB after prefill capture")
+    if len(combine_written) != 3:
+        raise SystemExit(
+            f"expected 3 combine classes, got {[key for key, _rec in combine_written]}"
+        )
 
     manifest_path = out / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     kernels = manifest["kernels"]
-    # Drop prefill records from a previous capture so a renamed class cannot
-    # linger beside the new keys. Decode records are the ones main() just wrote.
-    stale_keys = [name for name in list(kernels) if name.startswith("_paged_attn_prefill_kernel")]
+    # Drop prefill and combine records from a previous capture so a renamed
+    # class cannot linger. Decode records are the ones main() just wrote.
+    # The combine prefix does not start with `_paged_attn_prefill_kernel`.
+    stale_keys = [
+        name for name in list(kernels)
+        if name.startswith("_paged_attn_prefill_kernel")
+        or name.startswith("_paged_attn_prefill_combine_kernel")
+    ]
     for name in stale_keys:
         del kernels[name]
     for key, record in written:
         kernels[key] = record
-    for stale in out.glob("_paged_attn_prefill_kernel*.cubin"):
-        if stale.name not in {record["cubin"] for _key, record in written}:
-            stale.unlink()
+    for key, record in combine_written:
+        kernels[key] = record
+    kept = {record["cubin"] for _key, record in written}
+    kept.update(record["cubin"] for _key, record in combine_written)
+    for pattern in (
+        "_paged_attn_prefill_kernel*.cubin",
+        "_paged_attn_prefill_combine_kernel*.cubin",
+    ):
+        for stale in out.glob(pattern):
+            if stale.name not in kept:
+                stale.unlink()
     manifest["prefill"] = {
         "staging": 1,
         "two_pass_min_q": 256,
         "specialized_ints": list(SPECIALIZED_INTS),
+        "combine_specialized_ints": list(COMBINE_INTS),
         "int_class": "eq1 if value == 1 else div16 if value % 16 == 0 else other",
         "classes": [key for key, _record in written],
+        "combine_classes": [key for key, _record in combine_written],
     }
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     return notes

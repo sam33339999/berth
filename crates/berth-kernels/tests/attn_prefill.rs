@@ -2,9 +2,10 @@
 //!
 //! `tests/attn_prefill_ref.py` writes under `CARGO_TARGET_TMPDIR`. Each case
 //! is the fork op on seeded fp16 input, with the layer-3 q/k norm weights.
-//! The cases hit every captured specialization class (qc and fp16 staging,
-//! q_len other and divisible by 16, page counts 1, 6, and 16, plus the
-//! longer chunks). Outputs and the written cq3 pages are compared, 0
+//! The cases hit every captured specialization class of the prefill kernel
+//! and, where `num_splits > 1`, of the combine kernel (qc and fp16 staging,
+//! q_len other and divisible by 16, page counts that stay unsplit and the
+//! split classes). Outputs and the written cq3 pages are compared, 0
 //! differing.
 //!
 //! Runs only with `BERTH_GPU_TESTS=1`. Skips when `:8889` is listening.
@@ -15,9 +16,9 @@ use std::process::Command;
 use berth_cuda::{Context, DeviceBuffer, Stream};
 use berth_kernels::attn::TRITON_CUBIN_BUILD as DECODE_BUILD;
 use berth_kernels::attn_prefill::{
-    dequant_cache_paged_window, needs_staging, prefill_cubin_key, prefill_num_splits,
-    staging_pages, DequantWindow, PagedPrefill, PrefillChunk, SplitShape, HEAD_DIM, KV_HEADS,
-    PAGE_SIZE, Q_HEADS, TOKEN_DIM,
+    combine_cubin_key, dequant_cache_paged_window, needs_staging, partial_bytes, prefill_cubin_key,
+    staging_pages, DequantWindow, PagedPrefill, PrefillChunk, HEAD_DIM, KV_HEADS, PAGE_SIZE,
+    Q_HEADS, TOKEN_DIM,
 };
 
 const REF_PY: &str = "/home/sam/qwen38-exl3-dflash2/env/bin/python";
@@ -126,6 +127,7 @@ fn run_case(
     stream: &Stream,
     dir: &Path,
     case: &Case<'_>,
+    splits: i32,
     shared: &Shared,
     failures: &mut Vec<String>,
 ) {
@@ -184,6 +186,12 @@ fn run_case(
     let (global_n, profile_n) = prefill.scratch_bytes(q_len);
     let global = zeros(stream, global_n as usize);
     let profile = zeros(stream, profile_n as usize);
+    let (partial_o, partial_ml) = if splits > 1 {
+        let (o_bytes, ml_bytes) = partial_bytes(q_len, splits).unwrap();
+        (zeros(stream, o_bytes), zeros(stream, ml_bytes))
+    } else {
+        (zeros(stream, 0), zeros(stream, 0))
+    };
 
     let args = PrefillChunk {
         qg: dev(&qg),
@@ -207,6 +215,8 @@ fn run_case(
         identity_table: identity.as_ref().map(dev).unwrap_or(0),
         global_scratch: dev(&global),
         profile_scratch: dev(&profile),
+        partial_o: dev(&partial_o),
+        partial_ml: dev(&partial_ml),
     };
     unsafe {
         prefill
@@ -315,7 +325,15 @@ fn prefill_matches_fork() {
     for key in cubin_manifest["prefill"]["classes"].as_array().unwrap() {
         captured.insert(key.as_str().unwrap().to_string());
     }
+    let mut captured_combine = std::collections::BTreeSet::new();
+    for key in cubin_manifest["prefill"]["combine_classes"]
+        .as_array()
+        .unwrap()
+    {
+        captured_combine.insert(key.as_str().unwrap().to_string());
+    }
     let mut hit = std::collections::BTreeSet::new();
+    let mut hit_combine = std::collections::BTreeSet::new();
 
     let mut failures = Vec::new();
     for case in manifest["cases"].as_array().unwrap() {
@@ -330,28 +348,21 @@ fn prefill_matches_fork() {
         let end = i64::from(past_len) + i64::from(q_len);
         assert!(end <= i64::from(pages) * i64::from(PAGE_SIZE));
         assert!(staging_pages(1, pages).is_ok());
-        let splits = prefill_num_splits(&SplitShape {
-            q_len,
-            bt_width: pages,
-            page_size: PAGE_SIZE,
-            kv_append_len: q_len,
-            block_m: 64,
-            n_q_heads: Q_HEADS,
-            bsz: 1,
-            hd_pad: HEAD_DIM,
-            sm_count: 82,
-        })
-        .unwrap();
-        assert_eq!(splits, 1, "{name}");
+        let splits = prefill.num_splits(q_len, pages).unwrap();
+        let recorded = i32::try_from(case["splits"].as_i64().unwrap()).unwrap();
+        assert_eq!(splits, recorded, "{name}");
         hit.insert(prefill_cubin_key(
             needs_staging(q_len),
-            1,
+            splits,
             q_len,
             q_len,
             pages,
             -1,
             -1,
         ));
+        if splits > 1 {
+            hit_combine.insert(combine_cubin_key(needs_staging(q_len), splits, q_len));
+        }
         run_case(
             &prefill,
             &stream,
@@ -363,6 +374,7 @@ fn prefill_matches_fork() {
                 pages,
                 cache_in,
             },
+            splits,
             &shared,
             &mut failures,
         );
@@ -370,6 +382,10 @@ fn prefill_matches_fork() {
     assert_eq!(
         hit, captured,
         "every captured prefill class must be launched"
+    );
+    assert_eq!(
+        hit_combine, captured_combine,
+        "every captured combine class must be launched"
     );
     assert!(failures.is_empty(), "{failures:?}");
 }

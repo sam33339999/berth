@@ -89,6 +89,34 @@ fn chunk_bounds_match_the_fork() {
     assert_eq!(prefill::chunk_bounds(258), vec![(0, 256), (256, 257)]);
     assert_eq!(prefill::chunk_bounds(2049), vec![(0, 2048)]);
     assert_eq!(prefill::chunk_bounds(2050), vec![(0, 2048), (2048, 2049)]);
+    // 8190 is 32 pages (div16): three 2048-row staging splits, one 1792-row
+    // staging split, and a 253-row qc tail. 8400 is 33 pages (other): four
+    // 2048-row staging splits and a 207-row qc tail. One job has one page
+    // class, so the two lengths are both required.
+    assert_eq!(
+        prefill::chunk_bounds(8190),
+        vec![
+            (0, 2048),
+            (2048, 4096),
+            (4096, 6144),
+            (6144, 7936),
+            (7936, 8189)
+        ]
+    );
+    assert_eq!(
+        prefill::chunk_bounds(8400),
+        vec![
+            (0, 2048),
+            (2048, 4096),
+            (4096, 6144),
+            (6144, 8192),
+            (8192, 8399)
+        ]
+    );
+    assert_eq!(prefill::prefill_block_pages(100, 1), 1);
+    assert_eq!(prefill::prefill_block_pages(1500, 1), 6);
+    assert_eq!(prefill::prefill_block_pages(8190, 1), 32);
+    assert_eq!(prefill::prefill_block_pages(8400, 1), 33);
 
     let meta = meta();
     assert_eq!(
@@ -99,12 +127,19 @@ fn chunk_bounds_match_the_fork() {
         meta["max_chunk_size"].as_u64(),
         Some(u64::from(prefill::MAX_CHUNK_SIZE))
     );
-    let short = token_ids(prompt(&meta, "100"));
-    let long = token_ids(prompt(&meta, "1500"));
-    assert_eq!(short.len(), 100);
-    assert_eq!(long.len(), 1500);
-    assert_eq!(&long[..short.len()], short.as_slice());
-    for name in ["100", "1500"] {
+    let names = ["100", "1500", "8190", "8400"];
+    let stored: Vec<Vec<u32>> = names
+        .iter()
+        .map(|name| token_ids(prompt(&meta, name)))
+        .collect();
+    assert_eq!(stored[0].len(), 100);
+    assert_eq!(stored[1].len(), 1500);
+    assert_eq!(stored[2].len(), 8190);
+    assert_eq!(stored[3].len(), 8400);
+    for (short, long) in stored.iter().zip(stored.iter().skip(1)) {
+        assert_eq!(&long[..short.len()], short.as_slice());
+    }
+    for name in names {
         let prompt = prompt(&meta, name);
         let ids = token_ids(prompt);
         let got = prefill::chunk_bounds(u32::try_from(ids.len()).unwrap());
@@ -153,11 +188,15 @@ fn prefill_matches_fork_digests() {
     let gpu = Gpu::new().unwrap();
     let mut model = Model::load(&gpu, &ckpt, &plan, max_tokens).unwrap();
 
-    for name in ["100", "1500"] {
+    for name in ["100", "1500", "8190", "8400"] {
         let prompt = prompt(&meta, name);
         let ids = token_ids(prompt);
         eprintln!("prefill {name}");
         model.reset_sequence(&gpu).unwrap();
+        // Dump jobs use max_new_tokens 1, so the fork's prefill table is
+        // ceil((prompt_len + 2) / 256) on every chunk.
+        let pages = prefill::prefill_block_pages(u32::try_from(ids.len()).unwrap(), 1);
+        model.set_prefill_pages(pages).unwrap();
         let prefix = &ids[..ids.len() - 1];
         let mut records = Vec::new();
         let mut observe = |layer: u32, start: u32, end: u32, bytes: &[u8]| {

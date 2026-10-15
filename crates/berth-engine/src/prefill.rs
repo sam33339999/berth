@@ -133,8 +133,10 @@
 //!   an fp16 scratch and runs the fp16 prefill kernel over that. The 1280
 //!   chunk does. The 219 and 99 chunks read the packed cache inside
 //!   `_paged_attn_prefill_kernel` and do not dequant. `_paged_attn_prefill_combine_kernel`
-//!   runs only when `num_splits > 1` (`bound_kv >= 8192`). These prompts'
-//!   block tables are the sequence's own pages, so they do not combine.
+//!   runs only when `num_splits > 1` (`bound_kv >= 8192`). `bound_kv` uses
+//!   the job's allocated block-table width ([`prefill_block_pages`]), which
+//!   is constant across chunks. The 100- and 1500-token prompts stay under
+//!   the threshold. 8190 and 8400 do not, so those chunks combine.
 //! * `mul_sigmoid_` (`mul_sigmoid_kernel_h`) for the interleaved gate, then
 //!   `o_proj` (LIN).
 //! * Decode-only, not a prefill chunk: `_paged_attn_decode_split_kernel`,
@@ -260,6 +262,22 @@ pub struct PrefillOutput {
     pub chunks: Vec<ChunkDigest>,
     pub attn: Vec<AttnCacheDigest>,
     pub gdn: Vec<GdnStateDigest>,
+}
+
+/// Pages in the block table prefill sees for one job.
+///
+/// The fork allocates them in `Sequence.prepare` before the first chunk:
+/// `max_rq_tokens` defaults to `max_new_tokens + 1` when there is no draft
+/// (`Job.prepare_for_queue`), and `total_pages` is
+/// `ceil((len(sequence_ids) + max_rq_tokens) / PAGE_SIZE)`. Every chunk of
+/// that job is launched with this width. It is not the 16-padded decode
+/// width from `iterate_gen`.
+#[must_use]
+pub fn prefill_block_pages(prompt_len: u32, max_new_tokens: u32) -> u32 {
+    let max_rq = u64::from(max_new_tokens) + 1;
+    let total = u64::from(prompt_len) + max_rq;
+    let pages = total.div_ceil(u64::from(PAGE_SIZE));
+    u32::try_from(pages).unwrap_or(u32::MAX).max(1)
 }
 
 /// Chunk ranges `[start, end)` covering `ids[:-1]`.

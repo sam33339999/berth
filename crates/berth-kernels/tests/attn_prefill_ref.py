@@ -10,11 +10,14 @@ Fork path, bsz 1, cq3, EXL3_QC_STAGING=1:
   ext.mul_sigmoid_
 
 Cases come from testdata/kernels/attn_prefill/meta.json. They cover every
-unsplit specialization class of `_paged_attn_prefill_kernel` the 27B
-prefill launches: qc and fp16 staging, q_len in {other, div16}, and
-num_pages_per_seq in {eq1, div16, other} wherever that combination fits.
-q_norm and k_norm are the layer-3 checkpoint weights. Other tensors are
-seeded fp16.
+specialization class of `_paged_attn_prefill_kernel` the 27B prefill
+launches, including `num_splits > 1`, and every class of
+`_paged_attn_prefill_combine_kernel`. qc and fp16 staging, q_len in
+{other, div16}, and num_pages_per_seq in {eq1, div16, other} wherever that
+combination fits. `num_splits` on the split path is 2..8, so its class is
+`other`. q_norm and k_norm are the layer-3 checkpoint weights. Other
+tensors are seeded fp16. The written manifest records each case's
+`num_splits`.
 
 Large outputs go to the directory on argv (the test passes
 CARGO_TARGET_TMPDIR). They are not written under testdata. Exits before
@@ -25,6 +28,7 @@ same class must not compile another one.
 
 import importlib.util
 import json
+import math
 import os
 import subprocess
 import sys
@@ -188,11 +192,32 @@ def int_class(value: int) -> str:
     return "other"
 
 
-def prefill_class_key(q_len: int, pages: int) -> str:
-    """Unsplit full-attention key. kv_append_len is q_len and both windows are -1."""
+def num_splits(q_len: int, pages: int, sms: int) -> int:
+    """Same formula as `paged_attn_triton_prefill` and `prefill_num_splits`."""
+    block_m = 64
+    hd_pad = 256
+    bound = pages * PAGE + q_len
+    q_blocks = (q_len + block_m - 1) // block_m
+    programs = q_blocks * N_Q
+    splits = 1
+    if bound >= 8192 and programs:
+        best = None
+        for cand in (1, 2, 3, 4, 5, 6, 8):
+            cost = math.ceil(programs * cand / sms) / cand + 0.03 * (cand - 1)
+            if best is None or cost < best[0]:
+                best = (cost, cand)
+        splits = best[1]
+        max_partial_bytes = 128 * 1024 * 1024
+        denom = programs * block_m * hd_pad * 4
+        splits = min(splits, max(1, max_partial_bytes // denom))
+    return splits
+
+
+def prefill_class_key(q_len: int, pages: int, splits: int) -> str:
+    """Full-attention key. kv_append_len is q_len and both windows are -1."""
     path = "fp16" if q_len >= 256 else "qc"
     classes = {
-        "ns": int_class(1),
+        "ns": int_class(splits),
         "q": int_class(q_len),
         "kv": int_class(q_len),
         "p": int_class(pages),
@@ -206,23 +231,35 @@ def prefill_class_key(q_len: int, pages: int) -> str:
     )
 
 
-def load_class_cubins() -> dict:
+def combine_class_key(q_len: int, splits: int) -> str:
+    path = "fp16" if q_len >= 256 else "qc"
+    return (
+        f"_paged_attn_prefill_combine_kernel_{path}"
+        f"_ns-{int_class(splits)}_q-{int_class(q_len)}"
+    )
+
+
+def load_class_cubins() -> tuple[dict, dict]:
     manifest = json.loads((CUBIN_DIR / "manifest.json").read_text())
     found = {}
     for key in manifest["prefill"]["classes"]:
         rec = manifest["kernels"][key]
         found[key] = rec["cubin"]
-    if not found:
-        raise SystemExit(f"{CUBIN_DIR / 'manifest.json'} has no prefill classes")
-    return found
+    combine = {}
+    for key in manifest["prefill"]["combine_classes"]:
+        rec = manifest["kernels"][key]
+        combine[key] = rec["cubin"]
+    if not found or not combine:
+        raise SystemExit(f"{CUBIN_DIR / 'manifest.json'} is missing prefill or combine classes")
+    return found, combine
 
 
-def expect_class_cubin(fn, before: set, key: str, filename: str, first: bool):
+def expect_class_cubin(fn, before: set, key: str, filename: str, first: bool, what: str):
     after = jit_map(fn)
     new = [item for item in after if item not in before]
     if first:
         if len(new) != 1:
-            raise SystemExit(f"{key}: expected 1 new prefill cubin, got {len(new)}")
+            raise SystemExit(f"{key}: expected 1 new {what} cubin, got {len(new)}")
         blob = after[new[0]].asm["cubin"]
         if not isinstance(blob, (bytes, bytearray)):
             blob = bytes(blob)
@@ -230,7 +267,7 @@ def expect_class_cubin(fn, before: set, key: str, filename: str, first: bool):
         if bytes(blob) != disk:
             raise SystemExit(f"{filename}: JIT cubin bytes differ from {CUBIN_DIR / filename}")
     elif new:
-        raise SystemExit(f"{key}: compiled an unexpected prefill cubin")
+        raise SystemExit(f"{key}: compiled an unexpected {what} cubin")
     return set(after)
 
 
@@ -323,9 +360,15 @@ def main() -> None:
     bundle = (q_norm, k_norm, inv_freq)
 
     fn = paged._paged_attn_prefill_kernel
-    cubins = load_class_cubins()
+    combine_fn = paged._paged_attn_prefill_combine_kernel
+    cubins, combine_cubins = load_class_cubins()
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    if sms != 82:
+        raise SystemExit(f"split counts were enumerated for 82 SMs, got {sms}")
     seen_class = set()
+    seen_combine = set()
     produced = {}
+    recorded = []
     for case in spec["cases"]:
         name = case["name"]
         q_len = int(case["q_len"])
@@ -333,11 +376,13 @@ def main() -> None:
         pages = int(case["pages"])
         if past + q_len > pages * PAGE:
             raise SystemExit(f"{name}: past {past} + q_len {q_len} does not fit in {pages} pages")
-        if pages * PAGE + q_len >= 8192:
-            raise SystemExit(f"{name}: bound wants more than one split")
-        key = prefill_class_key(q_len, pages)
+        splits = num_splits(q_len, pages, sms)
+        key = prefill_class_key(q_len, pages, splits)
         if key not in cubins:
             raise SystemExit(f"{name}: no captured cubin for {key}")
+        ckey = combine_class_key(q_len, splits) if splits > 1 else None
+        if ckey is not None and ckey not in combine_cubins:
+            raise SystemExit(f"{name}: no captured combine cubin for {ckey}")
         cache = None
         if case.get("cache_in"):
             if name != "q300_at_1499":
@@ -348,18 +393,35 @@ def main() -> None:
             for dst, src_t in zip(cache, src):
                 dst[:n].copy_(src_t)
         before = set(jit_map(fn))
+        before_combine = set(jit_map(combine_fn))
         produced[name] = run_chunk(
             torch, ext, paged, out, name, q_len, past, pages, bundle, gen, cache, bool(case.get("cache_in"))
         )
-        expect_class_cubin(fn, before, key, cubins[key], key not in seen_class)
+        expect_class_cubin(fn, before, key, cubins[key], key not in seen_class, "prefill")
         seen_class.add(key)
+        if splits == 1:
+            fresh = [item for item in jit_map(combine_fn) if item not in before_combine]
+            if fresh:
+                raise SystemExit(f"{name}: unsplit launch compiled the combine kernel")
+        else:
+            expect_class_cubin(
+                combine_fn, before_combine, ckey, combine_cubins[ckey],
+                ckey not in seen_combine, "combine",
+            )
+            seen_combine.add(ckey)
+        row = dict(case)
+        row["splits"] = splits
+        recorded.append(row)
     missing = [key for key in cubins if key not in seen_class]
     if missing:
         raise SystemExit(f"cases did not launch every captured class: {missing}")
+    missing_combine = [key for key in combine_cubins if key not in seen_combine]
+    if missing_combine:
+        raise SystemExit(f"cases did not launch every combine class: {missing_combine}")
 
     manifest = {
         "seed": SEED,
-        "cases": spec["cases"],
+        "cases": recorded,
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     used = torch.cuda.memory_allocated()

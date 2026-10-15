@@ -85,7 +85,7 @@ shim 放在 `crates/berth-kernels` 裡，只 include fork 的 `.cuh`。fork 外�
 
 不在 `build.rs` 裡產生。在 `build.rs` 叫 Python 很脆，也會讓每次 `cargo build` 都要有 Triton。
 
-先跑一次 `scripts/build_triton_cubins.py`，cubin 放到固定目錄。`cargo build` 找不到就報錯，並說要跑哪支腳本。27B 自回歸只要 split 和 combine 兩支，見 [runtime.md](runtime.md)。
+先跑一次 `scripts/build_triton_cubins.py`，cubin 放到固定目錄。`cargo build` 找不到就報錯，並說要跑哪支腳本。27B 自回歸 decode 只要 split 和 combine 兩支，見 [runtime.md](runtime.md)。prefill 另外要未拆的 prefill cubin，以及 `num_splits` 為 2 到 8 的 split prefill 和 combine。這個範圍的 `num_splits` 都落在「其他」（4 和 8 也不是 16 的倍數），所以一種路徑、q 長度類別、頁數類別只要一支 cubin，不用每種 split 數各編一支。
 
 用服務那份 Python 跑，不載模型。腳本看到 `:8889` 有在聽就停，不碰 GPU：
 
@@ -95,7 +95,7 @@ TRITON_LIBCUDA_PATH=/usr/lib/x86_64-linux-gnu \
 ~/qwen38-exl3-dflash2/env/bin/python scripts/build_triton_cubins.py
 ```
 
-預設寫到 `target/triton-cubins/`（第一個參數換目錄）：`_paged_attn_decode_split_kernel.cubin`、`_paged_attn_decode_combine_kernel.cubin`、`manifest.json`。`BERTH_27B_DIR` 和 `BERTH_EXL3_SRC` 沒設時用 `~/qwen38-exl3-dflash2` 底下的 checkpoint 和 fork。
+預設寫到 `target/triton-cubins/`（第一個參數換目錄）：decode 的 `_paged_attn_decode_split_kernel.cubin`、`_paged_attn_decode_combine_kernel.cubin`，prefill 的 `_paged_attn_prefill_kernel_{fp16,qc}_...` 和 `_paged_attn_prefill_combine_kernel_{fp16,qc}_...`，以及 `manifest.json`。prefill 的類別在 `prefill.classes`，combine 在 `prefill.combine_classes`。`BERTH_27B_DIR` 和 `BERTH_EXL3_SRC` 沒設時用 `~/qwen38-exl3-dflash2` 底下的 checkpoint 和 fork。
 
 ## berth-kernels 的建置
 
@@ -156,15 +156,27 @@ cargo build --release -p berth
 
 greedy 299 步和 fork 的 argmax 完全一樣（`crates/berth-engine/tests/generate.rs`）。
 
-prompt 走 prefill（`Model::prefill`），照 fork 的規則切段：只 prefill `prompt[..len-1]`，段落對齊到 256，最後一個 prompt token 走 decode 拿 logits；第 63 層在 prefill 時只跑 mixer。100 和 1500 token 的 prompt 和 fork 逐位元一致：每段每層的殘差、所有 attention cache 和 GDN state、第一個 token 的 logits（`crates/berth-engine/tests/prefill_ref.rs`）。2223 token 的 prompt 約 2.3 秒出第一個 token，逐 token 送要約 58 秒。
+prompt 走 prefill（`Model::prefill`），照 fork 的規則切段：只 prefill `prompt[..len-1]`，段落對齊到 256，最後一個 prompt token 走 decode 拿 logits；第 63 層在 prefill 時只跑 mixer。100、1500、8190、8400 token 的 prompt 和 fork 逐位元一致：每段每層的殘差、所有 attention cache 和 GDN state、第一個 token 的 logits（`crates/berth-engine/tests/prefill_ref.rs`，四個 argmax 都是 561）。2223 token 的 prompt 約 2.3 秒出第一個 token，逐 token 送要約 58 秒。
 
 decode 的 block table 寬度（以及 attention 的 split 數）照 fork 依每個請求算：`ceil((prompt + max_new_tokens) / 256)` 頁，補到 16 的倍數（`generator.py` `iterate_gen`），不是整個 cache 的頁數。用 cache 的頁數，長 context 的 logits 會和服務不一樣。
 
 prefill 的 cuBLAS 連結的是 torch 的 `libcublas.so.13`（13.1），不是 CUDA 13.3 工具包的（13.6），兩者結果不同。`berth-kernels` 的 `build.rs` 在 `target/cublas-torch/` 放符號連結，`.cargo/config.toml` 的 `$ORIGIN` rpath 讓所有執行檔在執行時找到它。所以 berth 要 `~/openwebui/.venv` 那份 torch 在。
 
-Triton 依整數參數的值特化 kernel（等於 1、能被 16 整除、其他），fork 遇到新的組合就即時編。`scripts/build_triton_cubins.py` 預編 prefill attention 的每一種組合，執行時照同一個規則挑。
+Triton 依整數參數的值特化 kernel（等於 1、能被 16 整除、其他），fork 遇到新的組合就即時編。`scripts/build_triton_cubins.py` 預編 prefill attention 的每一種組合（未拆、split、combine），執行時照同一個規則挑。
 
 預設 270336 token 的 cache 載入後用 22.3 GB。attention prefill 的 fp16 暫存（q_len ≥ 256 時把 cq3 cache 解成 fp16）不在載入時配：fork 每次呼叫照 block table 的寬度臨時配、補到 2 的冪次頁（`triton_paged.py` 的 `pages_alloc`）。berth 第一次用到才配，不夠時先放掉再配大的，同樣補到 2 的冪次，但上限是 cache 的頁數：1056 頁補到 2048 頁會多出 1 GB。kernel 只碰 `bt_width` 頁，多配的頁不影響結果。之前照整個 cache 配（再補到 2048 頁），兩塊共 2 GiB，加上 cache 本身 3.7 GB 就開不起來。滿 context 時暫存是兩塊各 528 MiB。
 
-還沒做：prefill 的 split。chunk 的 `bt_width × 256 + q_len ≥ 8192` 時，fork 把 attention 分成幾段（`IS_SPLIT` 的 cubin 加 combine kernel），berth 只預編了 `num_splits = 1` 的 cubin，所以 prompt 超過大約 6000 token 會回錯誤（找不到 cubin）。5340 token 的 prompt 可以跑。
+prefill 的 split 已接上，跟 fork 的 `paged_attn_triton_prefill` 同一條路。`bound_kv = 頁數 × 256 + q_len ≥ 8192` 才拆：候選是 2、3、4、5、6、8，先挑 `ceil(programs × cand / sms) / cand + 0.03 × (cand − 1)` 最小的，平手留前面那個，再把 fp32 partial 壓在 128 MiB 以內。split kernel 的 grid 是 `(q_blocks, n_q_heads, num_splits)`，combine 在 `mul_sigmoid` 之前跑。partial 放在各層共用的 prefill scratch，第一次用到才配，高水位不超過 128 MiB，不跟 decode 的 partial 共用。
+
+prefill 的 block table 寬度是整份 job 的配置，每個 chunk 都一樣：`ceil((prompt_len + max_new_tokens + 1) / 256)` 頁，不補到 16 的倍數。fork 在 `Job.prepare_for_queue`（`generator/job.py` 1118–1120）沒有明示 `max_rq_tokens` 時設 `max_rq_tokens = max_new_tokens + 1 + num_draft_tokens`。berth 還沒有草稿，對齊的是 fork 不開草稿的情況（`generator.py` 171 把 `num_draft_tokens` 設成 0）。正式服務開了 DFlash2，寬度會再多 `num_draft_tokens`，接 DFlash2 時要跟著加。`Sequence.prepare`（`generator/pagetable.py` 235–238）用這個預算算出 `total_pages`，prefill 每個 chunk 都傳整張 `seq.block_index_tensor`（`job.py` 1398）。之前 berth 用該段結尾的 `end.div_ceil(256)`，長 prompt 的前段頁數少一截，過了 8192 之後 split 數會和 fork 不同。100 兩種算法都是 1 頁。1500 的第一段舊寬度是 5 頁、fork 是 6 頁，兩種都還低於 8192，頁數類別都是 other，kernel 不讀多出來的那一頁，所以 digest 不變。一個 prompt 只有一種頁數類別：8190 是 32 頁（div16），8400 是 33 頁（other）。decode 的寬度沒改，還是 `ceil((prompt + max_new_tokens) / 256)` 頁補到 16 的倍數。
+
+實測在 `127.0.0.1:18889`，`max_tokens` 20、溫度 0、串流。TTFT 從送出請求算到第一個 reasoning token（角色那一包不算）。載入後、還沒送請求是 22255 MiB。
+
+| prompt_tokens | TTFT | 跑完後的 nvidia-smi |
+| --- | --- | --- |
+| 10052 | 8.92 秒 | 22495 MiB |
+| 50051 | 56.11 秒 | 22691 MiB |
+| 150052 | 267.14 秒 | 23459 MiB |
+
+停掉服務之後回到 127 MiB。150k 放得進這張 24 GiB 的卡。
 

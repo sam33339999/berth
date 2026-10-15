@@ -25,7 +25,8 @@ use berth_kernels::attn::{
     PagedDecodeArgs, QuantCacheLaunch, RopeLaunch,
 };
 use berth_kernels::attn_prefill::{
-    needs_staging, staging_pages, PagedPrefill, PrefillChunk, NORM_EPS, ROTARY_DIM, TWO_PASS_MIN_Q,
+    needs_staging, partial_bytes, staging_pages, PagedPrefill, PrefillChunk, NORM_EPS, ROTARY_DIM,
+    TWO_PASS_MIN_Q,
 };
 use berth_kernels::ops::exl3_mgemm;
 use berth_kernels::{Codebook, OutDtype};
@@ -79,6 +80,11 @@ pub struct AttnLayer {
     /// split count follows it. [`Self::set_decode_width`] sets it; it starts
     /// as the whole cache.
     decode_width: i32,
+    /// Block-table width of the current prefill job. `None` means a direct
+    /// [`Self::prefill`] uses the pages that chunk has written. The model
+    /// path sets this to the fork's allocated page count, which is constant
+    /// for every chunk of the job.
+    prefill_pages: Option<i32>,
     max_tokens: u32,
     programs: i32,
     splits_cap: i32,
@@ -348,6 +354,7 @@ impl AttnLayer {
             codebook: q.codebook,
             num_pages,
             decode_width: num_pages,
+            prefill_pages: None,
             max_tokens,
             programs,
             splits_cap: cap,
@@ -431,6 +438,36 @@ impl AttnLayer {
         let padded = pages.div_ceil(16) * 16;
         let limit = u32::try_from(self.num_pages).unwrap_or(0).div_ceil(16) * 16;
         self.decode_width = i32::try_from(padded.min(limit)).unwrap_or(self.num_pages);
+    }
+
+    /// Set the prefill block-table width for this job.
+    ///
+    /// The fork allocates every page the request can touch before the first
+    /// chunk (`Sequence.prepare`: `ceil((prompt_len + max_rq_tokens) / 256)`,
+    /// and `max_rq_tokens` defaults to `max_new_tokens + 1` with no draft).
+    /// `paged_attn_triton_prefill` reads that width as `num_pages_per_seq`,
+    /// and the split count follows it. A width below the pages this chunk
+    /// writes is rejected at launch.
+    ///
+    /// # Errors
+    ///
+    /// `pages` is 0 or does not fit in this layer's cache.
+    pub fn set_prefill_pages(&mut self, pages: u32) -> Result<()> {
+        if pages < 1 {
+            return Err(Error::Input(
+                "prefill block table needs at least one page".into(),
+            ));
+        }
+        let pages_i = i32::try_from(pages)
+            .map_err(|_| Error::Input("prefill page count does not fit in i32".into()))?;
+        if pages_i > self.num_pages {
+            return Err(Error::Input(format!(
+                "prefill block table is {pages} pages; this layer's cache has {}",
+                self.num_pages
+            )));
+        }
+        self.prefill_pages = Some(pages_i);
+        Ok(())
     }
 
     pub fn reset_cache(&mut self, gpu: &Gpu) -> Result<()> {
@@ -1566,6 +1603,11 @@ pub struct AttnPrefillScratch {
     identity: ByteBuf,
     global_scratch: ByteBuf,
     profile_scratch: ByteBuf,
+    /// fp32 split partials. Allocated on the first split chunk and grown by
+    /// [`Self::reserve_partials`], never at load. The fork caps `partial_o`
+    /// at 128 MiB; [`partial_bytes`] rejects anything larger.
+    partial_o: Option<ByteBuf>,
+    partial_ml: Option<ByteBuf>,
 }
 
 /// One prefill chunk that fits this layer and `scratch`.
@@ -1658,7 +1700,29 @@ impl AttnPrefillScratch {
             identity: upload_i32(gpu, &identity)?,
             global_scratch: gpu.zeroed(u32_len(g_short.max(g_wide))?)?,
             profile_scratch: gpu.zeroed(u32_len(p_short.max(p_wide))?)?,
+            partial_o: None,
+            partial_ml: None,
         })
+    }
+
+    /// Make the fp32 partials large enough for this chunk, and return its split count.
+    ///
+    /// Unsplit launches do not allocate. Growth frees the old buffer first, so
+    /// the peak is the new size. A failed allocation leaves that buffer empty.
+    ///
+    /// # Errors
+    ///
+    /// The split count cannot be computed, the buffer would exceed the fork's
+    /// 128 MiB cap, or the device allocation fails.
+    fn reserve_partials(&mut self, gpu: &Gpu, q_len: i32, pages: i32) -> Result<i32> {
+        let splits = self.prefill.num_splits(q_len, pages)?;
+        if splits <= 1 {
+            return Ok(splits);
+        }
+        let (o_bytes, ml_bytes) = partial_bytes(q_len, splits)?;
+        grow_partial(gpu, &mut self.partial_o, o_bytes, "partial_o")?;
+        grow_partial(gpu, &mut self.partial_ml, ml_bytes, "partial_ml")?;
+        Ok(splits)
     }
 
     /// Make the staging pair hold at least `pages` pages.
@@ -1701,6 +1765,22 @@ fn stage_bytes(pages: i32) -> Result<usize> {
         .ok_or_else(|| Error::Input("attention staging scratch overflows".into()))
 }
 
+fn grow_partial(gpu: &Gpu, slot: &mut Option<ByteBuf>, bytes: usize, what: &str) -> Result<()> {
+    let have = slot.as_ref().map(ByteBuf::num_bytes).unwrap_or(0);
+    if have >= bytes {
+        return Ok(());
+    }
+    *slot = None;
+    let buf = gpu.zeroed(bytes).map_err(|err| {
+        Error::Input(format!(
+            "attention prefill {what} ({} MiB) did not fit: {err}",
+            bytes >> 20
+        ))
+    })?;
+    *slot = Some(buf);
+    Ok(())
+}
+
 fn staging_oom(err: Error, pages: i32, bytes: usize) -> Error {
     Error::Input(format!(
         "attention prefill staging: {pages} pages ({} MiB each for k and v) did not fit: {err}",
@@ -1723,8 +1803,9 @@ impl AttnLayer {
     /// `cache_seqlens = start`, runs the Triton prefill (fp16 staging when
     /// `rows >= 256`), and applies the output gate. The cubin is the Triton
     /// specialization class of this call: `q_len` and `kv_append_len` are
-    /// `rows`, `num_pages_per_seq` is the live page count, `num_splits` comes
-    /// from the fork's formula, and both windows are -1.
+    /// `rows`, `num_pages_per_seq` is the job's block-table width (or the
+    /// pages this chunk has written, when that width was not set),
+    /// `num_splits` comes from the fork's formula, and both windows are -1.
     /// [`PagedPrefill::prefill_chunk`] selects that cubin and errors if the
     /// class was not captured. `o_proj` is
     /// [`Exl3Linear::forward_rows`] with fp32 out.
@@ -1749,6 +1830,7 @@ impl AttnLayer {
         if needs_staging(span.rows) {
             scratch.reserve_staging(gpu, span.pages)?;
         }
+        scratch.reserve_partials(gpu, span.rows, span.pages)?;
         // Both host values are written before either copy. `seq_host` is
         // `start` and `pos_host` is `start + rows`. The first copy publishes
         // `start` for the kernels; the second publishes the new length after
@@ -1875,8 +1957,19 @@ impl AttnLayer {
             .map_err(|_| Error::Input(format!("prefill end {end} does not fit in i32")))?;
         let rows_i = i32::try_from(rows)
             .map_err(|_| Error::Input(format!("prefill rows {rows} does not fit in i32")))?;
-        let pages = i32::try_from(end.div_ceil(PAGE))
+        let live = i32::try_from(end.div_ceil(PAGE))
             .map_err(|_| Error::Input("page count does not fit in i32".into()))?;
+        // The fork passes the job's full block table on every chunk. Falling
+        // back to `live` keeps a direct layer call on the pages it has written.
+        let pages = match self.prefill_pages {
+            Some(job) if job >= live => job,
+            Some(job) => {
+                return Err(Error::Input(format!(
+                    "prefill block table is {job} pages; chunk end {end} needs {live}"
+                )))
+            }
+            None => live,
+        };
         if pages > self.num_pages || pages > scratch.max_pages {
             return Err(Error::Input(format!(
                 "prefill needs {pages} pages; layer has {}, scratch has {}",
@@ -2023,6 +2116,16 @@ impl AttnLayer {
             },
             global_scratch: scratch.global_scratch.ptr().as_u64(),
             profile_scratch: scratch.profile_scratch.ptr().as_u64(),
+            partial_o: scratch
+                .partial_o
+                .as_ref()
+                .map(|buf| buf.ptr().as_u64())
+                .unwrap_or(0),
+            partial_ml: scratch
+                .partial_ml
+                .as_ref()
+                .map(|buf| buf.ptr().as_u64())
+                .unwrap_or(0),
         }
     }
 }

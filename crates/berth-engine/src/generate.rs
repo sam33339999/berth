@@ -144,6 +144,11 @@ impl Engine {
         // (`Job.get_max_seq_len`: prompt plus max_new_tokens).
         self.model
             .set_decode_width(prompt_len.saturating_add(request.max_new_tokens));
+        // Prefill sees the job's allocated pages, not the pages written so
+        // far and not the 16-padded decode width. `max_rq_tokens` is
+        // `max_new_tokens + 1` when the generator has no draft.
+        let prefill_pages = crate::prefill::prefill_block_pages(prompt_len, request.max_new_tokens);
+        self.model.set_prefill_pages(prefill_pages)?;
         self.sampler
             .reset(&self.gpu, &request.sampler, &request.prompt)?;
 

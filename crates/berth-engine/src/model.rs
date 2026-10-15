@@ -518,6 +518,23 @@ impl Model {
         }
     }
 
+    /// Set every attention layer's prefill block-table width.
+    ///
+    /// See [`crate::attn::AttnLayer::set_prefill_pages`]. `pages` is
+    /// [`crate::prefill::prefill_block_pages`].
+    ///
+    /// # Errors
+    ///
+    /// A layer rejects `pages`.
+    pub fn set_prefill_pages(&mut self, pages: u32) -> Result<()> {
+        for block in &mut self.blocks {
+            if let MixerSlot::FullAttn(attn) = &mut block.mixer {
+                attn.set_prefill_pages(pages)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn reset_sequence(&mut self, gpu: &Gpu) -> Result<()> {
         self.synchronize(gpu)?;
         self.captured = false;

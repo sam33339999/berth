@@ -7,20 +7,33 @@ then refuses.
 
 Same job the serve runs for one prompt, target only (no draft)
 --------------------------------------------------------------
-``CacheLayer_quant`` cq3, ``max_batch_size`` 1, ``max_num_tokens`` 8192 (the
-width ``scripts/profile_27b_prefill.py`` used; the serve's default is 270336
-and would change the first-token logits, because ``num_splits`` follows the
-allocated block-table width). ``Generator`` keeps its default
-``max_chunk_size`` of 2048. Serve env flags are set before import.
+``CacheLayer_quant`` cq3, ``max_batch_size`` 1, ``max_num_tokens`` 12288.
+The cache has to hold the longest job: ``ceil((8400 + 2) / 256) = 33`` pages.
+``Generator`` keeps its default ``max_chunk_size`` of 2048. Serve env flags
+are set before import. ``max_new_tokens`` is 1, so ``max_rq_tokens`` is 2
+and every chunk of a job sees the same block-table width
+``ceil((prompt_len + 2) / 256)``. One prompt therefore has one page class.
+8190 and 8400 are both required: 32 pages is ``div16``, 33 is ``other``.
 
 ``Job.prefill`` (``generator/job.py``) forwards ``ids[:-1]`` only. The last
 prompt token is a decode ``model.forward``. Chunk end is aligned down to
 ``PAGE_SIZE`` (256), then cut at the last page boundary when the model has a
-recurrent cache (``qwen3_5.py`` sets ``recurrent_states``). For these two
-lengths that is:
+recurrent cache (``qwen3_5.py`` sets ``recurrent_states``). Lengths:
 
-- 1500 tokens: ``[0, 1280)`` then ``[1280, 1499)``, then decode position 1499
-- 100 tokens: ``[0, 99)``, then decode position 99
+- 1500 tokens, 6 pages, no split: ``[0, 1280)`` then ``[1280, 1499)``,
+  then decode position 1499
+- 100 tokens, 1 page, no split: ``[0, 99)``, then decode position 99
+- 8190 tokens, 32 pages (``div16``). Staging chunks ``[0, 2048)``,
+  ``[2048, 4096)``, ``[4096, 6144)`` are q_len 2048, ``num_splits`` 2
+  (case b: staging split, pages ``div16``). ``[6144, 7936)`` is q_len 1792,
+  ``num_splits`` 3, same cubin class. The tail ``[7936, 8189)`` is qc
+  q_len 253, ``num_splits`` 5 (case c on a ``div16`` table). Decode
+  position 8189.
+- 8400 tokens, 33 pages (``other``). Staging chunks ``[0, 2048)``,
+  ``[2048, 4096)``, ``[4096, 6144)``, ``[6144, 8192)`` are q_len 2048,
+  ``num_splits`` 2 (case a: staging split, pages ``other``). The tail
+  ``[8192, 8399)`` is qc q_len 207, ``num_splits`` 5 (case c on an
+  ``other`` table). Decode position 8399.
 
 ``prefill_ls`` stops at the last KV module (layer 63, full attention) and sets
 ``params["prefill"]``. ``TransformerBlock.forward`` still runs that mixer, so
@@ -37,8 +50,8 @@ Under ``testdata/prefill_ref/`` (kept under 4 MB):
   the digest of used cache rows (logical block-table order; qk/qv int32,
   sk/sv fp16), per GDN layer the slot's conv (bf16) and recurrent (fp32)
   state, and the logits digest plus argmax.
-- ``logits_100.bin`` and ``logits_1500.bin``: raw little-endian fp16 vocab
-  row from that decode, cloned before the sampler.
+- ``logits_<len>.bin`` for 100, 1500, 8190, and 8400: raw little-endian
+  fp16 vocab row from that decode, cloned before the sampler.
 
 Two measurement jobs per length must match. Two earlier jobs of the same ids
 are discarded: the first decode is the eager BC warmup, the second captures
@@ -84,10 +97,14 @@ TARGET = os.environ.get(
     "BERTH_27B_DIR", "/home/sam/qwen38-exl3-dflash2/models/qwen38-27b-exl3"
 )
 SENTENCE = "The quick brown fox jumps over the lazy dog. "
-LENGTHS = (1500, 100)
+# 1500 then 100 first: 1500's decode capture is what both short lengths
+# replay. 8190 (32 pages, div16) and 8400 (33 pages, other) follow.
+MEASURE_ORDER = (1500, 100, 8190, 8400)
+LENGTHS = MEASURE_ORDER
 PAGE_SIZE = 256
 MAX_CHUNK = 2048
-CACHE_TOKENS = 8192
+# 33 pages for the 8400 job, plus the 48-wide padded decode table.
+CACHE_TOKENS = 12288
 HIDDEN = 5120
 VOCAB = 248320
 LAYERS = 64
@@ -214,10 +231,16 @@ def chunk_bounds(prompt_len, max_chunk=MAX_CHUNK, page=PAGE_SIZE):
 
 
 def prompt_ids(tokenizer):
-    text = SENTENCE * 400
+    # Start from the same 400 repeats the 100/1500 dump used, then extend.
+    # The token prefix stays the repeated sentence, so the short prompts are
+    # the same ids as before.
+    repeats = 400
+    text = SENTENCE * repeats
     ids = tokenizer.encode(text)
-    if ids.shape[-1] < max(LENGTHS):
-        raise RuntimeError(f"tokenizer produced {ids.shape[-1]} tokens, need {max(LENGTHS)}")
+    while ids.shape[-1] < max(LENGTHS):
+        repeats *= 2
+        text = SENTENCE * repeats
+        ids = tokenizer.encode(text)
     full = ids[:, : max(LENGTHS)].contiguous()
     return {n: full[:, :n].contiguous() for n in LENGTHS}
 
@@ -596,13 +619,14 @@ def main():
         raise RuntimeError("target has no recurrent cache; chunk cuts would differ")
     cap = Capture(model)
     ids = prompt_ids(tokenizer)
-    if ids[100][0].tolist() != ids[1500][0, :100].tolist():
-        raise RuntimeError("100-token prompt is not a prefix of the 1500-token prompt")
+    prefix_order = (100, 1500, 8190, 8400)
+    for shorter, longer in zip(prefix_order, prefix_order[1:]):
+        if ids[shorter][0].tolist() != ids[longer][0, :shorter].tolist():
+            raise RuntimeError(f"{shorter}-token prompt is not a prefix of the {longer}-token prompt")
 
     prompts = {}
     blobs = {}
-    # 1500 first, so its decode capture is the one both lengths replay.
-    for length in (1500, 100):
+    for length in MEASURE_ORDER:
         record, raw = measure(gen, cap, ids[length], length)
         record["logits"]["file"] = f"logits_{length}.bin"
         prompts[str(length)] = record
@@ -637,9 +661,13 @@ def main():
                 "lm_head do not run during prefill."
             ),
             "cache_width": (
-                "cache_tokens is 8192, matching scripts/profile_27b_prefill.py. The "
-                "serve default is 270336. The decode step's num_splits follows the "
-                "allocated block-table width, so the logits are for this width."
+                "cache_tokens is 12288 so the 8400-token job's 33 pages fit, and "
+                "so does a decode table padded out to 48. The serve default is "
+                "270336. Prefill num_splits follows the job allocation "
+                "ceil((prompt_len + max_new_tokens + 1) / 256), which is constant "
+                "for every chunk. 8190 is 32 pages (div16) and 8400 is 33 (other); "
+                "one prompt cannot hit both page classes. Decode num_splits follows "
+                "the current sequence length padded up to a multiple of 16."
             ),
             "residual_digest": (
                 "blake2b-256 of the little-endian fp32 bytes of the block return, "
