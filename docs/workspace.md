@@ -164,5 +164,7 @@ prefill 的 cuBLAS 連結的是 torch 的 `libcublas.so.13`（13.1），不是 C
 
 Triton 依整數參數的值特化 kernel（等於 1、能被 16 整除、其他），fork 遇到新的組合就即時編。`scripts/build_triton_cubins.py` 預編 prefill attention 的每一種組合，執行時照同一個規則挑。
 
-還沒解決：預設 270336 token 的 cache 開不起來（GPU 記憶體不足）。attention prefill 的 fp16 暫存照整個 cache 配，fork 是每次呼叫照這個請求用到的頁數臨時配（補到 2 的冪次）。要改成照 fork 的方式。暫時用 `--max-tokens 32768`。
+預設 270336 token 的 cache 載入後用 22.3 GB。attention prefill 的 fp16 暫存（q_len ≥ 256 時把 cq3 cache 解成 fp16）不在載入時配：fork 每次呼叫照 block table 的寬度臨時配、補到 2 的冪次頁（`triton_paged.py` 的 `pages_alloc`）。berth 第一次用到才配，不夠時先放掉再配大的，同樣補到 2 的冪次，但上限是 cache 的頁數：1056 頁補到 2048 頁會多出 1 GB。kernel 只碰 `bt_width` 頁，多配的頁不影響結果。之前照整個 cache 配（再補到 2048 頁），兩塊共 2 GiB，加上 cache 本身 3.7 GB 就開不起來。滿 context 時暫存是兩塊各 528 MiB。
+
+還沒做：prefill 的 split。chunk 的 `bt_width × 256 + q_len ≥ 8192` 時，fork 把 attention 分成幾段（`IS_SPLIT` 的 cubin 加 combine kernel），berth 只預編了 `num_splits = 1` 的 cubin，所以 prompt 超過大約 6000 token 會回錯誤（找不到 cubin）。5340 token 的 prompt 可以跑。
 

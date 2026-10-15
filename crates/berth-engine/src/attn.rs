@@ -25,8 +25,7 @@ use berth_kernels::attn::{
     PagedDecodeArgs, QuantCacheLaunch, RopeLaunch,
 };
 use berth_kernels::attn_prefill::{
-    needs_staging, staging_scratch_elems, PagedPrefill, PrefillChunk, NORM_EPS, ROTARY_DIM,
-    TWO_PASS_MIN_Q,
+    needs_staging, staging_pages, PagedPrefill, PrefillChunk, NORM_EPS, ROTARY_DIM, TWO_PASS_MIN_Q,
 };
 use berth_kernels::ops::exl3_mgemm;
 use berth_kernels::{Codebook, OutDtype};
@@ -1555,8 +1554,14 @@ pub struct AttnPrefillScratch {
     /// Per-slice output pointers into `qg`, `k`, and `v`. Stable for the
     /// life of those buffers.
     c_ptrs: ByteBuf,
-    scratch_k: ByteBuf,
-    scratch_v: ByteBuf,
+    /// fp16 staging for chunks of `TWO_PASS_MIN_Q` rows or more, `stage_pages`
+    /// pages each. Allocated on first use and grown by
+    /// [`Self::reserve_staging`], never at load: a cache-sized pair is over
+    /// 1 GiB at 270336 tokens. The fork allocates this per call from the block
+    /// table's span (`triton_paged.py`, `pages_alloc`).
+    scratch_k: Option<ByteBuf>,
+    scratch_v: Option<ByteBuf>,
+    stage_pages: i32,
     /// int32 `[0, 1, …, max_pages)`. The launch reads the first `bt_width`.
     identity: ByteBuf,
     global_scratch: ByteBuf,
@@ -1630,10 +1635,6 @@ impl AttnPrefillScratch {
         }
         let (g_short, p_short) = prefill.scratch_bytes(1);
         let (g_wide, p_wide) = prefill.scratch_bytes(TWO_PASS_MIN_Q);
-        let stage_elems = staging_scratch_elems(1, max_pages)?;
-        let stage_bytes = stage_elems
-            .checked_mul(2)
-            .ok_or_else(|| Error::Input("attention staging scratch overflows".into()))?;
         let identity: Vec<i32> = (0..max_pages).collect();
         Ok(Self {
             prefill,
@@ -1651,13 +1652,60 @@ impl AttnPrefillScratch {
             o: gpu.zeroed(fp16_bytes(max_rows, q_cols)?)?,
             mgemm_had: gpu.zeroed(mgemm_had_bytes(mgemm_rows, hidden)?)?,
             c_ptrs: upload_u64(gpu, &ptrs)?,
-            scratch_k: gpu.zeroed(stage_bytes)?,
-            scratch_v: gpu.zeroed(stage_bytes)?,
+            scratch_k: None,
+            scratch_v: None,
+            stage_pages: 0,
             identity: upload_i32(gpu, &identity)?,
             global_scratch: gpu.zeroed(u32_len(g_short.max(g_wide))?)?,
             profile_scratch: gpu.zeroed(u32_len(p_short.max(p_wide))?)?,
         })
     }
+
+    /// Make the staging pair hold at least `pages` pages.
+    ///
+    /// The kernels touch `pages` pages (the launch's `bt_width`). Growth
+    /// rounds up to a power of two, as the fork's `pages_alloc` does, so a
+    /// growing context reallocates a handful of times; the cap is the cache's
+    /// page count, since a 1056-page cache would otherwise round to 2048. The
+    /// old pair is freed first (its drop waits for the context), so the peak
+    /// is the new size. If the allocation fails, the pair is empty and the
+    /// next call tries again at its own size.
+    fn reserve_staging(&mut self, gpu: &Gpu, pages: i32) -> Result<()> {
+        if pages <= self.stage_pages {
+            return Ok(());
+        }
+        let want = staging_pages(1, pages)?.min(self.max_pages).max(pages);
+        self.scratch_k = None;
+        self.scratch_v = None;
+        self.stage_pages = 0;
+        let bytes = stage_bytes(want)?;
+        let k = gpu
+            .zeroed(bytes)
+            .map_err(|err| staging_oom(err, want, bytes))?;
+        let v = gpu
+            .zeroed(bytes)
+            .map_err(|err| staging_oom(err, want, bytes))?;
+        self.scratch_k = Some(k);
+        self.scratch_v = Some(v);
+        self.stage_pages = want;
+        Ok(())
+    }
+}
+
+/// Bytes of one fp16 staging buffer of `pages` pages.
+fn stage_bytes(pages: i32) -> Result<usize> {
+    let per_page = usize::try_from(PAGE * KV_HEADS as u32 * HEAD_DIM as u32 * 2).unwrap_or(0);
+    usize::try_from(pages)
+        .ok()
+        .and_then(|p| p.checked_mul(per_page))
+        .ok_or_else(|| Error::Input("attention staging scratch overflows".into()))
+}
+
+fn staging_oom(err: Error, pages: i32, bytes: usize) -> Error {
+    Error::Input(format!(
+        "attention prefill staging: {pages} pages ({} MiB each for k and v) did not fit: {err}",
+        bytes >> 20
+    ))
 }
 
 impl AttnLayer {
@@ -1698,6 +1746,9 @@ impl AttnLayer {
         rows: u32,
     ) -> Result<()> {
         let span = self.prefill_span(scratch, input, output, start, rows)?;
+        if needs_staging(span.rows) {
+            scratch.reserve_staging(gpu, span.pages)?;
+        }
         // Both host values are written before either copy. `seq_host` is
         // `start` and `pos_host` is `start + rows`. The first copy publishes
         // `start` for the kernels; the second publishes the new length after
@@ -1871,12 +1922,6 @@ impl AttnLayer {
             need_bytes(&scratch.c_ptrs, ptr_bytes, "mgemm c_ptrs")?;
         }
         if needs_staging(rows_i) {
-            let elems = staging_scratch_elems(1, pages)?;
-            let bytes = elems
-                .checked_mul(2)
-                .ok_or_else(|| Error::Input("staging scratch overflows".into()))?;
-            need_bytes(&scratch.scratch_k, bytes, "staging k")?;
-            need_bytes(&scratch.scratch_v, bytes, "staging v")?;
             let table_bytes = usize::try_from(pages)
                 .unwrap_or(0)
                 .checked_mul(4)
@@ -1963,15 +2008,13 @@ impl AttnLayer {
             q_norm: self.q_norm.ptr().as_u64(),
             k_norm: self.k_norm.ptr().as_u64(),
             h32: self.h32.ptr().as_u64(),
-            scratch_k: if staging {
-                scratch.scratch_k.ptr().as_u64()
-            } else {
-                0
+            scratch_k: match &scratch.scratch_k {
+                Some(buf) if staging => buf.ptr().as_u64(),
+                _ => 0,
             },
-            scratch_v: if staging {
-                scratch.scratch_v.ptr().as_u64()
-            } else {
-                0
+            scratch_v: match &scratch.scratch_v {
+                Some(buf) if staging => buf.ptr().as_u64(),
+                _ => 0,
             },
             identity_table: if staging {
                 scratch.identity.ptr().as_u64()
