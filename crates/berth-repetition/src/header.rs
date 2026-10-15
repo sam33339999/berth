@@ -25,7 +25,10 @@ pub const TAIL_LOOKBACK_MIN: u32 = 512;
 /// Also the per-channel buffer cap ([`crate::MAX_WINDOW`]).
 pub const TAIL_LOOKBACK_MAX: u32 = 4096;
 
-/// Accepted tokens retained per channel. Exact-repeat never looks past this.
+/// Accepted tokens retained per channel. Exact-repeat reads only this buffer.
+/// A count already recorded can still rise after older tokens fall off: the new
+/// copy is checked against the buffer, and the copies already counted stay in
+/// the total.
 pub const MAX_WINDOW: usize = TAIL_LOOKBACK_MAX as usize;
 
 const _: () = assert!(MAX_WINDOW == 4096);

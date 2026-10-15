@@ -16,9 +16,11 @@
 //!   Low-diversity / `low_logprob` is not implemented and is never emitted.
 //!
 //! Labels accumulate for the request: insertion order, duplicates skipped,
-//! 256 bytes and 64 labels max. A new label is the signal to send the
-//! mid-stream event again, carrying the whole set. An empty set produces no
-//! event and no completion field.
+//! 256 bytes and 64 labels max. One exact-repeat label is kept per
+//! `(length, channel)`. A larger count rewrites that label in place and does
+//! not take a new slot. A smaller count does not. A new label, or a rewritten
+//! exact count, is the signal to send the mid-stream event again, carrying
+//! the whole set. An empty set produces no event and no completion field.
 //!
 //! Spec: `docs/repetition.md`.
 //!
@@ -28,8 +30,13 @@
 //! Among blocks with `len >= L` and `count >= 2` that tile that suffix, it
 //! records the smallest `len`, and for that `len` the largest `count`.
 //! A longer multiple of the same run is not also recorded at that step.
-//! The next copy, when it completes, is a new label: `exact_repetition:64x2@thinking`
-//! then `exact_repetition:64x3@thinking`. Both stay in the set.
+//! The same `(len, channel)` keeps a single label. The next copy rewrites it:
+//! `exact_repetition:64x2@thinking` becomes `exact_repetition:64x3@thinking`.
+//! The same length on the other channel is a different label.
+//!
+//! The retained window is at most 4096 tokens. A run that continues past that
+//! still raises the count. The new copy is checked against the window, and
+//! the copies already counted stay in the label.
 //!
 //! Detection is one Z-array over the reversed window: **O(W) time per accepted
 //! token**, O(W) scratch, W <= 4096. The bound does not grow with the generation.
@@ -87,11 +94,11 @@ pub enum Sampled {
 ///
 /// `new_trigger` is the edge: send [`Self::mid_stream_event`] only when it is set.
 /// The event text, when present, carries the full accumulated set, not only the
-/// label just added. No event is produced when the set is empty.
+/// label just added or rewritten. No event is produced when the set is empty.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[must_use = "new_trigger means the engine should send mid_stream_event"]
 pub struct Outcome {
-    /// At least one label was stored on this call.
+    /// At least one label was stored, or an exact-repeat count was raised.
     pub new_trigger: bool,
     /// Mid-stream SSE text to send when [`Self::new_trigger`] is set.
     pub mid_stream_event: Option<String>,
@@ -115,10 +122,25 @@ pub struct RepetitionCheck<D: TailDetector> {
     detector: D,
     thinking: VecDeque<TokenId>,
     response: VecDeque<TokenId>,
+    /// Accepted tokens ever pushed on each channel, including ones that have
+    /// fallen out of the window. Exact-run anchors are in this count.
+    thinking_seen: u64,
+    response_seen: u64,
+    /// One anchor per exact `(channel, len)` whose label was stored.
+    exact_runs: Vec<ExactRun>,
     triggers: TriggerSet,
     snapshot: Vec<TokenId>,
     reversed: Vec<TokenId>,
     z: Vec<usize>,
+}
+
+/// High-water mark for one exact `(channel, len)`, and the accepted-token
+/// count where that mark was written.
+struct ExactRun {
+    channel: Channel,
+    len: u32,
+    count: u32,
+    at: u64,
 }
 
 impl<D: TailDetector + Default> Default for RepetitionCheck<D> {
@@ -134,6 +156,9 @@ impl<D: TailDetector> RepetitionCheck<D> {
             detector,
             thinking: VecDeque::with_capacity(MAX_WINDOW),
             response: VecDeque::with_capacity(MAX_WINDOW),
+            thinking_seen: 0,
+            response_seen: 0,
+            exact_runs: Vec::new(),
             triggers: TriggerSet::new(),
             snapshot: Vec::with_capacity(MAX_WINDOW),
             reversed: Vec::with_capacity(MAX_WINDOW),
@@ -191,7 +216,8 @@ impl<D: TailDetector> RepetitionCheck<D> {
     /// On a token where both checks fire, the exact-repeat label is considered
     /// first, then each distinct `t` from the detector in return order.
     /// A label that loses to the 256-byte cap or the 64-label cap does not count
-    /// as new, so it does not by itself cause another mid-stream event.
+    /// as new. Rewriting an exact-repeat count does, including when 64 labels
+    /// are already stored: the rewrite does not add a slot.
     pub fn observe(&mut self, channel: Channel, sampled: Sampled) -> Outcome {
         let token = match sampled {
             Sampled::Accepted(token) => token,
@@ -203,12 +229,19 @@ impl<D: TailDetector> RepetitionCheck<D> {
         self.push(channel, token);
         self.load_snapshot(channel);
 
-        let mut batch = Vec::new();
+        let mut changed = false;
         if let Some(min_len) = self.config.exact_min_tokens() {
-            if let Some((len, count)) =
+            if let Some((len, visible)) =
                 exact::best_run(&self.snapshot, min_len, &mut self.reversed, &mut self.z)
             {
-                batch.push(format!("exact_repetition:{len}x{count}@{channel}"));
+                let count = self.running_exact_count(channel, len, visible);
+                if record_exact(&mut self.triggers, len, count, channel) {
+                    // Anchor the next copy to this token. A count that does not
+                    // raise the stored one leaves the anchor alone, so a shorter
+                    // later run cannot walk the old count up one block at a time.
+                    self.remember_exact(channel, len, count);
+                    changed = true;
+                }
             }
         }
         if let Some(lookback) = self.config.tail_lookback() {
@@ -220,17 +253,16 @@ impl<D: TailDetector> RepetitionCheck<D> {
                     continue;
                 }
                 seen.push(t);
-                batch.push(format!("tail_repetition:{t}@{channel}"));
+                if self
+                    .triggers
+                    .insert(&format!("tail_repetition:{t}@{channel}"))
+                {
+                    changed = true;
+                }
             }
         }
 
-        let mut added = false;
-        for label in &batch {
-            if self.triggers.insert(label) {
-                added = true;
-            }
-        }
-        if !added {
+        if !changed {
             return Outcome::silent();
         }
         let mid_stream_event = format_mid_stream_event(self.triggers.as_slice());
@@ -241,7 +273,52 @@ impl<D: TailDetector> RepetitionCheck<D> {
         }
     }
 
+    /// Count to record for this `(len, channel)`.
+    ///
+    /// [`exact::best_run`] only sees the retained window, so once a run has
+    /// filled it, each further copy still reports that same `visible` count.
+    /// If this copy ends exactly one block after the count already stored, the
+    /// run is still going and the stored count goes up by one.
+    fn running_exact_count(&self, channel: Channel, len: u32, visible: u32) -> u32 {
+        let seen = self.seen(channel);
+        let step = u64::from(len);
+        for run in &self.exact_runs {
+            if run.channel == channel && run.len == len && seen.saturating_sub(run.at) == step {
+                return visible.max(run.count.saturating_add(1));
+            }
+        }
+        visible
+    }
+
+    fn remember_exact(&mut self, channel: Channel, len: u32, count: u32) {
+        let at = self.seen(channel);
+        for run in &mut self.exact_runs {
+            if run.channel == channel && run.len == len {
+                run.count = count;
+                run.at = at;
+                return;
+            }
+        }
+        self.exact_runs.push(ExactRun {
+            channel,
+            len,
+            count,
+            at,
+        });
+    }
+
+    fn seen(&self, channel: Channel) -> u64 {
+        match channel {
+            Channel::Thinking => self.thinking_seen,
+            Channel::Response => self.response_seen,
+        }
+    }
+
     fn push(&mut self, channel: Channel, token: TokenId) {
+        match channel {
+            Channel::Thinking => self.thinking_seen += 1,
+            Channel::Response => self.response_seen += 1,
+        }
         let buf = self.buffer_mut(channel);
         if buf.len() == MAX_WINDOW {
             let _ = buf.pop_front();
@@ -274,4 +351,54 @@ impl<D: TailDetector> RepetitionCheck<D> {
 fn copy_window(src: &VecDeque<TokenId>, dst: &mut Vec<TokenId>) {
     dst.clear();
     dst.extend(src.iter().copied());
+}
+
+/// One exact label per `(len, channel)`. A larger `count` rewrites that label
+/// in place. A smaller or equal `count` leaves the set unchanged. The first
+/// label for the pair is an ordinary insert, so the byte cap and the 64-label
+/// cap still apply to it.
+fn record_exact(triggers: &mut TriggerSet, len: u32, count: u32, channel: Channel) -> bool {
+    if let Some((index, stored)) = find_exact(triggers.as_slice(), len, channel) {
+        if count <= stored {
+            return false;
+        }
+        return triggers.replace_at(index, &format_exact(len, count, channel));
+    }
+    triggers.insert(&format_exact(len, count, channel))
+}
+
+fn format_exact(len: u32, count: u32, channel: Channel) -> String {
+    format!("exact_repetition:{len}x{count}@{channel}")
+}
+
+fn find_exact(labels: &[String], len: u32, channel: Channel) -> Option<(usize, u32)> {
+    for (index, label) in labels.iter().enumerate() {
+        if let Some((parsed_len, count, parsed_channel)) = parse_exact_label(label) {
+            if parsed_len == len && parsed_channel == channel {
+                return Some((index, count));
+            }
+        }
+    }
+    None
+}
+
+fn parse_exact_label(label: &str) -> Option<(u32, u32, Channel)> {
+    let rest = label.strip_prefix("exact_repetition:")?;
+    let (len_text, rest) = rest.split_once('x')?;
+    let (count_text, channel_text) = rest.split_once('@')?;
+    if !is_ascii_digits(len_text) || !is_ascii_digits(count_text) {
+        return None;
+    }
+    let len = len_text.parse().ok()?;
+    let count = count_text.parse().ok()?;
+    let channel = match channel_text {
+        "thinking" => Channel::Thinking,
+        "response" => Channel::Response,
+        _ => return None,
+    };
+    Some((len, count, channel))
+}
+
+fn is_ascii_digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }

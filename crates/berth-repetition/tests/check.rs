@@ -35,6 +35,17 @@ impl TailDetector for ScriptedTail {
     }
 }
 
+/// Returns one fixed set of `t` values and does not store the windows.
+struct FixedTail {
+    answer: Vec<u32>,
+}
+
+impl TailDetector for FixedTail {
+    fn detect(&mut self, _channel: Channel, _window: &[u32]) -> Vec<u32> {
+        self.answer.clone()
+    }
+}
+
 struct PanicTail;
 
 impl TailDetector for PanicTail {
@@ -127,10 +138,12 @@ fn exact_repetition_doc_example_64x3_thinking() {
     assert!(check.triggers().is_empty());
 
     let mut saw_two = false;
+    let mut second_event = None;
     for token in block.iter() {
         let outcome = check.observe(Channel::Thinking, accept(*token));
         if outcome.new_trigger {
             saw_two = true;
+            second_event = outcome.mid_stream_event;
             assert_eq!(
                 check.triggers(),
                 ["exact_repetition:64x2@thinking".to_string()]
@@ -138,26 +151,41 @@ fn exact_repetition_doc_example_64x3_thinking() {
         }
     }
     assert!(saw_two, "the second copy is reported when it completes");
+    assert_eq!(
+        second_event.as_deref(),
+        Some(
+            "event: response.repetition_check\n\
+             data: {\"type\":\"response.repetition_check\",\"repetition_check\":{\"triggers\":[\"exact_repetition:64x2@thinking\"]}}\n"
+        )
+    );
 
     let mut third = Outcome {
         new_trigger: false,
         mid_stream_event: None,
     };
-    for token in block.iter() {
-        third = check.observe(Channel::Thinking, accept(*token));
+    for (index, token) in block.iter().enumerate() {
+        let outcome = check.observe(Channel::Thinking, accept(*token));
+        if index + 1 < block.len() {
+            assert!(!outcome.new_trigger, "the same count is not sent again");
+        }
+        third = outcome;
     }
-    assert!(third.new_trigger);
+    assert!(third.new_trigger, "a higher count is sent again");
     assert_eq!(
         check.triggers(),
-        [
-            "exact_repetition:64x2@thinking".to_string(),
-            "exact_repetition:64x3@thinking".to_string(),
-        ]
+        ["exact_repetition:64x3@thinking".to_string()]
     );
-    let event = third.mid_stream_event.expect("third copy is a new trigger");
-    assert!(event.contains("exact_repetition:64x2@thinking"));
-    assert!(event.contains("exact_repetition:64x3@thinking"));
-    assert!(event.find("64x2").unwrap() < event.find("64x3").unwrap());
+    assert_eq!(
+        third.mid_stream_event.as_deref(),
+        Some(
+            "event: response.repetition_check\n\
+             data: {\"type\":\"response.repetition_check\",\"repetition_check\":{\"triggers\":[\"exact_repetition:64x3@thinking\"]}}\n"
+        )
+    );
+    assert_eq!(
+        check.completion_field().as_deref(),
+        Some("\"repetition_check\": {\"triggers\": [\"exact_repetition:64x3@thinking\"]}")
+    );
 }
 
 #[test]
@@ -539,4 +567,177 @@ fn headers_parse_from_a_mixed_list() {
     ]);
     assert_eq!(config.exact_min_tokens(), Some(64));
     assert_eq!(config.tail_lookback(), Some(4096));
+}
+
+#[test]
+fn exact_run_to_64x70_keeps_one_label_and_a_later_tail_still_fits() {
+    let mut check = RepetitionCheck::new(
+        CheckConfig::new(Some(TAIL_LOOKBACK_MIN), Some(PROPOSED_EXACT_MIN_TOKENS)),
+        FixedTail { answer: Vec::new() },
+    );
+    let block = block(PROPOSED_EXACT_MIN_TOKENS);
+    for copy in 1..=70u32 {
+        feed(&mut check, Channel::Thinking, &block);
+        if copy == 1 {
+            assert!(check.triggers().is_empty());
+        } else {
+            assert_eq!(
+                check.triggers(),
+                [format!("exact_repetition:64x{copy}@thinking")]
+            );
+        }
+    }
+
+    check.detector_mut().answer = vec![4];
+    let outcome = check.observe(Channel::Thinking, accept(u32::MAX));
+    assert!(outcome.new_trigger);
+    assert_eq!(
+        check.triggers(),
+        [
+            "exact_repetition:64x70@thinking".to_string(),
+            "tail_repetition:4@thinking".to_string(),
+        ]
+    );
+    let event = outcome.mid_stream_event.expect("the tail label is new");
+    assert!(event.contains("[\"exact_repetition:64x70@thinking\",\"tail_repetition:4@thinking\"]"));
+}
+
+#[test]
+fn exact_rewrite_still_fits_when_the_trigger_list_is_full() {
+    let mut check = RepetitionCheck::new(
+        CheckConfig::new(Some(TAIL_LOOKBACK_MIN), Some(4)),
+        FixedTail { answer: Vec::new() },
+    );
+    let block = block(4);
+    feed(&mut check, Channel::Response, &block);
+    feed(&mut check, Channel::Response, &block);
+    assert_eq!(
+        check.triggers(),
+        ["exact_repetition:4x2@response".to_string()]
+    );
+
+    check.detector_mut().answer = (0..63).collect();
+    let filled = check.observe(Channel::Response, accept(block[0]));
+    assert!(filled.new_trigger);
+    assert_eq!(check.triggers().len(), MAX_TRIGGERS);
+    assert_eq!(check.triggers()[0], "exact_repetition:4x2@response");
+    assert_eq!(check.triggers()[1], "tail_repetition:0@response");
+    assert_eq!(check.triggers()[63], "tail_repetition:62@response");
+    let tails = check.triggers()[1..].to_vec();
+
+    let mut rewritten = Outcome {
+        new_trigger: false,
+        mid_stream_event: None,
+    };
+    for token in &block[1..] {
+        rewritten = check.observe(Channel::Response, accept(*token));
+    }
+    assert!(
+        rewritten.new_trigger,
+        "raising the count sends the set again"
+    );
+    assert_eq!(check.triggers().len(), MAX_TRIGGERS);
+    assert_eq!(check.triggers()[0], "exact_repetition:4x3@response");
+    assert_eq!(&check.triggers()[1..], &tails[..]);
+    let event = rewritten.mid_stream_event.expect("rewrite is a change");
+    assert!(event.contains("exact_repetition:4x3@response"));
+    assert!(!event.contains("exact_repetition:4x2@response"));
+    assert!(event.contains("tail_repetition:0@response"));
+    assert!(event.contains("tail_repetition:62@response"));
+    assert!(
+        event.find("exact_repetition:4x3@response").unwrap()
+            < event.find("tail_repetition:0@response").unwrap()
+    );
+
+    check.detector_mut().answer = vec![999];
+    let dropped = check.observe(Channel::Response, accept(u32::MAX));
+    assert!(!dropped.new_trigger);
+    assert!(dropped.mid_stream_event.is_none());
+    assert_eq!(check.triggers().len(), MAX_TRIGGERS);
+    assert_eq!(check.triggers()[0], "exact_repetition:4x3@response");
+}
+
+#[test]
+fn same_exact_length_on_the_other_channel_is_a_separate_label() {
+    let mut check = RepetitionCheck::new(
+        CheckConfig::new(None, Some(PROPOSED_EXACT_MIN_TOKENS)),
+        PanicTail,
+    );
+    let block = block(PROPOSED_EXACT_MIN_TOKENS);
+    feed(&mut check, Channel::Thinking, &block);
+    feed(&mut check, Channel::Thinking, &block);
+    feed(&mut check, Channel::Response, &block);
+    feed(&mut check, Channel::Response, &block);
+    assert_eq!(
+        check.triggers(),
+        [
+            "exact_repetition:64x2@thinking".to_string(),
+            "exact_repetition:64x2@response".to_string(),
+        ]
+    );
+
+    feed(&mut check, Channel::Thinking, &block);
+    assert_eq!(
+        check.triggers(),
+        [
+            "exact_repetition:64x3@thinking".to_string(),
+            "exact_repetition:64x2@response".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn different_exact_lengths_each_keep_one_label() {
+    let mut check = RepetitionCheck::new(CheckConfig::new(None, Some(2)), PanicTail);
+    feed(&mut check, Channel::Response, &[1, 2, 1, 2]);
+    assert_eq!(
+        check.triggers(),
+        ["exact_repetition:2x2@response".to_string()]
+    );
+    feed(&mut check, Channel::Response, &[3, 4, 5, 6, 3, 4, 5, 6]);
+    assert_eq!(
+        check.triggers(),
+        [
+            "exact_repetition:2x2@response".to_string(),
+            "exact_repetition:4x2@response".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn smaller_exact_count_does_not_downgrade() {
+    let mut check = RepetitionCheck::new(CheckConfig::new(None, Some(8)), PanicTail);
+    let first = block(8);
+    let second: Vec<u32> = (100..108).collect();
+    feed(&mut check, Channel::Thinking, &first);
+    feed(&mut check, Channel::Thinking, &first);
+    feed(&mut check, Channel::Thinking, &first);
+    assert_eq!(
+        check.triggers(),
+        ["exact_repetition:8x3@thinking".to_string()]
+    );
+
+    let mut raised = false;
+    for _ in 0..2 {
+        for token in &second {
+            raised |= check.observe(Channel::Thinking, accept(*token)).new_trigger;
+        }
+    }
+    assert!(!raised);
+    assert_eq!(
+        check.triggers(),
+        ["exact_repetition:8x3@thinking".to_string()]
+    );
+    let event = check.mid_stream_event().expect("the larger count stays");
+    assert!(event.contains("exact_repetition:8x3@thinking"));
+    assert!(!event.contains("exact_repetition:8x2@thinking"));
+
+    let mut alone = RepetitionCheck::new(CheckConfig::new(None, Some(8)), PanicTail);
+    feed(&mut alone, Channel::Thinking, &second);
+    feed(&mut alone, Channel::Thinking, &second);
+    assert_eq!(
+        alone.triggers(),
+        ["exact_repetition:8x2@thinking".to_string()],
+        "the later block would have been 8x2 on its own"
+    );
 }

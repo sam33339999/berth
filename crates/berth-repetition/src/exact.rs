@@ -4,12 +4,11 @@
 //! ending at the newest accepted token. A single different token between copies
 //! means they are not consecutive, so the pair does not qualify.
 //!
-//! When several `(len, count)` pairs qualify, the recorded label is the smallest
-//! `len` that is at least the configured minimum, with the largest `count` of
-//! that block. Larger multiples of the same run are not also recorded at that
-//! step. As the run grows, each new count is a new label (`64x2`, then `64x3`),
-//! because each was the longest run of the smallest period at the token where it
-//! completed.
+//! When several `(len, count)` pairs qualify, the pair reported here is the
+//! smallest `len` that is at least the configured minimum, with the largest
+//! `count` of that block. Larger multiples of the same run are not also
+//! reported at that step. The caller keeps one label per `(len, channel)` and
+//! rewrites that label when `count` grows.
 //!
 //! Cost: one Z-array over the reversed window. That is O(W) time per accepted
 //! token and O(W) scratch, with W <= [`crate::MAX_WINDOW`] (4096). Appending a

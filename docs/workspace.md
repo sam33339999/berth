@@ -92,12 +92,8 @@ shim 放在 `crates/berth-kernels` 裡，只 include fork 的 `.cuh`。fork 外�
 
 ## 第 1 階段（27B）的起手順序
 
-1. `berth-exl3`：讀 27B 的 checkpoint，印出每條張量的 K 和形狀，和 Python 對照。不需要 GPU
-2. `berth-plan`：建出 `Qwen3_5ForConditionalGeneration` 的 64 層計畫，整包停 VRAM
-3. `berth-cache`、`berth-repetition`：照規格寫，加單元測試
+1. ✅ `berth-exl3`：讀 27B 的 checkpoint，印出每條張量的 K 和形狀，和 Python 對照。不需要 GPU
+2. ✅ `berth-plan`：建出 `Qwen3_5ForConditionalGeneration` 的 64 層計畫，整包停 VRAM
+3. ✅ `berth-cache`、`berth-repetition`：照規格寫，加單元測試
 4. `berth-cuda`、`berth-kernels`：先只 shim 一支 `exl3_gemm`。服務停下來時，拿一條張量和 exllamav3 的輸出對
 5. `berth-engine`、`berth`：一個 token 跑通，再接成迴圈
-
-## 純 Rust 四個的待辦
-
-- `berth-repetition`：原樣重複每長一輪送一條 `64x2`、`64x3`……，長迴圈可能把 64 條標記用完，之後的尾端標記送不出去。這是照 [repetition.md](repetition.md) 字面寫的，要不要改還沒定

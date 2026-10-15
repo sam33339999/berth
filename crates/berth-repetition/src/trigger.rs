@@ -2,7 +2,8 @@
 //!
 //! Insertion-ordered and deduplicated. A label longer than 256 bytes is dropped.
 //! The 65th distinct label is dropped. Dropped labels are not truncated and do
-//! not count as a new trigger.
+//! not count as a new trigger. Replacing the text of a label already in the
+//! list does not take a slot, and it still runs when the list is full.
 
 /// Maximum stored label length, in bytes (not chars).
 pub const MAX_LABEL_BYTES: usize = 256;
@@ -41,6 +42,23 @@ impl TriggerSet {
         true
     }
 
+    /// Overwrite the label at `index`.
+    ///
+    /// The list length does not change, so this still works at [`MAX_TRIGGERS`].
+    /// Returns whether the stored string changed. An out-of-range index, a
+    /// label longer than [`MAX_LABEL_BYTES`], the same string, or a string
+    /// already stored at another index leaves the set unchanged.
+    pub(crate) fn replace_at(&mut self, index: usize, label: &str) -> bool {
+        if label.len() > MAX_LABEL_BYTES || index >= self.labels.len() {
+            return false;
+        }
+        if self.labels.iter().any(|stored| stored == label) {
+            return false;
+        }
+        self.labels[index] = label.to_string();
+        true
+    }
+
     pub fn as_slice(&self) -> &[String] {
         &self.labels
     }
@@ -51,5 +69,38 @@ impl TriggerSet {
 
     pub fn len(&self) -> usize {
         self.labels.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replace_at_rewrites_a_full_list_in_place() {
+        let mut set = TriggerSet::new();
+        for index in 0..MAX_TRIGGERS {
+            assert!(set.insert(&format!("label-{index}")));
+        }
+        assert_eq!(set.len(), MAX_TRIGGERS);
+
+        assert!(set.replace_at(0, "label-0b"));
+        assert_eq!(set.len(), MAX_TRIGGERS);
+        assert_eq!(set.as_slice()[0], "label-0b");
+        assert_eq!(set.as_slice()[1], "label-1");
+        assert_eq!(
+            set.as_slice()[MAX_TRIGGERS - 1],
+            format!("label-{}", MAX_TRIGGERS - 1)
+        );
+
+        assert!(!set.replace_at(0, "label-1"), "duplicate");
+        assert_eq!(set.as_slice()[0], "label-0b");
+        assert!(!set.replace_at(0, "label-0b"), "same string");
+
+        let oversized = "z".repeat(MAX_LABEL_BYTES + 1);
+        assert!(!set.replace_at(1, &oversized));
+        assert_eq!(set.as_slice()[1], "label-1");
+        assert!(!set.insert("one-past-cap"));
+        assert_eq!(set.len(), MAX_TRIGGERS);
     }
 }
