@@ -1,6 +1,6 @@
 # 工作區
 
-日期：2026-10-15。這份寫 Rust 工作區怎麼切 crate、每個 crate 放什麼。純 Rust 的四個（`berth-exl3`、`berth-plan`、`berth-cache`、`berth-repetition`）已經實作並有測試。`berth-cuda` 和 `berth-kernels` 也有了，一條 EXL3 Linear 在 GPU 上和 fork 逐位元一致。`berth-engine` 只有那個對照測試，`berth` 還是骨架。
+日期：2026-10-15。這份寫 Rust 工作區怎麼切 crate、每個 crate 放什麼。純 Rust 的四個（`berth-exl3`、`berth-plan`、`berth-cache`、`berth-repetition`）已經實作並有測試。`berth-cuda` 和 `berth-kernels` 也有了，一條 EXL3 Linear 在 GPU 上和 fork 逐位元一致。`berth-engine` 能跑 27B 的一個 decode step（eager，不捕捉 graph），64 層和 logits 都和 fork 逐位元一致。`berth` 還是骨架。
 
 ## 切法
 
@@ -128,9 +128,12 @@ TRITON_LIBCUDA_PATH=/usr/lib/x86_64-linux-gnu \
 2. ✅ `berth-plan`：建出 `Qwen3_5ForConditionalGeneration` 的 64 層計畫，整包停 VRAM
 3. ✅ `berth-cache`、`berth-repetition`：照規格寫，加單元測試
 4. ✅ `berth-cuda`、`berth-kernels`：shim int8 GEMV 和 `lm_head` 的協作式 GEMM，拿 `testdata/exl3_ref/` 的輸出逐位元對。`crates/berth-engine/tests/exl3_ref.rs`，`BERTH_GPU_TESTS=1` 時跑，4 條全部一致
-5. `berth-engine`、`berth`：一個 token 跑通，再接成迴圈
+5. `berth-engine`、`berth`：一個 token 跑通，再接成迴圈。一個 token 已經通了：`crates/berth-engine/tests/decode_ref.rs` 在位置 0 跑完 embedding、64 個 block、final norm、`lm_head`，65 處和 `testdata/decode_ref/` 比對，全部 0 個元素不同。還沒做的是迴圈、抽樣、graph 捕捉和 HTTP
 
 ## 第 4 步留下的
 
 - `berth-cuda` 的 `Capture::record` 只記得到透過 `berth-cuda` 的 `Function` launch 的 kernel。`berth-kernels` 在 nvcc 編的程式裡用 runtime 直接 launch，那些節點現在記不到參數。第 5 步把整層捕捉成 graph 之前要補
 - `berth-kernels` 還不依賴 `berth-cuda`，吃的是原始指標和 stream handle。`berth-engine` 接起兩邊
+- `rms_norm_eps`（1e-6）在 `berth-engine` 的 `gdn.rs` 和 `model.rs` 裡寫死，因為 `berth-exl3` 的 `ModelConfig` 沒讀這個欄位。要加進 `ModelConfig`，改成從 config 讀
+- attention 的 Triton cubin 在 `berth-kernels/csrc/attn/triton_launch.cu` 自己用 `dlsym` 找 libcuda 來 launch，因為 `berth-cuda` 的 `Function` 不能設超過 48 KiB 的 dynamic shared memory。27B 的兩支都不到 48 KiB。要在 `berth-cuda` 補上這個屬性，再拿掉這支 launcher
+- 位置 1 之後的 decode 還沒有對照資料。`AttnLayer` 在位置 1 跑得完、輸出有限，但沒有和 fork 比過。要多錄幾個 token 的參考

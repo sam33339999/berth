@@ -50,6 +50,7 @@ dependencies = [
  "berth-plan",
  "berth-repetition",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
