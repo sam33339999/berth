@@ -1,6 +1,6 @@
 # 工作區
 
-日期：2026-10-15。這份寫 Rust 工作區怎麼切 crate、每個 crate 放什麼。純 Rust 的四個（`berth-exl3`、`berth-plan`、`berth-cache`、`berth-repetition`）已經實作並有測試。`berth-cuda` 和 `berth-kernels` 也有了，一條 EXL3 Linear 在 GPU 上和 fork 逐位元一致。`berth-engine` 能跑 27B 的一個 decode step（eager，不捕捉 graph），64 層和 logits 都和 fork 逐位元一致。`berth` 還是骨架。
+日期：2026-10-15。這份寫 Rust 工作區怎麼切 crate、每個 crate 放什麼。純 Rust 的四個（`berth-exl3`、`berth-plan`、`berth-cache`、`berth-repetition`）已經實作並有測試。`berth-cuda` 和 `berth-kernels` 也有了，一條 EXL3 Linear 在 GPU 上和 fork 逐位元一致。`berth-engine` 能跑 27B 的一個 decode step（eager，不捕捉 graph），64 層和 logits 都和 fork 逐位元一致。`berth` 執行檔已經能對外服務，見「第 5 步之後」。
 
 ## 切法
 
@@ -142,3 +142,18 @@ TRITON_LIBCUDA_PATH=/usr/lib/x86_64-linux-gnu \
 fork 的 attention split 數照 block table 的寬度算，不照實際長度。4096 token 的 cache 是 16 頁，300 步裡 `num_splits` 一直是 33、`split_len` 一直是 128。
 
 eager decode（`tests/decode_bench.rs`，64 步）是 26.25 ms/token，fork 加 CUDA graph 是 25.81 ms/token，差 1.7%。debug 和 release 一樣快，瓶頸在 GPU：CPU 非同步排 kernel，一直跑在 GPU 前面。graph 捕捉在自回歸 decode 最多省這 1.7%，先不做；等 DFlash2 草稿和驗證讓 kernel 變多變小時再做。`berth-cuda` 已經能找到並改 nvcc 程式 launch 的 graph 節點（`Graph::kernel_nodes`、`set_node_param`），每個 token 會變的值在 `Model::decode_step` 前已經用非同步複製放進 device memory，剩下要改節點參數的是 Triton split / combine 的 `num_splits`、`split_len` 和 num_pages。
+
+## 第 5 步之後：能服務了
+
+`berth-engine` 的 `Engine` 加上 GPU 抽樣（`Sampler`，rep / pres-freq / DRY 懲罰、溫度、Gumbel 抽樣，同一個 seed 和 fork 抽出同一串 token），`crates/berth` 是 OpenAI 相容的 HTTP 服務：`/health`、`/v1/models`、`/v1/chat/completions`（含 SSE、`reasoning_content`、重複檢查事件）、`/v1/completions`。一次只跑一個 GPU job，斷線就取消。
+
+```text
+cargo build --release -p berth
+./target/release/berth --host 127.0.0.1 --port 18889
+```
+
+預設 port 是 8889，和正式服務一樣；兩個不能同時開，VRAM 只放得下一份 27B。
+
+greedy 299 步和 fork 的 argmax 完全一樣（`crates/berth-engine/tests/generate.rs`）。
+
+還沒有 prefill：prompt 也是一個 token 一個 token 走 decode，每個 token 約 26 ms，長 prompt 要等很久才開始回答。fork 的 prompt 走 prefill，所以多 token 的 prompt 在 berth 和服務上的結果不會逐位元一樣。下一步是 prefill。

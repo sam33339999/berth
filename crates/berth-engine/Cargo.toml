@@ -13,8 +13,8 @@ berth-cache = { path = "../berth-cache" }
 berth-repetition = { path = "../berth-repetition" }
 berth-cuda = { path = "../berth-cuda" }
 berth-kernels = { path = "../berth-kernels" }
+serde_json = "1"
 thiserror.workspace = true
 
 [dev-dependencies]
 blake2 = "0.10"
-serde_json = "1"

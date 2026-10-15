@@ -26,8 +26,12 @@ mod error;
 
 pub mod attn;
 pub mod gdn;
+pub mod generate;
 pub mod mlp;
 pub mod model;
+pub mod sampler;
 
 pub use device::{upload_tensor, Exl3Linear, Gpu};
 pub use error::{Error, Result};
+pub use generate::{Engine, Finish, Flow, GenerateRequest, Usage};
+pub use sampler::{Sampler, SamplerConfig};

@@ -201,6 +201,52 @@ const FORK_EXTRACTS: &[Extract] = &[
             contains: "rope_kernel",
         }],
     },
+    // Sampler device code. These .cu files include ATen above the kernels,
+    // so the host launchers in csrc/sample include the generated headers.
+    Extract {
+        name: "rep_pen_kernels.cuh",
+        parts: &[
+            Part {
+                file: "generator/rep_pen.cu",
+                first: 9,
+                last: 91,
+                contains: "apply_rep_pens_kernel",
+            },
+            Part {
+                file: "generator/rep_pen.cu",
+                first: 137,
+                last: 201,
+                contains: "apply_pres_freq_pens_kernel",
+            },
+        ],
+    },
+    Extract {
+        name: "dry_kernel.cuh",
+        parts: &[Part {
+            file: "generator/dry.cu",
+            first: 30,
+            last: 132,
+            contains: "dry_penalty_kernel",
+        }],
+    },
+    Extract {
+        name: "gumbel_kernels.cuh",
+        parts: &[Part {
+            file: "generator/gumbel.cu",
+            first: 10,
+            last: 94,
+            contains: "gumbel_noise_kernel_f32",
+        }],
+    },
+    Extract {
+        name: "sampling_fused_kernels.cuh",
+        parts: &[Part {
+            file: "generator/sampling_fused.cu",
+            first: 32,
+            last: 768,
+            contains: "fs_partial_argmax_kernel",
+        }],
+    },
 ];
 
 fn extract_fork_kernels(ext: &Path, out_dir: &Path) {

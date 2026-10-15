@@ -357,6 +357,25 @@ impl GdnLayer {
         }
         Ok(())
     }
+
+    /// Zero conv and recurrent state in the allocations from [`Self::load`].
+    ///
+    /// `GDNLayerState.clear` (`gated_delta_net.py`) does `zero_()` on the
+    /// slot. `Cache.get_new_state` asks for that when a job has no stashed
+    /// checkpoint. Nothing is reallocated. `berth-cuda` has no memset on an
+    /// existing buffer, so the zeros are copied into the same device memory.
+    /// The caller synchronizes `gpu.stream` first if a forward is still queued.
+    pub fn reset_state(&mut self, gpu: &Gpu) -> Result<()> {
+        zero_in_place(gpu, &mut self.conv_state)?;
+        zero_in_place(gpu, &mut self.recurrent_state)?;
+        Ok(())
+    }
+}
+
+fn zero_in_place(gpu: &Gpu, buf: &mut ByteBuf) -> Result<()> {
+    let zeros = vec![0u8; buf.num_bytes()];
+    buf.copy_from_host(&gpu.stream, &zeros)?;
+    Ok(())
 }
 
 fn dims_for(shape: &ModelShape, layer: u32) -> Result<Dims> {

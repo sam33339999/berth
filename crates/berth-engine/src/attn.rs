@@ -371,6 +371,24 @@ impl AttnLayer {
         self.bound_positions = Some(positions);
     }
 
+    /// Set this layer's cache length to 0.
+    ///
+    /// A fresh job starts at `kv_position = 0` (`generator/pagetable.py`,
+    /// `Sequence.__init__` and `CachePage.add_ref_unique`). Those paths do
+    /// not zero K/V pages. The next token overwrites position 0 before
+    /// attention reads it, and the kernel stops at `cache_seqlens`.
+    ///
+    /// Writes the private `seqlens` and rope `positions` words. When
+    /// [`Self::bind_sequence`] is in effect the kernels read the shared word
+    /// instead; [`crate::model::Model::reset_sequence`] clears that too.
+    /// The page allocations are unchanged.
+    pub fn reset_cache(&mut self, gpu: &Gpu) -> Result<()> {
+        let zero = [0u8; 4];
+        self.seqlens.copy_from_host(&gpu.stream, &zero)?;
+        self.positions.copy_from_host(&gpu.stream, &zero)?;
+        Ok(())
+    }
+
     /// `output = self_attn(input)` for the token at `position` (0-based; the
     /// cache holds `position` earlier tokens), writing this token's K/V.
     ///

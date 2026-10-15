@@ -35,6 +35,7 @@ mod error;
 mod ffi;
 pub mod gdn;
 pub mod ops;
+pub mod sample;
 
 pub use error::{Error, Result};
 

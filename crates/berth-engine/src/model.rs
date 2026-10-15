@@ -2,7 +2,8 @@
 //! norm, lm_head.
 //!
 //! Owner: task MODEL. Uses [`crate::gdn::GdnLayer`], [`crate::attn::AttnLayer`],
-//! and [`crate::mlp::MlpLayer`] through their `load` / `forward` only.
+//! and [`crate::mlp::MlpLayer`] through their `load` / `forward`. Between
+//! requests, [`Model::reset_sequence`] also calls each mixer's state reset.
 //!
 //! One block follows [`crate`]'s decode sketch, which is
 //! `TransformerBlock.forward` (`modules/transformer.py`) at batch 1:
@@ -30,7 +31,7 @@
 //! `prefer_cpu` and `model_ls.py` loads it on the host; that choice is for
 //! the service, which also keeps a draft model on the same card.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use berth_cuda::{ByteBuf, PinnedBuf};
 use berth_exl3::{Checkpoint, DType};
@@ -236,7 +237,21 @@ impl Model {
     /// `max_tokens` is the attention cache length and must be a positive
     /// multiple of [`ATTN_PAGE_TOKENS`]. `plan` must be the dense Qwen3.5
     /// stack (`ARCH_QWEN3_5`): GDN or full attention, dense MLP, no PLE.
+    ///
+    /// The Triton cubins come from `target/triton-cubins` in this workspace;
+    /// [`Self::load_with_cubins`] takes another directory.
     pub fn load(gpu: &Gpu, ckpt: &Checkpoint, plan: &ModelPlan, max_tokens: u32) -> Result<Self> {
+        Self::load_with_cubins(gpu, ckpt, plan, max_tokens, &default_cubin_dir())
+    }
+
+    /// [`Self::load`], with the Triton attention cubins read from `cubin_dir`.
+    pub fn load_with_cubins(
+        gpu: &Gpu,
+        ckpt: &Checkpoint,
+        plan: &ModelPlan,
+        max_tokens: u32,
+        cubin_dir: &Path,
+    ) -> Result<Self> {
         let shape = validate_plan(plan, max_tokens)?;
         let hidden = i32_width(plan.hidden_size, "hidden_size")?;
         let vocab = i32_width(plan.vocab_size, "vocab_size")?;
@@ -244,7 +259,7 @@ impl Model {
         let norm = TextNorm::qwen3_5(read_rms_eps(ckpt)?);
         // Cubins are a few megabytes. Load them before the embedding table
         // so a missing `target/triton-cubins/` fails without that upload.
-        let paged = PagedDecode::load(&gpu.ctx, &triton_cubin_dir())?;
+        let paged = PagedDecode::load(&gpu.ctx, cubin_dir)?;
         let embed = load_embedding(gpu, ckpt, plan.vocab_size, plan.hidden_size)?;
         let mut blocks = Vec::with_capacity(plan.layers.len());
         for layer in &plan.layers {
@@ -431,6 +446,39 @@ impl Model {
         Ok(())
     }
 
+    /// Drop per-sequence state so the next token is position 0.
+    ///
+    /// A fresh fork job with no prefix hit does the same thing and then
+    /// prefills from the start (`generator/job.py` allocates pages, then
+    /// `Cache.get_new_state` with `clear=True` when no GDN checkpoint was
+    /// stashed). Prefix reuse is out of scope here.
+    ///
+    /// * Every GDN layer's conv and recurrent state is zeroed in its existing
+    ///   device allocation (`GDNLayerState.clear`).
+    /// * Every attention layer's cache length goes back to 0. The fork's
+    ///   `Sequence` starts at `kv_position = 0` and `add_ref_unique` does
+    ///   not scrub K/V bytes; the next write overwrites a position before
+    ///   attention reads it. The live length is the shared `cache_seqlens`
+    ///   word this model stages, plus each layer's private word for the
+    ///   unbound path.
+    ///
+    /// Finishes any queued kernels first. After this returns, [`Self::logits`]
+    /// is not readable until the next [`Self::decode_step`].
+    pub fn reset_sequence(&mut self, gpu: &Gpu) -> Result<()> {
+        self.synchronize(gpu)?;
+        self.captured = false;
+        for block in &mut self.blocks {
+            match &mut block.mixer {
+                MixerSlot::Gdn(layer) => layer.reset_state(gpu)?,
+                MixerSlot::FullAttn(layer) => layer.reset_cache(gpu)?,
+            }
+        }
+        // Attention is bound to this word (`bind_sequence`). Zeroing the
+        // private layer words does not clear it.
+        self.staged.seq.copy_from_host(&gpu.stream, &[0u8; 4])?;
+        Ok(())
+    }
+
     /// Number of decoder layers loaded.
     pub fn num_layers(&self) -> usize {
         self.blocks.len()
@@ -444,6 +492,17 @@ impl Model {
             return Err(Error::Input("decode_step has not completed".to_string()));
         }
         Ok(&self.logits)
+    }
+
+    /// Mutable fp16 `[vocab]` logits of the last [`Self::decode_step`].
+    ///
+    /// The sampler penalizes this row in place. Synchronize `gpu.stream`
+    /// before the sampler reads it. The next [`Self::decode_step`] overwrites it.
+    pub fn logits_mut(&mut self) -> Result<&mut ByteBuf> {
+        if !self.captured {
+            return Err(Error::Input("decode_step has not completed".to_string()));
+        }
+        Ok(&mut self.logits)
     }
 
     /// fp16 `[hidden]` final norm of the last [`Self::decode_step`].
@@ -836,7 +895,7 @@ fn validate_plan(plan: &ModelPlan, max_tokens: u32) -> Result<ModelShape> {
     })
 }
 
-fn triton_cubin_dir() -> PathBuf {
+fn default_cubin_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/triton-cubins")
 }
 
