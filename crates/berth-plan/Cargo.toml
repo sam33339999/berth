@@ -8,4 +8,4 @@ description = "Layer plan and tensor placement for the berth runtime"
 
 [dependencies]
 berth-exl3 = { path = "../berth-exl3" }
-thiserror = "1"
+thiserror.workspace = true
