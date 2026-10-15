@@ -551,6 +551,132 @@ pub fn splits_cap(programs: i32, sm_count: i32) -> Result<i32> {
     i32_fit(cap, "splits_cap")
 }
 
+/// Tile `bc_attn._configure` picks for one decode `q_len` on the 27B.
+///
+/// `block_m = next_pow2(q_len)`, `block_h = max(16 / block_m, 1)`,
+/// `block_rows = block_m * block_h` (16 for `q_len` 1..=16). `programs` is
+/// `bsz * n_kv_heads * cdiv(group, block_h)` with 24 query heads and 4 KV
+/// heads. `splits_cap` is [`splits_cap`] of that program count.
+///
+/// # Errors
+///
+/// `q_len` is outside 1..=16, or `bsz` / `sm_count` is not positive.
+pub fn decode_qlen_tile(q_len: i32, bsz: i32, sm_count: i32) -> Result<DecodeQlenTile> {
+    let geom = qlen_geom(q_len)?;
+    if bsz < 1 || sm_count < 1 {
+        return Err(Error::Launch(
+            "decode_qlen_tile: bsz and sm_count must be positive".into(),
+        ));
+    }
+    let programs = i32_fit(
+        i64::from(bsz) * i64::from(KV_HEADS) * i64::from(geom.h_blocks),
+        "programs",
+    )?;
+    let cap = splits_cap(programs, sm_count)?;
+    Ok(DecodeQlenTile {
+        q_len,
+        block_m: geom.block_m,
+        block_h: geom.block_h,
+        block_rows: geom.block_rows,
+        h_blocks: geom.h_blocks,
+        programs,
+        splits_cap: cap,
+        block_n: 32,
+        hd_pad: HEAD_DIM,
+    })
+}
+
+/// Byte sizes of `partial_o` and `partial_ml` for one `q_len`.
+///
+/// Elements are `programs * splits_cap * block_rows * HD_PAD` and
+/// `programs * splits_cap * block_rows * 2`. Both buffers are fp32.
+///
+/// # Errors
+///
+/// Same as [`decode_qlen_tile`], or a product that does not fit in `usize`.
+pub fn qlen_partial_bytes(q_len: i32, bsz: i32, sm_count: i32) -> Result<(usize, usize)> {
+    let tile = decode_qlen_tile(q_len, bsz, sm_count)?;
+    let rows = i64::from(tile.programs)
+        .checked_mul(i64::from(tile.splits_cap))
+        .and_then(|n| n.checked_mul(i64::from(tile.block_rows)))
+        .ok_or_else(|| Error::Launch("partial rows overflow".into()))?;
+    let o_elems = rows
+        .checked_mul(i64::from(tile.hd_pad))
+        .ok_or_else(|| Error::Launch("partial_o overflow".into()))?;
+    let ml_elems = rows
+        .checked_mul(2)
+        .ok_or_else(|| Error::Launch("partial_ml overflow".into()))?;
+    let o = usize_fit(o_elems, "partial_o")?
+        .checked_mul(4)
+        .ok_or_else(|| Error::Launch("partial_o bytes overflow".into()))?;
+    let ml = usize_fit(ml_elems, "partial_ml")?
+        .checked_mul(4)
+        .ok_or_else(|| Error::Launch("partial_ml bytes overflow".into()))?;
+    Ok((o, ml))
+}
+
+/// `bc_attn._configure` tile for one 27B decode `q_len`.
+pub struct DecodeQlenTile {
+    /// Query length. 1..=16.
+    pub q_len: i32,
+    /// `next_pow2(q_len)`.
+    pub block_m: i32,
+    /// `max(16 / block_m, 1)`.
+    pub block_h: i32,
+    /// `block_m * block_h`. 16 on this head layout.
+    pub block_rows: i32,
+    /// `cdiv(n_q_heads / n_kv_heads, block_h)`.
+    pub h_blocks: i32,
+    /// `bsz * n_kv_heads * h_blocks`.
+    pub programs: i32,
+    /// [`splits_cap`] for `programs` and `sm_count`.
+    pub splits_cap: i32,
+    /// `BLOCK_N`. 32 for head dim 256.
+    pub block_n: i32,
+    /// `next_pow2(head_dim)`. 256.
+    pub hd_pad: i32,
+}
+
+struct QlenGeom {
+    block_m: i32,
+    block_h: i32,
+    block_rows: i32,
+    h_blocks: i32,
+}
+
+fn qlen_geom(q_len: i32) -> Result<QlenGeom> {
+    if !(1..=16).contains(&q_len) {
+        return Err(Error::Launch(format!(
+            "decode q_len {q_len} is outside 1..=16"
+        )));
+    }
+    let block_m = next_pow2_i32(q_len)?;
+    let block_h = (16 / block_m).max(1);
+    let block_rows = block_m
+        .checked_mul(block_h)
+        .ok_or_else(|| Error::Launch("BLOCK_ROWS overflow".into()))?;
+    let h_blocks = ceil_div_i32(Q_HEADS / KV_HEADS, block_h)?;
+    Ok(QlenGeom {
+        block_m,
+        block_h,
+        block_rows,
+        h_blocks,
+    })
+}
+
+fn next_pow2_i32(n: i32) -> Result<i32> {
+    if n < 1 {
+        return Err(Error::Launch("next_pow2: n must be positive".into()));
+    }
+    let mut p = 1i32;
+    while p < n {
+        p = p
+            .checked_mul(2)
+            .ok_or_else(|| Error::Launch("next_pow2 overflow".into()))?;
+    }
+    Ok(p)
+}
+
 fn i32_fit(v: i64, what: &str) -> Result<i32> {
     i32::try_from(v).map_err(|_| Error::Launch(format!("{what} does not fit in i32")))
 }
@@ -660,7 +786,18 @@ struct Tile {
 /// the cubin asks for more than 48 KiB of dynamic shared memory, load calls
 /// [`berth_cuda::Function::set_max_dynamic_shared_bytes`] first, which is
 /// what `TritonKernel` does. The 27B decode cubins are under that cap.
+///
+/// `qlen` holds the optional q_len 2..=16 pairs. A missing cubin does not
+/// fail [`PagedDecode::load`]; [`PagedDecode::launch_qlen`] reports it.
 pub struct PagedDecode {
+    split: KernelImage,
+    combine: KernelImage,
+    tile: Tile,
+    qlen: Vec<QlenPair>,
+}
+
+struct QlenPair {
+    q_len: i32,
     split: KernelImage,
     combine: KernelImage,
     tile: Tile,
@@ -741,10 +878,17 @@ impl PagedDecode {
                 split.num_warps, combine.num_warps
             )));
         }
+        let mut qlen = Vec::new();
+        for n in 2..=16 {
+            if let Some(pair) = load_qlen_pair(ctx, dir, kernels, n)? {
+                qlen.push(pair);
+            }
+        }
         Ok(Self {
             split,
             combine,
             tile,
+            qlen,
         })
     }
 
@@ -857,6 +1001,109 @@ impl PagedDecode {
             Dim3::new(programs_u, cap_u, 1),
         )?;
         launch_image(&self.combine, stream, &runtime, Dim3::new(programs_u, 1, 1))?;
+        Ok(())
+    }
+
+    /// Quantize the new K/V tile, then split and combine, for `q_len` 1..=16.
+    ///
+    /// `q_len == 1` calls [`Self::launch`] with `splits_cap` from `sm_count`.
+    /// `q_len` 2..=16 uses the cubin loaded for that length. The grid is
+    /// `(programs, splits_cap, 1)` then `(programs, 1, 1)`. `quant.seq_len`,
+    /// `quant.bsz`, and `quant.blocks_per_seq` must match the launch.
+    ///
+    /// Partial buffer sizes for this `q_len` are [`qlen_partial_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// `q_len` outside 1..=16, a quant descriptor that does not match, or a
+    /// q_len whose cubin was not loaded. The missing-cubin error includes
+    /// [`TRITON_CUBIN_BUILD`].
+    ///
+    /// # Safety
+    ///
+    /// Same as [`quant_cache_paged`] and [`Self::launch`]. `partial_o` and
+    /// `partial_ml` must hold [`qlen_partial_bytes`] bytes for this `q_len`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn launch_qlen(
+        &self,
+        stream: &Stream,
+        quant: &QuantCacheLaunch,
+        args: &PagedDecodeArgs,
+        q_len: i32,
+        bsz: i32,
+        bt_width: i32,
+        sm_count: i32,
+    ) -> Result<()> {
+        if !(1..=16).contains(&q_len) {
+            return Err(Error::Launch(format!(
+                "paged decode: q_len {q_len} is outside 1..=16"
+            )));
+        }
+        if bsz < 1 || bt_width < 1 || sm_count < 1 {
+            return Err(Error::Launch(
+                "paged decode: bsz, bt_width, and sm_count must be positive".into(),
+            ));
+        }
+        if quant.seq_len != q_len || quant.bsz != bsz || quant.blocks_per_seq != bt_width {
+            return Err(Error::Launch(
+                "paged decode: quant seq_len, bsz, and blocks_per_seq must match the launch".into(),
+            ));
+        }
+        if q_len != 1 && self.qlen.iter().all(|pair| pair.q_len != q_len) {
+            return Err(Error::Launch(format!(
+                "paged attention cubin for q_len {q_len} is missing. Run: {TRITON_CUBIN_BUILD}"
+            )));
+        }
+        unsafe { quant_cache_paged(quant, stream.handle().as_ptr())? };
+        if q_len == 1 {
+            let programs = self.programs(bsz)?;
+            let cap = splits_cap(programs, sm_count)?;
+            return unsafe { self.launch(stream, args, bsz, bt_width, cap) };
+        }
+        let pair = self
+            .qlen
+            .iter()
+            .find(|pair| pair.q_len == q_len)
+            .ok_or_else(|| {
+                Error::Launch(format!(
+                    "paged attention cubin for q_len {q_len} is missing. Run: {TRITON_CUBIN_BUILD}"
+                ))
+            })?;
+        let group = pair.tile.n_q_heads / pair.tile.n_kv_heads;
+        let h_blocks = ceil_div_i32(group, pair.tile.block_h)?;
+        let programs = i32_fit(
+            i64::from(bsz) * i64::from(pair.tile.n_kv_heads) * i64::from(h_blocks),
+            "programs",
+        )?;
+        let cap = splits_cap(programs, sm_count)?;
+        let (num_splits, split_len) =
+            split_config(bt_width, pair.tile.page_size, q_len, pair.tile.block_n, cap)?;
+        let programs_u = u32_fit(i64::from(programs), "programs")?;
+        let cap_u = u32_fit(i64::from(cap), "splits_cap")?;
+        let runtime = Runtime {
+            q: args.q,
+            k_cache: args.k_cache,
+            v_cache: args.v_cache,
+            block_table: args.block_table,
+            cache_seqlens: args.cache_seqlens,
+            out: args.out,
+            partial_o: args.partial_o,
+            partial_ml: args.partial_ml,
+            k_scales: args.k_scales,
+            v_scales: args.v_scales,
+            h32: args.h32,
+            split_len,
+            num_pages_per_seq: bt_width,
+            num_splits,
+            sinks: args.sinks,
+        };
+        launch_image(
+            &pair.split,
+            stream,
+            &runtime,
+            Dim3::new(programs_u, cap_u, 1),
+        )?;
+        launch_image(&pair.combine, stream, &runtime, Dim3::new(programs_u, 1, 1))?;
         Ok(())
     }
 }
@@ -1155,6 +1402,150 @@ fn check_combine_tile(kernels: &Json, tile: &Tile) -> Result<()> {
     Ok(())
 }
 
+const QLEN_SPLIT_PARAMS: &[&str] = &[
+    "q",
+    "k_cache",
+    "v_cache",
+    "block_table",
+    "cache_seqlens",
+    "out",
+    "partial_o",
+    "partial_ml",
+    "k_scales",
+    "v_scales",
+    "h32",
+    "split_len",
+    "num_pages_per_seq",
+    "num_splits",
+    "sinks",
+    "global_scratch",
+    "profile_scratch",
+];
+
+const QLEN_COMBINE_PARAMS: &[&str] = &[
+    "partial_o",
+    "partial_ml",
+    "out",
+    "h32",
+    "num_splits",
+    "sinks",
+    "global_scratch",
+    "profile_scratch",
+];
+
+fn load_qlen_pair(
+    ctx: &Context,
+    dir: &Path,
+    kernels: &Json,
+    q_len: i32,
+) -> Result<Option<QlenPair>> {
+    let split_key = format!("_paged_attn_decode_split_kernel_q{q_len}");
+    let combine_key = format!("_paged_attn_decode_combine_kernel_q{q_len}");
+    let (Some(split_rec), Some(combine_rec)) = (kernels.get(&split_key), kernels.get(&combine_key))
+    else {
+        return Ok(None);
+    };
+    if !cubin_nonempty(dir, split_rec) || !cubin_nonempty(dir, combine_rec) {
+        return Ok(None);
+    }
+    let split = load_kernel(ctx, dir, kernels, &split_key, QLEN_SPLIT_PARAMS)?;
+    let combine = load_kernel(ctx, dir, kernels, &combine_key, QLEN_COMBINE_PARAMS)?;
+    if split.num_warps != combine.num_warps {
+        return Err(Error::Launch(format!(
+            "q_len {q_len} split num_warps {} != combine num_warps {}",
+            split.num_warps, combine.num_warps
+        )));
+    }
+    let geom = qlen_geom(q_len)?;
+    let tile = tile_from_qlen(split_rec, q_len, &geom)?;
+    check_combine_qlen(combine_rec, &tile, geom.block_m)?;
+    Ok(Some(QlenPair {
+        q_len,
+        split,
+        combine,
+        tile,
+    }))
+}
+
+fn cubin_nonempty(dir: &Path, record: &Json) -> bool {
+    let Some(file) = record.get("cubin").and_then(Json::as_str) else {
+        return false;
+    };
+    std::fs::metadata(dir.join(file)).is_ok_and(|meta| meta.len() > 0)
+}
+
+fn tile_from_qlen(record: &Json, q_len: i32, geom: &QlenGeom) -> Result<Tile> {
+    let c = record
+        .get("constexprs")
+        .ok_or_else(|| Error::Launch("split constexprs missing".into()))?;
+    let tile = Tile {
+        n_q_heads: need_i32(c, "n_q_heads")?,
+        n_kv_heads: need_i32(c, "n_kv_heads")?,
+        q_len: need_i32(c, "q_len")?,
+        page_size: need_i32(c, "page_size")?,
+        head_dim: need_i32(c, "head_dim")?,
+        block_h: need_i32(c, "BLOCK_H")?,
+        block_rows: need_i32(c, "BLOCK_ROWS")?,
+        block_n: need_i32(c, "BLOCK_N")?,
+        hd_pad: need_i32(c, "HD_PAD")?,
+    };
+    let qck = need_i32(c, "QCK")?;
+    let qcv = need_i32(c, "QCV")?;
+    let kv_append = need_i32(c, "kv_append_len")?;
+    let block_m = need_i32(c, "BLOCK_M")?;
+    let final_flag = c
+        .get("FINAL")
+        .and_then(Json::as_bool)
+        .ok_or_else(|| Error::Launch("FINAL constexpr missing".into()))?;
+    let sinks = c
+        .get("HAS_SINKS")
+        .and_then(Json::as_bool)
+        .ok_or_else(|| Error::Launch("HAS_SINKS constexpr missing".into()))?;
+    if tile.n_q_heads != Q_HEADS
+        || tile.n_kv_heads != KV_HEADS
+        || tile.head_dim != HEAD_DIM
+        || tile.page_size != PAGE_SIZE
+        || tile.q_len != q_len
+        || qck != 3
+        || qcv != 3
+        || kv_append != q_len
+        || block_m != geom.block_m
+        || tile.block_h != geom.block_h
+        || tile.block_rows != geom.block_rows
+        || tile.block_n != 32
+        || tile.hd_pad != 256
+        || final_flag
+        || sinks
+    {
+        return Err(Error::Launch(format!(
+            "split cubin constexprs are not the 27B q_len-{q_len} cq3 decode tile"
+        )));
+    }
+    Ok(tile)
+}
+
+fn check_combine_qlen(record: &Json, tile: &Tile, block_m: i32) -> Result<()> {
+    let c = record
+        .get("constexprs")
+        .ok_or_else(|| Error::Launch("combine constexprs missing".into()))?;
+    let same = need_i32(c, "n_q_heads")? == tile.n_q_heads
+        && need_i32(c, "n_kv_heads")? == tile.n_kv_heads
+        && need_i32(c, "head_dim")? == tile.head_dim
+        && need_i32(c, "q_len")? == tile.q_len
+        && need_i32(c, "HD_PAD")? == tile.hd_pad
+        && need_i32(c, "BLOCK_H")? == tile.block_h
+        && need_i32(c, "BLOCK_ROWS")? == tile.block_rows
+        && need_i32(c, "BLOCK_M")? == block_m
+        && need_i32(c, "QCV")? == 3
+        && c.get("HAS_SINKS").and_then(Json::as_bool) == Some(false);
+    if !same {
+        return Err(Error::Launch(
+            "combine cubin constexprs do not match the split cubin".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn need_i32(obj: &Json, key: &str) -> Result<i32> {
     let v = obj
         .get(key)
@@ -1430,6 +1821,53 @@ mod tests {
     fn split_config_rejects_non_positive() {
         assert!(split_config(0, 256, 1, 32, 41).is_err());
         assert!(splits_cap(0, 82).is_err());
+    }
+
+    #[test]
+    fn qlen_constexpr_table_for_82_sms() {
+        // bsz 1, 24 query heads, 4 KV heads, group 6. block_rows stays 16.
+        let rows = [
+            (1, 1, 16, 1, 4, 41),
+            (2, 2, 8, 1, 4, 41),
+            (3, 4, 4, 2, 8, 20),
+            (4, 4, 4, 2, 8, 20),
+            (5, 8, 2, 3, 12, 13),
+            (6, 8, 2, 3, 12, 13),
+            (7, 8, 2, 3, 12, 13),
+            (8, 8, 2, 3, 12, 13),
+            (9, 16, 1, 6, 24, 6),
+            (16, 16, 1, 6, 24, 6),
+        ];
+        for (q_len, block_m, block_h, h_blocks, programs, cap) in rows {
+            let tile = decode_qlen_tile(q_len, 1, 82).unwrap();
+            assert_eq!(tile.block_m, block_m, "q_len {q_len} block_m");
+            assert_eq!(tile.block_h, block_h, "q_len {q_len} block_h");
+            assert_eq!(tile.block_rows, 16, "q_len {q_len} block_rows");
+            assert_eq!(tile.h_blocks, h_blocks, "q_len {q_len} h_blocks");
+            assert_eq!(tile.programs, programs, "q_len {q_len} programs");
+            assert_eq!(tile.splits_cap, cap, "q_len {q_len} splits_cap");
+            assert_eq!(tile.block_n, 32);
+            assert_eq!(tile.hd_pad, 256);
+        }
+        for q_len in 10..=15 {
+            let tile = decode_qlen_tile(q_len, 1, 82).unwrap();
+            assert_eq!(
+                (tile.block_m, tile.block_h, tile.programs, tile.splits_cap),
+                (16, 1, 24, 6),
+                "q_len {q_len}"
+            );
+        }
+        assert!(decode_qlen_tile(0, 1, 82).is_err());
+        assert!(decode_qlen_tile(17, 1, 82).is_err());
+        let (partial_o, partial_ml) = qlen_partial_bytes(5, 1, 82).unwrap();
+        assert_eq!(partial_o, 12 * 13 * 16 * 256 * 4);
+        assert_eq!(partial_ml, 12 * 13 * 16 * 2 * 4);
+    }
+
+    #[test]
+    fn split_config_16_pages_qlen_5() {
+        // bound = 16 * 256 + 5 = 4101, splits_cap 13, BLOCK_N 32.
+        assert_eq!(split_config(16, 256, 5, 32, 13).unwrap(), (13, 320));
     }
 
     #[test]

@@ -16,7 +16,11 @@ Conv constexprs are not autotuned: num_warps=4, dim=10240, K=4, state_size=4
 (max_history 0), history off, no bias, transpose_output. Combined BLOCK_S is
 next_pow2(seq_len) for seq_len <= 256. seq_len is a runtime integer that
 Triton specializes on divisibility by 16, so each BLOCK_S is built twice when
-both classes exist and the cubins differ.
+both classes exist and the cubins differ. `build_wide_conv_cubins`, called
+after that manifest is written, captures the same conv specializations for
+state_size 5..19 (BLOCK_STATE = next_pow2(state_size), history off). Those
+files are named with `_ss{state_size}`. state_size 4 and the fla kernels
+are not rewritten.
 
 Does not load the model. If anything is listening on :8889 the script exits
 before touching the GPU.
@@ -565,6 +569,182 @@ def main() -> None:
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"wrote {out} ({len(manifest_kernels)} kernels, rebenched={rebenched})", flush=True)
+    wide_notes = build_wide_conv_cubins(conv_mod, out)
+    for note in wide_notes:
+        print(note, flush=True)
+
+
+def _next_pow2(n: int) -> int:
+    p = 1
+    while p < n:
+        p *= 2
+    return p
+
+
+def _conv_share_stem(key: str) -> str:
+    """Identity of a conv cubin ignoring the divisibility-16 suffix."""
+    return key.replace("_div16", "")
+
+
+def launch_conv_state(conv_mod, seq: int, state_size: int):
+    import torch
+    x = torch.empty(1, QKV_DIM, seq, dtype=torch.bfloat16, device="cuda")
+    state = torch.empty(1, QKV_DIM, state_size, dtype=torch.bfloat16, device="cuda")
+    weight = torch.empty(QKV_DIM, CONV_K, dtype=torch.bfloat16, device="cuda")
+    slots = torch.zeros(1, dtype=torch.int32, device="cuda")
+    conv_mod.causal_conv1d_update_slotted_triton(
+        x, state, slots, weight, None, transpose_output=True, history=False,
+    )
+    torch.cuda.synchronize()
+
+
+def _check_wide_conv(rec: dict, state_size: int, kind: str) -> None:
+    consts = rec["constexprs"]
+    block_state = _next_pow2(state_size)
+    if consts.get("state_size") != state_size:
+        raise SystemExit(f"{kind} state_size {consts.get('state_size')} != {state_size}")
+    if consts.get("conv_kernel_size") != CONV_K or consts.get("dim") != QKV_DIM:
+        raise SystemExit(f"{kind} ss{state_size} dim/K constexprs {consts}")
+    if kind == "output":
+        if "BLOCK_STATE" in consts:
+            raise SystemExit(f"output kernel ss{state_size} has BLOCK_STATE")
+    else:
+        if consts.get("BLOCK_STATE") != block_state:
+            raise SystemExit(
+                f"{kind} ss{state_size} BLOCK_STATE {consts.get('BLOCK_STATE')} != {block_state}"
+            )
+        if consts.get("history") is not False:
+            raise SystemExit(f"{kind} ss{state_size} history {consts.get('history')}")
+    if kind != "state":
+        if consts.get("BLOCK_K") != CONV_K:
+            raise SystemExit(f"{kind} ss{state_size} BLOCK_K {consts.get('BLOCK_K')}")
+        if consts.get("has_bias") is not False or consts.get("transpose_output") is not True:
+            raise SystemExit(f"{kind} ss{state_size} bias/transpose {consts}")
+
+
+def _wide_entry(rec: dict, filename: str) -> dict:
+    return {
+        "cubin": filename,
+        "sha256": rec["sha256"],
+        "name": rec["name"],
+        "shared": rec["shared"],
+        "num_warps": rec["num_warps"],
+        "num_stages": rec["num_stages"],
+        "num_ctas": rec["num_ctas"],
+        "global_scratch_size": rec["global_scratch_size"],
+        "global_scratch_align": rec["global_scratch_align"],
+        "profile_scratch_size": rec["profile_scratch_size"],
+        "profile_scratch_align": rec["profile_scratch_align"],
+        "grid": rec["grid"],
+        "parameters": rec["parameters"],
+        "constexprs": rec["constexprs"],
+        "autotune": rec["autotune"],
+    }
+
+
+def build_wide_conv_cubins(conv_mod, out: Path) -> list[str]:
+    """Capture conv cubins for state_size 5..19, history off.
+
+    Reloads the manifest main() just wrote and adds `_ss` keys. Does not
+    rewrite state_size 4 cubins or the fla kernels. Identical images are
+    shared only within one state_size, and only across the `_div16` pair.
+    """
+    import torch
+
+    manifest_path = out / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    kernels = manifest["kernels"]
+    if manifest.get("shapes", {}).get("state_size") != STATE_SIZE:
+        raise SystemExit("refusing to change the state_size 4 manifest field")
+
+    conv_kernels = {
+        "combined": conv_mod._causal_conv1d_update_slotted_kernel,
+        "output": conv_mod._causal_conv1d_update_slotted_output_kernel,
+        "state": conv_mod._causal_conv1d_update_slotted_state_kernel,
+    }
+    notes = []
+
+    def take_new(kernel, before_keys: set, label: str):
+        _auto, jit = unwrap(kernel)
+        new = [device_cache(jit)[k] for k in device_cache(jit).keys() if k not in before_keys]
+        if len(new) > 1:
+            raise SystemExit(f"{label}: {len(new)} new cubins")
+        return new
+
+    def store(key: str, rec: dict, written_hash: dict) -> None:
+        if "_ss" not in key:
+            raise SystemExit(f"refusing wide conv key without _ss: {key}")
+        filename = f"{key}.cubin"
+        stem = _conv_share_stem(key)
+        for prev, prev_hash in written_hash.items():
+            if prev_hash == rec["sha256"] and _conv_share_stem(prev) == stem:
+                filename = kernels[prev]["cubin"]
+                break
+        if "_ss" not in filename:
+            raise SystemExit(f"{key}: refusing to write {filename}")
+        path = out / filename
+        data = rec["cubin_bytes"]
+        if path.is_file() and path.read_bytes() != data:
+            raise SystemExit(
+                f"{key} cubin bytes differ from the existing {path} "
+                f"({path.stat().st_size} on disk, {len(data)} newly compiled). "
+                "Refusing to overwrite."
+            )
+        if filename == f"{key}.cubin":
+            path.write_bytes(data)
+        written_hash[key] = rec["sha256"]
+        kernels[key] = _wide_entry(rec, filename)
+        notes.append(f"{key} sha={rec['sha256'][:12]} file={filename}")
+
+    for state_size in range(5, 20):
+        conv_records = {}
+        written_hash = {}
+        for block_s, seq, div16 in combined_cases():
+            kernel = conv_kernels["combined"]
+            _auto, jit = unwrap(kernel)
+            before_keys = set(device_cache(jit).keys())
+            launch_conv_state(conv_mod, seq, state_size)
+            label = f"combined BLOCK_S={block_s} seq={seq} ss={state_size}"
+            new = take_new(kernel, before_keys, label)
+            if len(new) == 1:
+                rec = record_from_compiled(new[0], "conv_combined", None)
+                _check_wide_conv(rec, state_size, "combined")
+            else:
+                prev = f"conv_combined_bs{block_s}_ss{state_size}"
+                if prev not in conv_records:
+                    raise SystemExit(f"{label}: no cubin")
+                rec = conv_records[prev]
+            key = f"conv_combined_bs{block_s}" + ("_div16" if div16 else "") + f"_ss{state_size}"
+            conv_records[key] = rec
+        for seq, div16 in ((300, False), (512, True)):
+            before_conv = {}
+            for kind in ("output", "state"):
+                _auto, jit = unwrap(conv_kernels[kind])
+                before_conv[kind] = set(device_cache(jit).keys())
+            launch_conv_state(conv_mod, seq, state_size)
+            for kind, grid in (("output", "conv_output"), ("state", "conv_state")):
+                label = f"{kind} seq={seq} ss={state_size}"
+                new = take_new(conv_kernels[kind], before_conv[kind], label)
+                base = f"conv_{kind}_ss{state_size}"
+                if len(new) == 1:
+                    rec = record_from_compiled(new[0], grid, None)
+                    _check_wide_conv(rec, state_size, kind)
+                elif base in conv_records:
+                    rec = conv_records[base]
+                else:
+                    raise SystemExit(f"{label}: no cubin")
+                key = f"conv_{kind}" + ("_div16" if div16 else "") + f"_ss{state_size}"
+                conv_records[key] = rec
+        for key, rec in conv_records.items():
+            store(key, rec, written_hash)
+        torch.cuda.empty_cache()
+        used = torch.cuda.memory_allocated()
+        if used > 1 << 30:
+            raise SystemExit(f"GPU allocation {used} bytes exceeds 1 GiB after state_size {state_size}")
+
+    manifest["conv_state_sizes"] = list(range(5, 20))
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    return notes
 
 
 if __name__ == "__main__":

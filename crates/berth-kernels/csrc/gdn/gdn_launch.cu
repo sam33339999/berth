@@ -5,13 +5,18 @@
 // line ranges into OUT_DIR/fork/ (FORK_EXTRACTS) and this file includes those.
 // No fork source is stored in this repo.
 //
-// Only the instances measured on the 27B decode are instantiated:
+// The instances measured on the 27B decode are instantiated:
 // conv1d_update_kernel<1,0>, gated_delta_net_fused_op_3_kernel<bf16>,
 // cuda_recurrent_gated_delta_rule_kernel_128<0,4,0>, and
 // gated_rms_norm_kernel<32,half,bf16,float>. gdn_ba_gemv_kernel is not templated.
 // Launchers below reproduce gdn_ba_gemv_gr, gated_delta_net_fused_op_3_gr,
 // cuda_causal_conv1d_update_gr, cuda_recurrent_gated_delta_rule_gr, and
 // gated_rms_norm_gr (grid, block, dynamic smem 0, argument order).
+//
+// Verification (history on, seqlen <= 16) also instantiates
+// conv1d_update_kernel<1,1> and kernel_128<1,4,0>, via
+// berth_gdn_conv1d_update_history and berth_gdn_recurrent_history.
+// The <1,0> and <0,4,0> entry points are unchanged.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -116,8 +121,9 @@ void launch_conv1d(
     if (state_size < k)
         throw std::runtime_error("conv1d_update: state_size must be at least K");
 
-    // activation=true, history=false: conv1d_update_kernel<1,0>. The other
-    // three template instances are not linked.
+    // activation=true, history=false: conv1d_update_kernel<1,0>.
+    // <1,1> is berth_gdn_conv1d_update_history. The activation=false
+    // instances are not linked.
     dim3 grid(CEIL_DIVIDE(dim, CONV1D_NUM_THREADS), bsz, 1);
     dim3 block(CONV1D_NUM_THREADS, 1, 1);
     clear_sticky();
@@ -292,6 +298,162 @@ void launch_gated_rms(
     g_launch = describe("gated_rms_norm_kernel<32,half,bf16,float>", grid, block, 0);
 }
 
+// cuda_causal_conv1d_update_gr with a caller-supplied history flag.
+// history != 0 launches conv1d_update_kernel<true, true>. Grid and block
+// match the fork: (ceil(dim / 256), bsz), 256 threads.
+void launch_conv1d_history(
+    const void* x,
+    void* conv_state,
+    const void* slots,
+    const void* weight,
+    const void* bias,
+    void* out,
+    int bsz,
+    int dim,
+    int seqlen,
+    int state_size,
+    int k,
+    int history,
+    cudaStream_t stream)
+{
+    if (history != 0 && history != 1)
+        throw std::runtime_error("conv1d_update_history: history must be 0 or 1");
+    if (!x || !conv_state || !weight || !out)
+        throw std::runtime_error("conv1d_update_history: x, conv_state, weight, and out are required");
+    if (bsz <= 0 || dim <= 0 || seqlen <= 0)
+        throw std::runtime_error("conv1d_update_history: bsz, dim, and seqlen must be positive");
+    if (k < 1 || k > CONV1D_MAX_K)
+        throw std::runtime_error("conv1d_update_history: K must be in 1..=16");
+    if (state_size < k)
+        throw std::runtime_error("conv1d_update_history: state_size must be at least K");
+
+    dim3 grid(CEIL_DIVIDE(dim, CONV1D_NUM_THREADS), bsz, 1);
+    dim3 block(CONV1D_NUM_THREADS, 1, 1);
+    clear_sticky();
+    if (history)
+    {
+        conv1d_update_kernel<true, true><<<grid, block, 0, stream>>>(
+            static_cast<const bfloat16*>(x),
+            static_cast<bfloat16*>(conv_state),
+            static_cast<const int*>(slots),
+            static_cast<const bfloat16*>(weight),
+            static_cast<const bfloat16*>(bias),
+            static_cast<bfloat16*>(out),
+            dim,
+            seqlen,
+            state_size,
+            k);
+        berth_cuda_ok(cudaGetLastError(), "conv1d_update_history");
+        g_launch = describe("conv1d_update_kernel<1,1>", grid, block, 0);
+    }
+    else
+    {
+        conv1d_update_kernel<true, false><<<grid, block, 0, stream>>>(
+            static_cast<const bfloat16*>(x),
+            static_cast<bfloat16*>(conv_state),
+            static_cast<const int*>(slots),
+            static_cast<const bfloat16*>(weight),
+            static_cast<const bfloat16*>(bias),
+            static_cast<bfloat16*>(out),
+            dim,
+            seqlen,
+            state_size,
+            k);
+        berth_cuda_ok(cudaGetLastError(), "conv1d_update_history");
+        g_launch = describe("conv1d_update_kernel<1,0>", grid, block, 0);
+    }
+}
+
+// cuda_recurrent_gated_delta_rule_gr. v_split matches gdn.cu: 4 when
+// bsz == 1, k_head_dim <= 128, v_head_dim == 128, and num_v_heads <= 64.
+// Only kernel_128<history, 4> (CHANNELWISE false) is linked. history
+// requires history_stride >= seqlen, which is recurrent_state.size(1).
+void launch_recurrent_history(
+    const void* mixed_qkv,
+    const void* g,
+    const void* beta,
+    void* recurrent_state,
+    void* core_attn_out,
+    const void* slots,
+    int bsz,
+    int seqlen,
+    int num_k_heads,
+    int num_v_heads,
+    int k_head_dim,
+    int v_head_dim,
+    int history_stride,
+    int history,
+    cudaStream_t stream)
+{
+    if (history != 0 && history != 1)
+        throw std::runtime_error("recurrent_gated_delta_rule_history: history must be 0 or 1");
+    if (!mixed_qkv || !g || !beta || !recurrent_state || !core_attn_out)
+        throw std::runtime_error(
+            "recurrent_gated_delta_rule_history: mixed_qkv, g, beta, recurrent_state, and core_attn_out are required");
+    if (seqlen <= 0 || history_stride <= 0)
+        throw std::runtime_error(
+            "recurrent_gated_delta_rule_history: seqlen and history_stride must be positive");
+    if (num_k_heads <= 0 || num_v_heads <= 0 || num_v_heads % num_k_heads != 0)
+        throw std::runtime_error(
+            "recurrent_gated_delta_rule_history: num_v_heads must be a positive multiple of num_k_heads");
+    const int v_split =
+        (bsz == 1 && k_head_dim <= 128 && v_head_dim == 128 && num_v_heads <= 64) ? 4 : 1;
+    if (v_split != 4 || k_head_dim != 128 || v_head_dim != 128)
+        throw std::runtime_error(
+            "recurrent_gated_delta_rule_history: only kernel_128 v_split 4 is linked "
+            "(bsz 1, head dims 128, num_v_heads <= 64)");
+    if (history && history_stride < seqlen)
+        throw std::runtime_error(
+            "recurrent_gated_delta_rule_history: history_stride must be at least seqlen");
+
+    dim3 grid(bsz, num_v_heads, v_split);
+    dim3 block(MAX(k_head_dim, v_head_dim / v_split), SUBK, 1);
+    const float scale = 1.0f / sqrtf(static_cast<float>(k_head_dim));
+    clear_sticky();
+    if (history)
+    {
+        cuda_recurrent_gated_delta_rule_kernel_128<true, 4><<<grid, block, 0, stream>>>(
+            static_cast<const bfloat16*>(mixed_qkv),
+            static_cast<const float*>(g),
+            static_cast<const bfloat16*>(beta),
+            static_cast<float*>(recurrent_state),
+            static_cast<bfloat16*>(core_attn_out),
+            bsz,
+            seqlen,
+            num_k_heads,
+            num_v_heads,
+            k_head_dim,
+            v_head_dim,
+            scale,
+            static_cast<const int*>(slots),
+            history_stride,
+            nullptr);
+        berth_cuda_ok(cudaGetLastError(), "recurrent_gated_delta_rule_history");
+        g_launch = describe("cuda_recurrent_gated_delta_rule_kernel_128<1,4,0>", grid, block, 0);
+    }
+    else
+    {
+        cuda_recurrent_gated_delta_rule_kernel_128<false, 4><<<grid, block, 0, stream>>>(
+            static_cast<const bfloat16*>(mixed_qkv),
+            static_cast<const float*>(g),
+            static_cast<const bfloat16*>(beta),
+            static_cast<float*>(recurrent_state),
+            static_cast<bfloat16*>(core_attn_out),
+            bsz,
+            seqlen,
+            num_k_heads,
+            num_v_heads,
+            k_head_dim,
+            v_head_dim,
+            scale,
+            static_cast<const int*>(slots),
+            history_stride,
+            nullptr);
+        berth_cuda_ok(cudaGetLastError(), "recurrent_gated_delta_rule_history");
+        g_launch = describe("cuda_recurrent_gated_delta_rule_kernel_128<0,4,0>", grid, block, 0);
+    }
+}
+
 }  // namespace
 
 template <typename F>
@@ -397,6 +559,53 @@ extern "C" int berth_gdn_recurrent(
             mixed_qkv, g, beta, recurrent_state, core_attn_out, slots,
             bsz, seqlen, num_k_heads, num_v_heads, k_head_dim, v_head_dim,
             history_stride, static_cast<cudaStream_t>(stream));
+    });
+}
+
+extern "C" int berth_gdn_conv1d_update_history(
+    const void* x,
+    void* conv_state,
+    const void* slots,
+    const void* weight,
+    const void* bias,
+    void* out,
+    int bsz,
+    int dim,
+    int seqlen,
+    int state_size,
+    int k,
+    int history,
+    void* stream)
+{
+    return berth_gdn_guard([&] {
+        launch_conv1d_history(
+            x, conv_state, slots, weight, bias, out,
+            bsz, dim, seqlen, state_size, k, history, static_cast<cudaStream_t>(stream));
+    });
+}
+
+extern "C" int berth_gdn_recurrent_history(
+    const void* mixed_qkv,
+    const void* g,
+    const void* beta,
+    void* recurrent_state,
+    void* core_attn_out,
+    const void* slots,
+    int bsz,
+    int seqlen,
+    int num_k_heads,
+    int num_v_heads,
+    int k_head_dim,
+    int v_head_dim,
+    int history_stride,
+    int history,
+    void* stream)
+{
+    return berth_gdn_guard([&] {
+        launch_recurrent_history(
+            mixed_qkv, g, beta, recurrent_state, core_attn_out, slots,
+            bsz, seqlen, num_k_heads, num_v_heads, k_head_dim, v_head_dim,
+            history_stride, history, static_cast<cudaStream_t>(stream));
     });
 }
 

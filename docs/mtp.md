@@ -443,6 +443,15 @@ Kernel 測試，Python 參考的寫法和 `crates/berth-kernels/tests/attn_prefi
 
 **P1，kernel。** 檔案：`crates/berth-kernels/csrc/gdn/`（新的 history launcher，不改現有 `<false>` 呼叫）、`build.rs` 的 `FORK_EXTRACTS`、`scripts/build_triton_cubins.py`（decode cubin 的 `q_len`）、`csrc/attn` 一條 `q_len = n` 的包裝。rewind 的抽出範圍：`gdn.cu` 1923–1960 兩支 kernel。`ConvRewindJob` / `StateRewindJob` 在 `gdn.cuh` 222–247，但 `gdn.cuh` 開頭就有 `at::Tensor`，整檔不能 include；結構是 POD，和 kernel 一起抽，或在 csrc 裡照欄位宣告。host wrapper `gdn.cu` 1962–2010 和 `bindings.cpp` 223–224 吃 ATen，不抽。`kernel_128` 和 `conv1d_update_kernel` 的本體已經在現有 extract 裡，這段只加實例。conv prefill 的 `state_size = 4 + N` cubin 也在這段，由 `build_triton_fla_cubins.py` 的新類別產生，不改 `state_size = 4` 的檢查。QTIP 那條若「未確認」的結論是 fork 會發 `exl3_gemv_kernel`，GEMV 的實例也放這段；結論是 coop，這段就不要做。CPU：`cargo build`、`cargo test`（不設 `BERTH_GPU_TESTS`）、`cargo clippy -p berth-kernels --all-targets -- -D warnings`。rewind 的 index 算術做成純 Rust 測試。
 
+**P1 已完成。** 只動 `crates/berth-kernels/**` 與兩支 cubin 腳本；腳本沒有執行。既有 launcher、q_len 1 與 state_size 4 的 cubin 名稱不變。
+
+- `FORK_EXTRACTS`：`gdn.cu` 1923–1960 → `fork/gdn_rewind_kernels.cuh`（`batched_conv_rewind_kernel`）。host wrapper 1962–2010 與 `gdn.cuh` 不抽。
+- 新實例：`conv1d_update_kernel<true,true>`、`cuda_recurrent_gated_delta_rule_kernel_128<true,4>`、`exl3_gemv_kernel<4,false,2,1,0,false>`、`exl3_gemv_kernel<4,true,2,1,0,false>`。
+- `extern "C"`：`berth_gdn_conv1d_update_history`、`berth_gdn_recurrent_history`、`berth_gdn_batched_conv_rewind`、`berth_gdn_batched_state_rewind`、`berth_gdn_rewind_last_error`、`berth_gdn_rewind_last_launch`、`berth_exl3_gemv_cfg`、`berth_prefill_try_qtip`。
+- Rust：`conv1d_update_history`、`recurrent_gated_delta_rule_history`、`batched_conv_rewind`、`batched_state_rewind`、`rewind_last_launch`、`rewind_conv_addrs`、`rewind_state_addrs`、`exl3_gemv_cfg`、`decode_qlen_tile`、`qlen_partial_bytes`、`PagedDecode::launch_qlen`、`GdnPrefill::run_with_state_size`。
+- cubin（腳本會產生、本次未跑）：`_paged_attn_decode_{split,combine}_kernel_q{2..=16}.cubin`；`conv_combined_bs{bs}[_div16]_ss{5..=19}.cubin`、`conv_{output,state}[_div16]_ss{5..=19}.cubin`。
+- CPU 測試：`rewind_job_layout`、`rewind_addrs_match_section6`、`rewind_and_history_reject_before_cuda`、`exl3_gemv_cfg_matches_27b_shapes`、`qlen_constexpr_table_for_82_sms`、`split_config_16_pages_qlen_5`、`conv_key_for_keeps_state_size_4`。
+
 **P2，MTP 頭和 target prefill export。** 檔案：新的 `crates/berth-engine/src/mtp.rs`，`model.rs` 只加 `prefill_for_mtp`，`gdn.rs` 只加寬 state 的配置函數（現有 buffer 和 launch 不動）。draft cache 用現有的 cq3 頁配置再配一份。CPU：`mtp.fc` 的形狀、`chunk_bounds` 在 `N` 底下不變、`prefill_block_pages` 加 `N` 之後的頁數（含 8190 從 32 頁變 33 頁）、carry / shift 的列數。`cargo test -p berth-engine`。不跑 GPU。
 
 **P3，驗證、草稿、接受、rewind。** 檔案：`generate.rs` 的 MTP 分支，`model.rs` 的 `verify_step`，`gdn.rs` 的 `rewind`，`attn.rs` 只加 `q_len = n` 的呼叫（kv rewind 是長度，不是新 kernel），`sampler.rs` 不改。`crates/berth` 的 `--mtp-steps`。CPU：接受條件、EOS 不 rewind、`kv_position % 2048 == 0` 停、`rewind` 的 slot、草稿 / 驗證 block table 寬度。用假的 logits 列，不載模型。`cargo test -p berth-engine` 和 `cargo test -p berth`。
