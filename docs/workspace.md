@@ -69,7 +69,9 @@ cuda-core 自己寫明是早期研究專案，API 會改。`berth-cuda` 是隔�
 
 ## exllamav3 原始碼
 
-不 vendor 進這個 repo。`berth-kernels` 的 `build.rs` 讀 `BERTH_EXL3_SRC`，預設 `~/qwen38-exl3-dflash2/exllamav3`，並檢查 commit 是 `355c6ee`；對不上就停。
+不 vendor 進這個 repo。`berth-kernels` 的 `build.rs` 讀 `BERTH_EXL3_SRC`，預設 `~/qwen38-exl3-dflash2/exllamav3`，並檢查 `exllamav3/exllamav3_ext` 的 git tree hash 是 `de35ffb`；對不上就停。
+
+檢查 tree hash，不檢查 commit。fork 只改 Python 時（例如 `355c6ee` 到 `dc0e608` 加了 MiniCPM-V 4.7），kernel 沒變，照常 build。
 
 shim 放在 `crates/berth-kernels` 裡，只 include fork 的 `.cuh`。fork 外層吃 `at::Tensor` 的 launcher 不編進來。
 
@@ -95,5 +97,5 @@ shim 放在 `crates/berth-kernels` 裡，只 include fork 的 `.cuh`。fork 外�
 1. ✅ `berth-exl3`：讀 27B 的 checkpoint，印出每條張量的 K 和形狀，和 Python 對照。不需要 GPU
 2. ✅ `berth-plan`：建出 `Qwen3_5ForConditionalGeneration` 的 64 層計畫，整包停 VRAM
 3. ✅ `berth-cache`、`berth-repetition`：照規格寫，加單元測試
-4. `berth-cuda`、`berth-kernels`：先只 shim 一支 `exl3_gemm`。服務停下來時，拿一條張量和 exllamav3 的輸出對
+4. `berth-cuda`、`berth-kernels`：先只 shim 一支 `exl3_gemm`，再拿 `testdata/exl3_ref/` 的輸出逐位元對。對照資料已經在服務停著時產生好，見 [kernels.md](kernels.md) 的「實測」
 5. `berth-engine`、`berth`：一個 token 跑通，再接成迴圈

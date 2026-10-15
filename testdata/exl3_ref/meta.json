@@ -1,0 +1,87 @@
+{
+  "target": "/home/sam/qwen38-exl3-dflash2/models/qwen38-27b-exl3",
+  "fork_commit": "dc0e60805997d1c8f648781e60872f8cce48d33b",
+  "ext_tree": "de35ffbe336bdc6d617e49e208cd7c730a789787",
+  "torch": "2.13.0+cu130",
+  "seed": 1234,
+  "env": {
+    "EXL3_INT8_GEMV": "2",
+    "EXL3_INT8_GEMV_MAX_K": "5",
+    "EXL3_QC_STAGING": "1",
+    "EXL3_HGEMM_F16ACC": "auto"
+  },
+  "cases": [
+    {
+      "name": "l0_down_m1",
+      "key": "model.language_model.layers.0.mlp.down_proj",
+      "x_shape": [
+        1,
+        1,
+        17408
+      ],
+      "x_dtype": "float16",
+      "y_shape": [
+        1,
+        1,
+        5120
+      ],
+      "y_dtype": "float32",
+      "y_abs_max": 8.405281066894531,
+      "y_finite": true
+    },
+    {
+      "name": "l0_gate_m1",
+      "key": "model.language_model.layers.0.mlp.gate_proj",
+      "x_shape": [
+        1,
+        1,
+        5120
+      ],
+      "x_dtype": "float16",
+      "y_shape": [
+        1,
+        1,
+        17408
+      ],
+      "y_dtype": "float16",
+      "y_abs_max": 3.443359375,
+      "y_finite": true
+    },
+    {
+      "name": "l3_o_m1",
+      "key": "model.language_model.layers.3.self_attn.o_proj",
+      "x_shape": [
+        1,
+        1,
+        6144
+      ],
+      "x_dtype": "float16",
+      "y_shape": [
+        1,
+        1,
+        5120
+      ],
+      "y_dtype": "float32",
+      "y_abs_max": 5.897510528564453,
+      "y_finite": true
+    },
+    {
+      "name": "lm_head_m1",
+      "key": "lm_head",
+      "x_shape": [
+        1,
+        1,
+        5120
+      ],
+      "x_dtype": "float16",
+      "y_shape": [
+        1,
+        1,
+        248320
+      ],
+      "y_dtype": "float16",
+      "y_abs_max": 5.1640625,
+      "y_finite": true
+    }
+  ]
+}
