@@ -4,3 +4,11 @@
 # headers, which provide those files on this machine.
 [env]
 BINDGEN_EXTRA_CLANG_ARGS = "-I/usr/lib/gcc/x86_64-linux-gnu/15/include"
+
+# torch's libcublas (berth-kernels build.rs links it from <target>/cublas-torch).
+# test binaries live in <target>/<profile>/deps, executables in <target>/<profile>.
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "link-arg=-Wl,-rpath,$ORIGIN/../../cublas-torch",
+    "-C", "link-arg=-Wl,-rpath,$ORIGIN/../cublas-torch",
+]

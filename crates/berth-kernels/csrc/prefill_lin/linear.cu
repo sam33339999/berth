@@ -361,6 +361,45 @@ extern "C" int berth_prefill_exl3_linear(
     }
 }
 
+// Plain fp16 GEMM, `C[m, n] = A[m, k] @ B[k, n]` (row-major, C row stride
+// ldc), through the fork's `hgemm` choice: f16acc::gemm_kernel when it
+// covers the shape, otherwise cublasGemmEx with hgemm_gemmex_impl's
+// arguments. GDN prefill uses it for the b / a projections (`ext.hgemm`).
+extern "C" int berth_prefill_hgemm(
+    const void* a,
+    const void* b,
+    void* c,
+    int size_m,
+    int size_k,
+    int size_n,
+    int ldc,
+    int out_fp32,
+    void* stream)
+{
+    try
+    {
+        g_err.clear();
+        g_launch.clear();
+        if (!a || !b || !c)
+            throw std::runtime_error("prefill hgemm: null device pointer");
+        if (size_m < 1 || size_k < 1 || size_n < 1 || ldc < size_n)
+            throw std::runtime_error("prefill hgemm: bad shape");
+        int kind = berth_prefill_hgemm_recon(
+            a, b, c, size_m, size_k, size_n, ldc, out_fp32, (cudaStream_t) stream);
+        g_launch = kind == 1
+            ? (out_fp32 ? "f16acc::gemm_kernel<1,128,false>" : "f16acc::gemm_kernel<0,128,false>")
+            : "cublasGemmEx";
+        return 0;
+    }
+    catch (const std::exception& err)
+    {
+        g_err = err.what();
+        g_launch.clear();
+        cudaGetLastError();
+        return -1;
+    }
+}
+
 extern "C" const char* berth_prefill_last_error(void)
 {
     return g_err.c_str();

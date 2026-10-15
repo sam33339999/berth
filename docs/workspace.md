@@ -156,4 +156,13 @@ cargo build --release -p berth
 
 greedy 299 步和 fork 的 argmax 完全一樣（`crates/berth-engine/tests/generate.rs`）。
 
-還沒有 prefill：prompt 也是一個 token 一個 token 走 decode，每個 token 約 26 ms，長 prompt 要等很久才開始回答。fork 的 prompt 走 prefill，所以多 token 的 prompt 在 berth 和服務上的結果不會逐位元一樣。下一步是 prefill。
+prompt 走 prefill（`Model::prefill`），照 fork 的規則切段：只 prefill `prompt[..len-1]`，段落對齊到 256，最後一個 prompt token 走 decode 拿 logits；第 63 層在 prefill 時只跑 mixer。100 和 1500 token 的 prompt 和 fork 逐位元一致：每段每層的殘差、所有 attention cache 和 GDN state、第一個 token 的 logits（`crates/berth-engine/tests/prefill_ref.rs`）。2223 token 的 prompt 約 2.3 秒出第一個 token，逐 token 送要約 58 秒。
+
+decode 的 block table 寬度（以及 attention 的 split 數）照 fork 依每個請求算：`ceil((prompt + max_new_tokens) / 256)` 頁，補到 16 的倍數（`generator.py` `iterate_gen`），不是整個 cache 的頁數。用 cache 的頁數，長 context 的 logits 會和服務不一樣。
+
+prefill 的 cuBLAS 連結的是 torch 的 `libcublas.so.13`（13.1），不是 CUDA 13.3 工具包的（13.6），兩者結果不同。`berth-kernels` 的 `build.rs` 在 `target/cublas-torch/` 放符號連結，`.cargo/config.toml` 的 `$ORIGIN` rpath 讓所有執行檔在執行時找到它。所以 berth 要 `~/openwebui/.venv` 那份 torch 在。
+
+Triton 依整數參數的值特化 kernel（等於 1、能被 16 整除、其他），fork 遇到新的組合就即時編。`scripts/build_triton_cubins.py` 預編 prefill attention 的每一種組合，執行時照同一個規則挑。
+
+還沒解決：預設 270336 token 的 cache 開不起來（GPU 記憶體不足）。attention prefill 的 fp16 暫存照整個 cache 配，fork 是每次呼叫照這個請求用到的頁數臨時配（補到 2 的冪次）。要改成照 fork 的方式。暫時用 `--max-tokens 32768`。
+

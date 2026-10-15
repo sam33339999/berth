@@ -1,10 +1,9 @@
 //! One request, end to end: feed the prompt, then sample until a stop.
 //!
-//! Owner: task LOOP. There is no prefill yet: the prompt goes through
-//! [`crate::model::Model::decode_step`] one token at a time, the way
-//! `tests/decode_seq.rs` teacher-forces tokens. That is correct but slow for
-//! long prompts, and the fork prefills prompts, so results are not
-//! bit-identical to the serve. Prefill is the next stage.
+//! A prompt longer than one token is the fork's prefill: [`Model::prefill`]
+//! on every id except the last (`generator/job.py` `Job.prefill` forwards
+//! `ids[:-1]`), then [`Model::decode_step`] of that last id. A one-token
+//! prompt is only the decode step.
 //!
 //! Prompt tokens occupy positions `0..n-1` and are not sampled. The logits
 //! of the last prompt token are the first sample. Each later sample is fed
@@ -141,6 +140,10 @@ impl Engine {
     ) -> Result<(Finish, Usage)> {
         let prompt_len = self.check_request(request)?;
         self.model.reset_sequence(&self.gpu)?;
+        // The fork sizes the decode block table from the job's whole length
+        // (`Job.get_max_seq_len`: prompt plus max_new_tokens).
+        self.model
+            .set_decode_width(prompt_len.saturating_add(request.max_new_tokens));
         self.sampler
             .reset(&self.gpu, &request.sampler, &request.prompt)?;
 
@@ -212,16 +215,20 @@ impl Engine {
     }
 }
 
-/// Prompt tokens at positions `0..prompt.len()`, one decode each.
+/// Prompt tokens at positions `0..prompt.len()`.
 ///
-/// Synchronize every step. [`Model::decode_step`] only has a fixed number of
-/// pinned staging slots, and the logits have to be finished before sampling.
+/// A longer prompt is `Job.prefill` (`generator/job.py`): [`Model::prefill`]
+/// on `prompt[..len - 1]`, then one [`Model::decode_step`] of the last id at
+/// position `len - 1`. A one-token prompt is only that decode step. The step
+/// is synchronized so the logits are finished before sampling.
 fn feed_prompt(model: &mut Model, gpu: &Gpu, prompt: &[u32]) -> Result<()> {
-    for (index, &token) in prompt.iter().enumerate() {
-        let position = u32::try_from(index).expect("prompt length fits u32");
-        model.decode_step(gpu, token, position)?;
-        model.synchronize(gpu)?;
+    if prompt.len() > 1 {
+        model.prefill(gpu, &prompt[..prompt.len() - 1])?;
     }
+    let last = *prompt.last().expect("prompt is non-empty");
+    let position = u32::try_from(prompt.len() - 1).expect("prompt length fits u32");
+    model.decode_step(gpu, last, position)?;
+    model.synchronize(gpu)?;
     Ok(())
 }
 

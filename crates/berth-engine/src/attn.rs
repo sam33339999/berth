@@ -24,6 +24,10 @@ use berth_kernels::attn::{
     deinterleave_qg, mul_sigmoid, quant_cache_paged, rope, splits_cap, PagedDecode,
     PagedDecodeArgs, QuantCacheLaunch, RopeLaunch,
 };
+use berth_kernels::attn_prefill::{
+    needs_staging, staging_scratch_elems, PagedPrefill, PrefillChunk, NORM_EPS, ROTARY_DIM,
+    TWO_PASS_MIN_Q,
+};
 use berth_kernels::ops::exl3_mgemm;
 use berth_kernels::{Codebook, OutDtype};
 use berth_plan::{LayerKind, ModelShape};
@@ -43,6 +47,15 @@ const HD_PAD: i32 = 256;
 const ROPE_NEOX: i32 = 2;
 /// Qwen3.5 passes this when `text_config` has no `rope_theta`.
 const DEFAULT_ROPE_THETA: f64 = 10_000_000.0;
+/// `project_qkv` uses the sliced bundle only while `bsz * q_len <= 32`.
+const SLICED_MAX_ROWS: u32 = 32;
+
+const _: () = {
+    assert!(Q_HEADS == berth_kernels::attn_prefill::Q_HEADS);
+    assert!(KV_HEADS == berth_kernels::attn_prefill::KV_HEADS);
+    assert!(HEAD_DIM == berth_kernels::attn_prefill::HEAD_DIM);
+    assert!(PAGE as i32 == berth_kernels::attn_prefill::PAGE_SIZE);
+};
 
 /// One attention layer: its weights, its own paged cq3 K/V cache for a single
 /// sequence of up to `max_tokens`, and scratch.
@@ -61,6 +74,12 @@ pub struct AttnLayer {
     k_bits: i32,
     codebook: Codebook,
     num_pages: i32,
+    /// Block-table width the decode attention is launched with. The fork
+    /// sizes it per request, not per cache: `ceil(max_seq_len / 256)` pages
+    /// rounded up to a multiple of 16 (`generator.py` `iterate_gen`), and the
+    /// split count follows it. [`Self::set_decode_width`] sets it; it starts
+    /// as the whole cache.
+    decode_width: i32,
     max_tokens: u32,
     programs: i32,
     splits_cap: i32,
@@ -113,6 +132,15 @@ pub struct AttnLayer {
     partial_o: ByteBuf,
     partial_ml: ByteBuf,
     o_proj: Exl3Linear,
+    /// q/k/v again, so `rows > 32` can call [`Exl3Linear::forward_rows`].
+    ///
+    /// [`Exl3Linear`] keeps its trellis private, and the sliced bundle above
+    /// has to stay for decode. These are the fork's separate linears
+    /// (`project_qkv` when `bsz * q_len > 32`). The `rows <= 32` path does
+    /// not read them.
+    q_linear: Exl3Linear,
+    k_linear: Exl3Linear,
+    v_linear: Exl3Linear,
 }
 
 /// One EXL3 source in the sliced bundle.
@@ -271,6 +299,11 @@ impl AttnLayer {
                 o_proj.size_k, o_proj.size_n
             )));
         }
+        let q_linear =
+            load_rows_linear(gpu, ckpt, &format!("{base}.q_proj"), hidden, q_features * 2)?;
+        let kv_n = KV_HEADS * HEAD_DIM;
+        let k_linear = load_rows_linear(gpu, ckpt, &format!("{base}.k_proj"), hidden, kv_n)?;
+        let v_linear = load_rows_linear(gpu, ckpt, &format!("{base}.v_proj"), hidden, kv_n)?;
 
         let num_pages_u = max_tokens / PAGE;
         let num_pages = i32::try_from(num_pages_u)
@@ -295,7 +328,12 @@ impl AttnLayer {
             .and_then(|n| n.checked_mul(2))
             .ok_or_else(|| Error::Input("qkv carrier overflows".into()))?;
 
-        let table: Vec<i32> = (0..num_pages).collect();
+        // Room for the widest padded decode width; columns past the cache
+        // are 0 and never read (the kernels stop at cache_seqlens).
+        let table_len = (num_pages + 15) / 16 * 16;
+        let table: Vec<i32> = (0..table_len)
+            .map(|p| if p < num_pages { p } else { 0 })
+            .collect();
         let qkv = [q.proj, k.proj, v.proj];
         Ok(Self {
             hidden,
@@ -310,6 +348,7 @@ impl AttnLayer {
             k_bits: q.k_bits,
             codebook: q.codebook,
             num_pages,
+            decode_width: num_pages,
             max_tokens,
             programs,
             splits_cap: cap,
@@ -354,6 +393,9 @@ impl AttnLayer {
                     .ok_or_else(|| Error::Input("partial_ml scratch overflows".into()))?,
             )?,
             o_proj,
+            q_linear,
+            k_linear,
+            v_linear,
         })
     }
 
@@ -382,6 +424,16 @@ impl AttnLayer {
     /// [`Self::bind_sequence`] is in effect the kernels read the shared word
     /// instead; [`crate::model::Model::reset_sequence`] clears that too.
     /// The page allocations are unchanged.
+    /// Set the decode block-table width for a request whose prompt plus
+    /// `max_new_tokens` is `max_seq_len` tokens, the way the fork's
+    /// `iterate_gen` sizes it.
+    pub fn set_decode_width(&mut self, max_seq_len: u32) {
+        let pages = max_seq_len.div_ceil(PAGE).max(1);
+        let padded = pages.div_ceil(16) * 16;
+        let limit = u32::try_from(self.num_pages).unwrap_or(0).div_ceil(16) * 16;
+        self.decode_width = i32::try_from(padded.min(limit)).unwrap_or(self.num_pages);
+    }
+
     pub fn reset_cache(&mut self, gpu: &Gpu) -> Result<()> {
         let zero = [0u8; 4];
         self.seqlens.copy_from_host(&gpu.stream, &zero)?;
@@ -578,7 +630,7 @@ impl AttnLayer {
                 &gpu.stream,
                 &self.paged_args(),
                 1,
-                self.num_pages,
+                self.decode_width,
                 self.splits_cap,
             )?;
             mul_sigmoid(o, g.cast_const(), self.q_numel, stream)?;
@@ -761,6 +813,26 @@ fn load_source(
             out: gpu.zeroed(usize::try_from(n).unwrap_or(0) * 2)?,
         },
     })
+}
+
+/// The same linear as [`load_source`], through [`Exl3Linear`] so prefill can
+/// call [`Exl3Linear::forward_rows`]. `load_source` already rejected a bias
+/// and a non-mul1 K = 4 trellis.
+fn load_rows_linear(
+    gpu: &Gpu,
+    ckpt: &Checkpoint,
+    prefix: &str,
+    expect_k: i32,
+    expect_n: i32,
+) -> Result<Exl3Linear> {
+    let linear = Exl3Linear::load(gpu, ckpt, prefix)?;
+    if linear.size_k != expect_k || linear.size_n != expect_n {
+        return Err(Error::Weights(format!(
+            "{prefix}: {}x{}, expected {expect_k}x{expect_n}",
+            linear.size_k, linear.size_n
+        )));
+    }
+    Ok(linear)
 }
 
 fn shape_dim(groups: u64, scale: u64, prefix: &str, what: &str) -> Result<i32> {
@@ -1450,6 +1522,585 @@ fn skip_ws(text: &str, i: &mut usize) {
     while matches!(bytes.get(*i), Some(b' ' | b'\n' | b'\r' | b'\t')) {
         *i += 1;
     }
+}
+
+/// Scratch for [`AttnLayer::prefill`], allocated once for the largest chunk
+/// and shared by every attention layer, plus the Triton prefill kernels.
+///
+/// Holds the q/k/v/gate/output rows, the sliced-mgemm Hadamard image (up to
+/// 32 rows), the cq3 staging buffers, and an identity block table. It does
+/// not hold a second copy of any layer's weights.
+///
+/// Owner: prefill task ATTN.
+pub struct AttnPrefillScratch {
+    prefill: PagedPrefill,
+    max_rows: u32,
+    max_pages: i32,
+    hidden: i32,
+    width: i32,
+    slices: i32,
+    /// Rows the sliced mgemm Hadamard image can hold (`min(max_rows, 32)`).
+    mgemm_rows: u32,
+    /// Interleaved q and gate, fp16 `[max_rows, 2 * q_heads * head_dim]`.
+    qg: ByteBuf,
+    /// Key and value before RoPE, fp16 `[max_rows, kv_heads * head_dim]`.
+    k: ByteBuf,
+    v: ByteBuf,
+    /// Deinterleaved query, gate, and gated attention output.
+    q: ByteBuf,
+    g: ByteBuf,
+    o: ByteBuf,
+    /// fp16 Hadamard image for the sliced bundle: 3 slabs of `mgemm_rows`.
+    mgemm_had: ByteBuf,
+    /// Per-slice output pointers into `qg`, `k`, and `v`. Stable for the
+    /// life of those buffers.
+    c_ptrs: ByteBuf,
+    scratch_k: ByteBuf,
+    scratch_v: ByteBuf,
+    /// int32 `[0, 1, …, max_pages)`. The launch reads the first `bt_width`.
+    identity: ByteBuf,
+    global_scratch: ByteBuf,
+    profile_scratch: ByteBuf,
+}
+
+/// One prefill chunk that fits this layer and `scratch`.
+struct PrefillSpan {
+    rows: i32,
+    start: i32,
+    end: i32,
+    pages: i32,
+}
+
+impl AttnPrefillScratch {
+    /// Room for chunks of up to `max_rows` tokens over a `max_tokens` cache.
+    /// `cubin_dir` is the Triton cubin directory (`target/triton-cubins`).
+    pub fn new(
+        gpu: &Gpu,
+        shape: &ModelShape,
+        max_rows: u32,
+        max_tokens: u32,
+        cubin_dir: &std::path::Path,
+    ) -> Result<Self> {
+        if shape.num_q_heads != u32::try_from(Q_HEADS).unwrap_or(0)
+            || shape.num_kv_heads != u32::try_from(KV_HEADS).unwrap_or(0)
+            || shape.head_dim != u32::try_from(HEAD_DIM).unwrap_or(0)
+        {
+            return Err(Error::Weights(
+                "paged prefill cubin is the 27B tile (24 query heads, 4 kv heads, head dim 256)"
+                    .into(),
+            ));
+        }
+        if max_rows < 2 {
+            return Err(Error::Input(format!(
+                "attention prefill max_rows {max_rows} is below 2"
+            )));
+        }
+        if max_tokens == 0 || !max_tokens.is_multiple_of(PAGE) {
+            return Err(Error::Input(format!(
+                "max_tokens {max_tokens} is not a positive multiple of {PAGE}"
+            )));
+        }
+        let max_pages = i32::try_from(max_tokens / PAGE)
+            .map_err(|_| Error::Input("page count does not fit in i32".into()))?;
+        let hidden = i32::try_from(shape.hidden_size)
+            .map_err(|_| Error::Weights("hidden_size does not fit in i32".into()))?;
+        if hidden < 1 {
+            return Err(Error::Weights("hidden_size is 0".into()));
+        }
+
+        let prefill = PagedPrefill::load(&gpu.ctx, cubin_dir)?;
+        let (width, slices, q_n, kv_n) = qkv_layout()?;
+        let mgemm_rows = max_rows.min(SLICED_MAX_ROWS);
+        let q_cols = Q_HEADS * HEAD_DIM;
+        let qg = gpu.zeroed(fp16_bytes(max_rows, q_n)?)?;
+        let k = gpu.zeroed(fp16_bytes(max_rows, kv_n)?)?;
+        let v = gpu.zeroed(fp16_bytes(max_rows, kv_n)?)?;
+        let ptrs = slice_out_ptrs(
+            qg.ptr().as_u64(),
+            k.ptr().as_u64(),
+            v.ptr().as_u64(),
+            q_n,
+            kv_n,
+            width,
+        )?;
+        if i32::try_from(ptrs.len()).ok() != Some(slices) {
+            return Err(Error::Input(
+                "prefill slice pointer count does not match the bundle".into(),
+            ));
+        }
+        let (g_short, p_short) = prefill.scratch_bytes(1);
+        let (g_wide, p_wide) = prefill.scratch_bytes(TWO_PASS_MIN_Q);
+        let stage_elems = staging_scratch_elems(1, max_pages)?;
+        let stage_bytes = stage_elems
+            .checked_mul(2)
+            .ok_or_else(|| Error::Input("attention staging scratch overflows".into()))?;
+        let identity: Vec<i32> = (0..max_pages).collect();
+        Ok(Self {
+            prefill,
+            max_rows,
+            max_pages,
+            hidden,
+            width,
+            slices,
+            mgemm_rows,
+            qg,
+            k,
+            v,
+            q: gpu.zeroed(fp16_bytes(max_rows, q_cols)?)?,
+            g: gpu.zeroed(fp16_bytes(max_rows, q_cols)?)?,
+            o: gpu.zeroed(fp16_bytes(max_rows, q_cols)?)?,
+            mgemm_had: gpu.zeroed(mgemm_had_bytes(mgemm_rows, hidden)?)?,
+            c_ptrs: upload_u64(gpu, &ptrs)?,
+            scratch_k: gpu.zeroed(stage_bytes)?,
+            scratch_v: gpu.zeroed(stage_bytes)?,
+            identity: upload_i32(gpu, &identity)?,
+            global_scratch: gpu.zeroed(u32_len(g_short.max(g_wide))?)?,
+            profile_scratch: gpu.zeroed(u32_len(p_short.max(p_wide))?)?,
+        })
+    }
+}
+
+impl AttnLayer {
+    /// `output = self_attn(input)` for `rows > 1` tokens at positions
+    /// `start .. start + rows`; the cache holds `start` earlier tokens and
+    /// gets these. The fork's prefill path (`decode_flash_attn` for
+    /// `q_len > 1`).
+    ///
+    /// `input` is fp16 `[rows, hidden]`; `output` is fp32 `[rows, hidden]`.
+    ///
+    /// `rows <= 32` is one sliced `exl3_mgemm` (`project_qkv_sliced`). Larger
+    /// chunks are separate `q_proj`, `k_proj`, and `v_proj` linears. Either
+    /// way [`PagedPrefill::prefill_chunk`] deinterleaves, applies fused q/k
+    /// norm and RoPE at `start .. start + rows`, writes cq3 at
+    /// `cache_seqlens = start`, runs the Triton prefill (fp16 staging when
+    /// `rows >= 256`), and applies the output gate. The cubin is the Triton
+    /// specialization class of this call: `q_len` and `kv_append_len` are
+    /// `rows`, `num_pages_per_seq` is the live page count, `num_splits` comes
+    /// from the fork's formula, and both windows are -1.
+    /// [`PagedPrefill::prefill_chunk`] selects that cubin and errors if the
+    /// class was not captured. `o_proj` is
+    /// [`Exl3Linear::forward_rows`] with fp32 out.
+    ///
+    /// The private cache length becomes `start + rows` after the launch.
+    /// A [`Self::bind_sequence`] word is left unchanged: every attention
+    /// layer in the chunk still reads `start` from it. Synchronize
+    /// `gpu.stream` before the next `prefill` or [`Self::forward`] on this
+    /// layer. The pinned slots are single-buffered, same as `forward`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill(
+        &mut self,
+        gpu: &Gpu,
+        rows_scratch: &mut crate::device::RowScratch,
+        scratch: &mut AttnPrefillScratch,
+        input: &ByteBuf,
+        output: &mut ByteBuf,
+        start: u32,
+        rows: u32,
+    ) -> Result<()> {
+        let span = self.prefill_span(scratch, input, output, start, rows)?;
+        // Both host values are written before either copy. `seq_host` is
+        // `start` and `pos_host` is `start + rows`. The first copy publishes
+        // `start` for the kernels; the second publishes the new length after
+        // them. Do not write either page again until `gpu.stream` completes.
+        self.seq_host
+            .as_mut_slice()
+            .copy_from_slice(&span.start.to_le_bytes());
+        self.pos_host
+            .as_mut_slice()
+            .copy_from_slice(&span.end.to_le_bytes());
+        self.copy_length_from(gpu, true)?;
+        if rows <= SLICED_MAX_ROWS {
+            self.project_qkv_sliced(gpu, scratch, input, span.rows)?;
+        } else {
+            self.q_linear.forward_rows(
+                gpu,
+                rows_scratch,
+                input,
+                &mut scratch.qg,
+                rows,
+                OutDtype::F16,
+            )?;
+            self.k_linear.forward_rows(
+                gpu,
+                rows_scratch,
+                input,
+                &mut scratch.k,
+                rows,
+                OutDtype::F16,
+            )?;
+            self.v_linear.forward_rows(
+                gpu,
+                rows_scratch,
+                input,
+                &mut scratch.v,
+                rows,
+                OutDtype::F16,
+            )?;
+        }
+        let args = self.prefill_args(scratch, span.rows);
+        // SAFETY: qg, k, v, q, g, and o are scratch rows of at least `span.rows`
+        // and do not alias each other. Cache pages, scales, and the identity
+        // table cover `span.pages`. `cache_seqlens` is this layer's private
+        // word, just staged to `start`, unless [`Self::bind_sequence`] points
+        // it at the model's word (the model set that to `start`). Norms,
+        // inv_freq, and h32 belong to the layer. Every buffer outlives
+        // `gpu.stream`. The cq3 write is ordered before the attention read.
+        unsafe {
+            scratch
+                .prefill
+                .prefill_chunk(&gpu.stream, &args, span.rows, span.pages, span.start)?;
+        }
+        self.o_proj
+            .forward_rows(gpu, rows_scratch, &scratch.o, output, rows, OutDtype::F32)?;
+        self.copy_length_from(gpu, false)?;
+        Ok(())
+    }
+
+    /// Async copy of `seq_host` (`start`) or `pos_host` (`start + rows`) into
+    /// the private length words. Never the [`Self::bind_sequence`] word.
+    fn copy_length_from(&mut self, gpu: &Gpu, start_value: bool) -> Result<()> {
+        let AttnLayer {
+            seqlens,
+            positions,
+            seq_host,
+            pos_host,
+            ..
+        } = self;
+        let host = if start_value { &*seq_host } else { &*pos_host };
+        // SAFETY: `host` stays allocated on `self` and is not written again
+        // until the caller synchronizes `gpu.stream`. The device words outlive
+        // the copy. Both words read the same pinned page.
+        unsafe {
+            seqlens.copy_from_pinned_async(&gpu.stream, host)?;
+            positions.copy_from_pinned_async(&gpu.stream, host)?;
+        }
+        Ok(())
+    }
+
+    fn prefill_span(
+        &self,
+        scratch: &AttnPrefillScratch,
+        input: &ByteBuf,
+        output: &ByteBuf,
+        start: u32,
+        rows: u32,
+    ) -> Result<PrefillSpan> {
+        if rows < 2 {
+            return Err(Error::Input("attention prefill needs rows > 1".into()));
+        }
+        if rows > scratch.max_rows {
+            return Err(Error::Input(format!(
+                "prefill rows {rows} exceeds the scratch's {}",
+                scratch.max_rows
+            )));
+        }
+        if scratch.hidden != self.hidden
+            || scratch.width != self.width
+            || scratch.slices != self.slices
+        {
+            return Err(Error::Input(format!(
+                "prefill scratch is {}x{} ({} slices); this layer is {}x{} ({} slices)",
+                scratch.hidden, scratch.width, scratch.slices, self.hidden, self.width, self.slices
+            )));
+        }
+        if self.partial_head_dim != ROTARY_DIM || self.norm_eps.to_bits() != NORM_EPS.to_bits() {
+            return Err(Error::Input(format!(
+                "prefill rope cubin is rotary dim {ROTARY_DIM} and eps {NORM_EPS}; this layer is {} / {}",
+                self.partial_head_dim, self.norm_eps
+            )));
+        }
+        let end = start
+            .checked_add(rows)
+            .ok_or_else(|| Error::Input("start + rows overflows".into()))?;
+        if end > self.max_tokens {
+            return Err(Error::Input(format!(
+                "prefill end {end} is past the {}-token cache",
+                self.max_tokens
+            )));
+        }
+        let start_i = i32::try_from(start)
+            .map_err(|_| Error::Input(format!("prefill start {start} does not fit in i32")))?;
+        let end_i = i32::try_from(end)
+            .map_err(|_| Error::Input(format!("prefill end {end} does not fit in i32")))?;
+        let rows_i = i32::try_from(rows)
+            .map_err(|_| Error::Input(format!("prefill rows {rows} does not fit in i32")))?;
+        let pages = i32::try_from(end.div_ceil(PAGE))
+            .map_err(|_| Error::Input("page count does not fit in i32".into()))?;
+        if pages > self.num_pages || pages > scratch.max_pages {
+            return Err(Error::Input(format!(
+                "prefill needs {pages} pages; layer has {}, scratch has {}",
+                self.num_pages, scratch.max_pages
+            )));
+        }
+        let hidden = usize::try_from(self.hidden).unwrap_or(0);
+        let rows_u = usize::try_from(rows).unwrap_or(0);
+        let in_bytes = rows_u
+            .checked_mul(hidden)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| Error::Input("prefill input size overflows".into()))?;
+        let out_bytes = rows_u
+            .checked_mul(hidden)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| Error::Input("prefill output size overflows".into()))?;
+        need_bytes(input, in_bytes, "attention input")?;
+        need_bytes(output, out_bytes, "attention output")?;
+        let q_cols = Q_HEADS * HEAD_DIM;
+        let kv_cols = KV_HEADS * HEAD_DIM;
+        need_bytes(&scratch.qg, fp16_bytes(rows, q_cols * 2)?, "qg")?;
+        need_bytes(&scratch.k, fp16_bytes(rows, kv_cols)?, "k")?;
+        need_bytes(&scratch.v, fp16_bytes(rows, kv_cols)?, "v")?;
+        need_bytes(&scratch.q, fp16_bytes(rows, q_cols)?, "q")?;
+        need_bytes(&scratch.g, fp16_bytes(rows, q_cols)?, "g")?;
+        need_bytes(&scratch.o, fp16_bytes(rows, q_cols)?, "o")?;
+        if rows <= SLICED_MAX_ROWS {
+            if rows > scratch.mgemm_rows {
+                return Err(Error::Input(format!(
+                    "sliced prefill rows {rows} exceeds the mgemm scratch's {}",
+                    scratch.mgemm_rows
+                )));
+            }
+            need_bytes(
+                &scratch.mgemm_had,
+                mgemm_had_bytes(rows, self.hidden)?,
+                "mgemm hadamard",
+            )?;
+            let ptr_bytes = usize::try_from(self.slices)
+                .unwrap_or(0)
+                .checked_mul(8)
+                .ok_or_else(|| Error::Input("mgemm c_ptrs overflow".into()))?;
+            need_bytes(&scratch.c_ptrs, ptr_bytes, "mgemm c_ptrs")?;
+        }
+        if needs_staging(rows_i) {
+            let elems = staging_scratch_elems(1, pages)?;
+            let bytes = elems
+                .checked_mul(2)
+                .ok_or_else(|| Error::Input("staging scratch overflows".into()))?;
+            need_bytes(&scratch.scratch_k, bytes, "staging k")?;
+            need_bytes(&scratch.scratch_v, bytes, "staging v")?;
+            let table_bytes = usize::try_from(pages)
+                .unwrap_or(0)
+                .checked_mul(4)
+                .ok_or_else(|| Error::Input("identity table overflows".into()))?;
+            need_bytes(&scratch.identity, table_bytes, "identity block table")?;
+        }
+        let (global, profile) = scratch.prefill.scratch_bytes(rows_i);
+        need_bytes(
+            &scratch.global_scratch,
+            u32_len(global)?,
+            "triton global scratch",
+        )?;
+        need_bytes(
+            &scratch.profile_scratch,
+            u32_len(profile)?,
+            "triton profile scratch",
+        )?;
+        Ok(PrefillSpan {
+            rows: rows_i,
+            start: start_i,
+            end: end_i,
+            pages,
+        })
+    }
+
+    /// Interleaved q/g plus k and v, one sliced mgemm. `prefill_chunk`
+    /// deinterleaves; doing it here would run that kernel twice.
+    fn project_qkv_sliced(
+        &self,
+        gpu: &Gpu,
+        scratch: &AttnPrefillScratch,
+        input: &ByteBuf,
+        rows: i32,
+    ) -> Result<()> {
+        // SAFETY: the slice lists alias this layer's q/k/v trellis. `c_ptrs`
+        // address `scratch`'s qg/k/v at each slice column, with the source
+        // width as the row stride. `mgemm_had` holds 3 * `rows` * hidden fp16
+        // (the kernel strides by `rows`, not by the allocation). The carrier
+        // is not written when `c_ptrs` is set; it carries the fp16 dtype and
+        // the slice width. All of them outlive `gpu.stream`.
+        let _shape = unsafe {
+            berth_kernels::prefill_lin::exl3_mgemm(
+                ptr(input).cast_const(),
+                ptr(&self.b_list).cast_const(),
+                ptr(&self.carrier),
+                ptr(&self.suh_list).cast_const(),
+                ptr(&scratch.mgemm_had),
+                ptr(&self.svh_list).cast_const(),
+                rows,
+                self.size_k,
+                self.width,
+                self.k_bits,
+                self.codebook,
+                OutDtype::F16,
+                1,
+                self.slices,
+                ptr(&self.size_n_list) as *const i32,
+                ptr(&scratch.c_ptrs).cast_const(),
+                ptr(&self.n_stride_list) as *const i32,
+                ptr(&self.had_src_list) as *const i32,
+                3,
+                gpu.raw_stream(),
+            )?
+        };
+        Ok(())
+    }
+
+    fn prefill_args(&self, scratch: &AttnPrefillScratch, rows: i32) -> PrefillChunk {
+        let staging = needs_staging(rows);
+        PrefillChunk {
+            qg: scratch.qg.ptr().as_u64(),
+            k: scratch.k.ptr().as_u64(),
+            v: scratch.v.ptr().as_u64(),
+            q: scratch.q.ptr().as_u64(),
+            g: scratch.g.ptr().as_u64(),
+            o: scratch.o.ptr().as_u64(),
+            k_cache: self.k_pages.ptr().as_u64(),
+            v_cache: self.v_pages.ptr().as_u64(),
+            k_scales: self.k_scales.ptr().as_u64(),
+            v_scales: self.v_scales.ptr().as_u64(),
+            block_table: self.block_table.ptr().as_u64(),
+            cache_seqlens: self.seqlens_addr(),
+            inv_freq: self.inv_freq.ptr().as_u64(),
+            q_norm: self.q_norm.ptr().as_u64(),
+            k_norm: self.k_norm.ptr().as_u64(),
+            h32: self.h32.ptr().as_u64(),
+            scratch_k: if staging {
+                scratch.scratch_k.ptr().as_u64()
+            } else {
+                0
+            },
+            scratch_v: if staging {
+                scratch.scratch_v.ptr().as_u64()
+            } else {
+                0
+            },
+            identity_table: if staging {
+                scratch.identity.ptr().as_u64()
+            } else {
+                0
+            },
+            global_scratch: scratch.global_scratch.ptr().as_u64(),
+            profile_scratch: scratch.profile_scratch.ptr().as_u64(),
+        }
+    }
+}
+
+fn qkv_layout() -> Result<(i32, i32, i32, i32)> {
+    let q_n = Q_HEADS * HEAD_DIM * 2;
+    let kv_n = KV_HEADS * HEAD_DIM;
+    let width = gcd(q_n, kv_n);
+    if width < 256 || width % 128 != 0 || q_n % width != 0 || kv_n % width != 0 {
+        return Err(Error::Weights(format!(
+            "prefill slice width {width} does not tile q/k/v"
+        )));
+    }
+    let slices = (q_n / width) + (kv_n / width) * 2;
+    Ok((width, slices, q_n, kv_n))
+}
+
+fn slice_out_ptrs(qg: u64, k: u64, v: u64, q_n: i32, kv_n: i32, width: i32) -> Result<Vec<u64>> {
+    let mut ptrs = Vec::new();
+    push_slice_ptrs(&mut ptrs, qg, q_n, width)?;
+    push_slice_ptrs(&mut ptrs, k, kv_n, width)?;
+    push_slice_ptrs(&mut ptrs, v, kv_n, width)?;
+    Ok(ptrs)
+}
+
+fn push_slice_ptrs(ptrs: &mut Vec<u64>, base: u64, n: i32, width: i32) -> Result<()> {
+    if width < 1 {
+        return Err(Error::Weights("prefill slice width is 0".into()));
+    }
+    let mut n0 = 0i32;
+    while n0 < n {
+        ptrs.push(base + u64::from(u32::try_from(n0).unwrap_or(0)) * 2);
+        n0 = n0
+            .checked_add(width)
+            .ok_or_else(|| Error::Weights("prefill slice column overflows".into()))?;
+    }
+    Ok(())
+}
+
+fn fp16_bytes(rows: u32, cols: i32) -> Result<usize> {
+    let cols = u64::try_from(cols).map_err(|_| Error::Input("negative prefill width".into()))?;
+    let bytes = u64::from(rows)
+        .checked_mul(cols)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or_else(|| Error::Input("attention prefill buffer overflows".into()))?;
+    usize::try_from(bytes).map_err(|_| Error::Input("attention prefill buffer overflows".into()))
+}
+
+fn mgemm_had_bytes(rows: u32, hidden: i32) -> Result<usize> {
+    fp16_bytes(rows, hidden)?
+        .checked_mul(3)
+        .ok_or_else(|| Error::Input("qkv hadamard scratch overflows".into()))
+}
+
+fn u32_len(bytes: u32) -> Result<usize> {
+    usize::try_from(bytes).map_err(|_| Error::Input("scratch size does not fit usize".into()))
+}
+
+fn need_bytes(buf: &ByteBuf, bytes: usize, what: &str) -> Result<()> {
+    if buf.num_bytes() < bytes {
+        return Err(Error::Input(format!(
+            "{what} has {} bytes, needs {bytes}",
+            buf.num_bytes()
+        )));
+    }
+    Ok(())
+}
+
+/// Host copy of this layer's cq3 pages and block table.
+///
+/// `qk` / `qv` are int32 code pages, `sk` / `sv` are fp16 scales, both in
+/// physical page order. `q_cols` is the int32 width of one token
+/// (`token_dim / 32 * bits`). `s_cols` is the fp16 scale width
+/// (`token_dim / 32`). The model gathers used rows in block-table order.
+pub(crate) struct CachePages {
+    pub qk: Vec<u8>,
+    pub qv: Vec<u8>,
+    pub sk: Vec<u8>,
+    pub sv: Vec<u8>,
+    pub block_table: Vec<i32>,
+    pub q_cols: usize,
+    pub s_cols: usize,
+    pub page_tokens: usize,
+}
+
+impl AttnLayer {
+    /// Copy the cache pages and the block table. The allocations stay on device.
+    ///
+    /// This is how the prefill reference reads used rows. Decode does not call it.
+    pub(crate) fn copy_cache(&self, gpu: &Gpu) -> Result<CachePages> {
+        let groups = usize::try_from(self.token_dim).unwrap_or(0) / 32;
+        Ok(CachePages {
+            qk: download_bytes(gpu, &self.k_pages)?,
+            qv: download_bytes(gpu, &self.v_pages)?,
+            sk: download_bytes(gpu, &self.k_scales)?,
+            sv: download_bytes(gpu, &self.v_scales)?,
+            block_table: download_i32(gpu, &self.block_table)?,
+            q_cols: groups * usize::try_from(CACHE_BITS).unwrap_or(0),
+            s_cols: groups,
+            page_tokens: usize::try_from(PAGE).unwrap_or(0),
+        })
+    }
+}
+
+fn download_bytes(gpu: &Gpu, buf: &ByteBuf) -> Result<Vec<u8>> {
+    let mut out = vec![0u8; buf.num_bytes()];
+    buf.copy_to_host(&gpu.stream, &mut out)?;
+    Ok(out)
+}
+
+fn download_i32(gpu: &Gpu, buf: &ByteBuf) -> Result<Vec<i32>> {
+    let bytes = download_bytes(gpu, buf)?;
+    if !bytes.len().is_multiple_of(4) {
+        return Err(Error::Input(
+            "block table byte length is not a multiple of 4".into(),
+        ));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|word| i32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+        .collect())
 }
 
 #[cfg(test)]

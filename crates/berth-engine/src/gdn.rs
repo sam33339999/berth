@@ -1,10 +1,14 @@
-//! Gated DeltaNet mixer, one decode token (48 of the 27B's 64 layers).
+//! Gated DeltaNet mixer (48 of the 27B's 64 layers).
 //!
-//! Owner: task GDN. Reproduces `BC_GatedDeltaNetSplit::run_bszN` for bsz 1,
-//! history off: the sliced qkv+z `exl3_mgemm`, then the five GDN kernels, then
-//! `out_proj`.
+//! Decode ([`GdnLayer::forward`]) reproduces `BC_GatedDeltaNetSplit::run_bszN`
+//! for one token, history off: the sliced qkv+z `exl3_mgemm`, then the five
+//! GDN kernels, then `out_proj`.
+//!
+//! Prefill ([`GdnLayer::prefill`]) is the torch path. `seq_len > 1` misses the
+//! BC graph (`gated_delta_net.py` 1034–1048) even when `seq_len <= 16`.
 
 use std::ffi::c_void;
+use std::path::PathBuf;
 
 use berth_cuda::{ByteBuf, DeviceBuffer, DeviceCopy};
 use berth_exl3::{Bitrate, Checkpoint, DType, HadamardScale, LinearExl3};
@@ -18,6 +22,16 @@ use crate::{Error, Exl3Linear, Gpu, Result};
 /// (`gated_delta_net.py`).
 const BETA_SCALE: f32 = 1.0;
 
+/// `project_qkvz_sliced` runs only when `bsz * seqlen <= 32`
+/// (`gated_delta_net.py`). Longer chunks use the two linears.
+const SLICED_QKVZ_MAX: i32 = 32;
+
+/// `AUTO_RECONSTRUCT_THRESHOLD`. Rows above this reconstruct the fp16 weight.
+const RECONSTRUCT_ABOVE: i32 = 144;
+
+/// Pinned fla cubins reject a longer chunk (`gdn_prefill`).
+const PREFILL_MAX_ROWS: u32 = 4096;
+
 /// 27B `text_config.rms_norm_eps`. The fork passes `config.rms_norm_eps` into
 /// `GatedRMSNorm`. [`berth_exl3::ModelConfig`] does not store the field, so
 /// the constant lives here. The checkpoint's value is `1e-06`.
@@ -28,8 +42,14 @@ pub struct GdnLayer {
     dims: Dims,
     qkvz: Qkvz,
     /// fp16 `[2 * num_v_heads, hidden]`. Rows `0..H` are `in_proj_b`, the rest
-    /// `in_proj_a` (`gated_delta_net.py` `cat([b, a], dim=-1).T`).
+    /// `in_proj_a` (`gated_delta_net.py` `cat([b, a], dim=-1).T`). Decode only.
     ba_weight: ByteBuf,
+    /// fp16 `[hidden, num_v_heads]`. Checkpoint `in_proj_b.weight` is
+    /// `[num_v_heads, hidden]`; `load_fp16` transposes it (`transposed_load`,
+    /// default true) into the `x @ W` layout `ext.hgemm` multiplies.
+    b_hgemm: ByteBuf,
+    /// fp16 `[hidden, num_v_heads]`, the same transpose of `in_proj_a.weight`.
+    a_hgemm: ByteBuf,
     /// fp16 `[2 * num_v_heads]`, or absent. The 27B checkpoint has neither bias.
     ba_bias: Option<ByteBuf>,
     /// bf16 `[num_v_heads]`, `linear_attn.dt_bias`.
@@ -55,6 +75,7 @@ pub struct GdnLayer {
 }
 
 /// Widths for one token. Every product is checked into `i32` at load.
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Dims {
     hidden: i32,
     /// `2 * num_k_heads * k_head_dim + num_v_heads * v_head_dim`.
@@ -84,9 +105,8 @@ struct Projection {
 /// the same tables `SlicedMultiLinear` and `set_qkvz_bundle` keep.
 struct Qkvz {
     qkv: Projection,
-    /// `in_proj_z` weights. The slice tables alias this allocation, so it has
-    /// to stay alive even though launch reads the tables, not the field.
-    #[allow(dead_code)]
+    /// `in_proj_z` weights. The slice tables alias this allocation. Prefill
+    /// rows above 32 also launch this trellis on its own.
     z: Projection,
     b_list: DeviceBuffer<u64>,
     suh_list: DeviceBuffer<u64>,
@@ -155,6 +175,20 @@ impl GdnLayer {
         let qkvz = pack_qkvz(gpu, qkv, z, &scratch.qkv, &scratch.z, width, slices)?;
 
         let ba_weight = cat_ba(gpu, ckpt, &base, dims.num_v_heads, dims.hidden)?;
+        let b_hgemm = hgemm_weight(
+            gpu,
+            ckpt,
+            &format!("{base}.in_proj_b.weight"),
+            dims.num_v_heads,
+            dims.hidden,
+        )?;
+        let a_hgemm = hgemm_weight(
+            gpu,
+            ckpt,
+            &format!("{base}.in_proj_a.weight"),
+            dims.num_v_heads,
+            dims.hidden,
+        )?;
         let ba_bias = cat_ba_bias(gpu, ckpt, &base, dims.num_v_heads)?;
         let dt_bias = upload_exact(
             gpu,
@@ -211,6 +245,8 @@ impl GdnLayer {
             dims,
             qkvz,
             ba_weight,
+            b_hgemm,
+            a_hgemm,
             ba_bias,
             dt_bias,
             a_log,
@@ -390,6 +426,10 @@ fn dims_for(shape: &ModelShape, layer: u32) -> Result<Dims> {
             "layer {layer} is {kind}, not linear_attention"
         )));
     }
+    dims_from_shape(shape)
+}
+
+fn dims_from_shape(shape: &ModelShape) -> Result<Dims> {
     let g = &shape.gdn;
     let hidden = as_i32(shape.hidden_size, "hidden_size")?;
     let num_k_heads = as_i32(g.num_k_heads, "num_k_heads")?;
@@ -646,6 +686,39 @@ fn cat_ba(gpu: &Gpu, ckpt: &Checkpoint, base: &str, num_v: i32, hidden: i32) -> 
     Ok(DeviceBuffer::from_host(&gpu.stream, &rows)?)
 }
 
+/// Checkpoint `[num_v, hidden]` transposed to the runtime `[hidden, num_v]`
+/// `LinearFP16` weight (`linear.py` `load_fp16`, `transpose = transposed_load`).
+fn hgemm_weight(gpu: &Gpu, ckpt: &Checkpoint, name: &str, n: i32, k: i32) -> Result<ByteBuf> {
+    let bytes = read_exact(ckpt, name, DType::F16, &[u64_dim(n), u64_dim(k)])?;
+    let transposed = transpose_fp16(&bytes, n as usize, k as usize)?;
+    Ok(DeviceBuffer::from_host(&gpu.stream, &transposed)?)
+}
+
+/// `[n, k]` fp16 to `[k, n]` fp16. Bits are copied; nothing is converted.
+fn transpose_fp16(bytes: &[u8], n: usize, k: usize) -> Result<Vec<u8>> {
+    if n == 0 || k == 0 {
+        return Err(Error::Weights("b/a weight has a zero dimension".into()));
+    }
+    let need = n
+        .checked_mul(k)
+        .and_then(|elems| elems.checked_mul(2))
+        .ok_or_else(|| Error::Weights("b/a weight size overflows".into()))?;
+    if bytes.len() != need {
+        return Err(Error::Weights(format!(
+            "b/a weight has {} bytes, expected {need}",
+            bytes.len()
+        )));
+    }
+    let mut out = vec![0u8; need];
+    for (row, src_row) in bytes.chunks_exact(k * 2).enumerate() {
+        for (col, elem) in src_row.chunks_exact(2).enumerate() {
+            let dst = (col * n + row) * 2;
+            out[dst..dst + 2].copy_from_slice(elem);
+        }
+    }
+    Ok(out)
+}
+
 fn cat_ba_bias(gpu: &Gpu, ckpt: &Checkpoint, base: &str, num_v: i32) -> Result<Option<ByteBuf>> {
     let b_name = format!("{base}.in_proj_b.bias");
     let a_name = format!("{base}.in_proj_a.bias");
@@ -726,4 +799,508 @@ fn upload_info(gpu: &Gpu, info: &berth_exl3::TensorInfo) -> Result<ByteBuf> {
 
 fn raw<T: DeviceCopy>(buf: &DeviceBuffer<T>) -> *mut c_void {
     buf.ptr().as_u64() as *mut c_void
+}
+
+/// Scratch for [`GdnLayer::prefill`], allocated once by the model for the
+/// largest chunk and shared by all 48 GDN layers.
+///
+/// The qkv and z trellises stay on the layer. This holds the chunk buffers
+/// those linears write, the `gdn_prefill` workspace, and the Hadamard /
+/// reconstruct scratch the separate linears need. `out_proj` uses the
+/// caller's [`crate::device::RowScratch`] instead of a second copy.
+pub struct GdnPrefillScratch {
+    dims: Dims,
+    max_rows: u32,
+    width: i32,
+    slices: i32,
+    /// fp32 `[max_rows, fdim]`.
+    qkv: ByteBuf,
+    /// fp32 `[max_rows, v_dim]`.
+    z: ByteBuf,
+    /// fp32 `[max_rows, num_v_heads]`, `b_proj` output.
+    b: ByteBuf,
+    /// fp32 `[max_rows, num_v_heads]`, `a_proj` output.
+    a: ByteBuf,
+    /// fp16 `[max_rows, v_dim]`. Gated RMSNorm output, `out_proj` input.
+    core: ByteBuf,
+    /// `gdn_prefill::scratch_bytes(max_rows)`.
+    workspace: ByteBuf,
+    /// fp16 `[max_rows, hidden]` for the separate `exl3_linear` calls.
+    a_had: ByteBuf,
+    /// fp16 reconstruct buffer, `hidden * fdim` (qkv is wider than z).
+    weight: ByteBuf,
+    /// fp16 `[2, mgemm_rows, hidden]` for `project_qkvz_sliced`.
+    mgemm_had: ByteBuf,
+    /// fp32 `[slices, mgemm_rows, width]`. Sliced mode writes `c_ptrs`.
+    carrier: ByteBuf,
+    /// Device pointers, `out + n0 * 4`, into `qkv` then `z`.
+    c_ptrs: DeviceBuffer<u64>,
+    kernels: berth_kernels::gdn_prefill::GdnPrefill,
+}
+
+impl GdnPrefillScratch {
+    /// Room for chunks of up to `max_rows` tokens.
+    ///
+    /// The cubins are the 27B path (16/48 heads, dim 128, conv 4, `F = 10240`).
+    /// `max_rows` is `2..=4096`. The model passes 2048.
+    pub fn new(gpu: &Gpu, shape: &ModelShape, max_rows: u32) -> Result<Self> {
+        let dims = dims_from_shape(shape)?;
+        expect_kernel_shape(&dims)?;
+        let rows_i = i32::try_from(max_rows)
+            .map_err(|_| Error::Input("gdn prefill max_rows does not fit in i32".into()))?;
+        if !(2..=PREFILL_MAX_ROWS).contains(&max_rows) {
+            return Err(Error::Input(format!(
+                "gdn prefill max_rows {max_rows} is outside 2..={PREFILL_MAX_ROWS}"
+            )));
+        }
+        let kernels = berth_kernels::gdn_prefill::GdnPrefill::load(&gpu.ctx, &fla_cubin_dir())?;
+        let (width, slices) = slice_plan(dims.fdim, dims.v_dim)?;
+        let rows = max_rows as usize;
+        let hidden = dims.hidden as usize;
+        let fdim = dims.fdim as usize;
+        let v_dim = dims.v_dim as usize;
+        let heads = dims.num_v_heads as usize;
+        let mgemm_rows = rows.min(SLICED_QKVZ_MAX as usize);
+        let qkv = dev_bytes(gpu, mul_usize(rows, fdim, "qkv")?, 4, "qkv")?;
+        let z = dev_bytes(gpu, mul_usize(rows, v_dim, "z")?, 4, "z")?;
+        let workspace_bytes = berth_kernels::gdn_prefill::scratch_bytes(rows_i)?;
+        let workspace = gpu.zeroed(workspace_bytes)?;
+        if !workspace.ptr().as_u64().is_multiple_of(256) {
+            return Err(Error::Input(
+                "gdn prefill workspace is not 256-byte aligned".into(),
+            ));
+        }
+        let c_ptrs = qkvz_c_ptrs(gpu, &qkv, &z, dims.fdim, dims.v_dim, width, slices)?;
+        let carrier_elems = mul_usize(slices as usize, mgemm_rows, "mgemm carrier")?;
+        let carrier_elems = mul_usize(carrier_elems, width as usize, "mgemm carrier")?;
+        let mgemm_had_elems = mul_usize(2, mgemm_rows, "mgemm a_had")?;
+        let mgemm_had_elems = mul_usize(mgemm_had_elems, hidden, "mgemm a_had")?;
+        Ok(Self {
+            dims,
+            max_rows,
+            width,
+            slices,
+            qkv,
+            z,
+            b: dev_bytes(gpu, mul_usize(rows, heads, "b")?, 4, "b")?,
+            a: dev_bytes(gpu, mul_usize(rows, heads, "a")?, 4, "a")?,
+            core: dev_bytes(gpu, mul_usize(rows, v_dim, "core")?, 2, "core")?,
+            workspace,
+            a_had: dev_bytes(gpu, mul_usize(rows, hidden, "a_had")?, 2, "a_had")?,
+            weight: dev_bytes(
+                gpu,
+                mul_usize(hidden, fdim, "reconstruct weight")?,
+                2,
+                "reconstruct weight",
+            )?,
+            mgemm_had: dev_bytes(gpu, mgemm_had_elems, 2, "mgemm a_had")?,
+            carrier: dev_bytes(gpu, carrier_elems, 4, "mgemm carrier")?,
+            c_ptrs,
+            kernels,
+        })
+    }
+}
+
+fn fla_cubin_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/triton-cubins/fla")
+}
+
+fn expect_kernel_shape(dims: &Dims) -> Result<()> {
+    let ok = dims.hidden == 5120
+        && dims.num_k_heads == 16
+        && dims.num_v_heads == 48
+        && dims.k_head_dim == 128
+        && dims.v_head_dim == 128
+        && dims.conv_k == 4
+        && dims.fdim == 10240
+        && dims.v_dim == 6144;
+    if ok {
+        return Ok(());
+    }
+    Err(Error::Input(format!(
+        "gdn prefill cubins are the 27B shape (hidden 5120, 16/48 heads of 128, conv 4, F 10240); \
+         got hidden {} heads {}/{} dims {}/{} conv {} F {} V {}",
+        dims.hidden,
+        dims.num_k_heads,
+        dims.num_v_heads,
+        dims.k_head_dim,
+        dims.v_head_dim,
+        dims.conv_k,
+        dims.fdim,
+        dims.v_dim
+    )))
+}
+
+fn dev_bytes(gpu: &Gpu, elems: usize, elem: usize, what: &str) -> Result<ByteBuf> {
+    let bytes = elems
+        .checked_mul(elem)
+        .ok_or_else(|| Error::Input(format!("gdn prefill {what} overflows")))?;
+    gpu.zeroed(bytes)
+}
+
+fn mul_usize(a: usize, b: usize, what: &str) -> Result<usize> {
+    a.checked_mul(b)
+        .ok_or_else(|| Error::Input(format!("gdn prefill {what} overflows")))
+}
+
+/// `SlicedMultiLinear` output bases: `out.data_ptr() + n0 * sizeof(fp32)`.
+fn qkvz_c_ptrs(
+    gpu: &Gpu,
+    qkv: &ByteBuf,
+    z: &ByteBuf,
+    fdim: i32,
+    v_dim: i32,
+    width: i32,
+    slices: i32,
+) -> Result<DeviceBuffer<u64>> {
+    let mut host = Vec::with_capacity(slices as usize);
+    for (out, n) in [(qkv, fdim), (z, v_dim)] {
+        let mut n0 = 0;
+        while n0 < n {
+            host.push(out.ptr().as_u64() + u64::try_from(n0).unwrap() * 4);
+            n0 += width;
+        }
+    }
+    if host.len() != slices as usize {
+        return Err(Error::Input(format!(
+            "gdn prefill built {} c_ptrs, expected {slices}",
+            host.len()
+        )));
+    }
+    Ok(DeviceBuffer::from_host(&gpu.stream, &host)?)
+}
+
+impl GdnLayer {
+    /// `output = linear_attn(input)` for a chunk of `rows > 1` tokens, the
+    /// fork's prefill path. Continues from this layer's conv and recurrent
+    /// state and leaves the state after the chunk, as the fork does.
+    ///
+    /// `input` is fp16 `[rows, hidden]`; `output` is fp32 `[rows, hidden]`.
+    ///
+    /// Fork order (`gated_delta_net.py` 1096–1154): qkv and z (1097–1101),
+    /// `b_proj` and `a_proj` (1103–1104), `gated_delta_net_fused_op_2` plus
+    /// the conv, delta rule, and gated norm (`gdn_prefill`), then `o_proj`
+    /// (1154).
+    pub fn prefill(
+        &mut self,
+        gpu: &Gpu,
+        rows_scratch: &mut crate::device::RowScratch,
+        scratch: &mut GdnPrefillScratch,
+        input: &ByteBuf,
+        output: &mut ByteBuf,
+        rows: u32,
+    ) -> Result<()> {
+        let rows_i = i32::try_from(rows)
+            .map_err(|_| Error::Input("gdn prefill rows do not fit in i32".into()))?;
+        if rows < 2 || rows > scratch.max_rows {
+            return Err(Error::Input(format!(
+                "gdn prefill rows {rows} is outside 2..={}",
+                scratch.max_rows
+            )));
+        }
+        if self.dims != scratch.dims
+            || self.qkvz.width != scratch.width
+            || self.qkvz.slices != scratch.slices
+        {
+            return Err(Error::Input(
+                "gdn prefill scratch was built for a different shape".into(),
+            ));
+        }
+        if self.ba_bias.is_some() {
+            return Err(Error::Input(
+                "gdn prefill: in_proj_b/a bias is present; LinearFP16 would add it".into(),
+            ));
+        }
+        if self.conv_bias.is_some() {
+            return Err(Error::Input(
+                "gdn prefill: conv1d bias is present; the triton conv has no bias".into(),
+            ));
+        }
+        let hidden = self.dims.hidden as usize;
+        let n = rows as usize;
+        if input.num_bytes() < n * hidden * 2 || output.num_bytes() < n * hidden * 4 {
+            return Err(Error::Input(format!(
+                "gdn prefill: expected fp16 [{rows}, {hidden}] in and fp32 [{rows}, {hidden}] out"
+            )));
+        }
+        self.project_qkvz(gpu, scratch, input, rows_i)?;
+        self.project_ba(gpu, scratch, input, rows_i)?;
+        self.run_gdn_prefill(gpu, scratch, rows_i)?;
+        self.out_proj.forward_rows(
+            gpu,
+            rows_scratch,
+            &scratch.core,
+            output,
+            rows,
+            OutDtype::F32,
+        )
+    }
+
+    /// `gated_delta_net.py` 1097–1101. `rows <= 32` is one sliced mgemm.
+    /// Longer chunks are `qkv_proj.forward` then `z_proj.forward`, both fp32.
+    fn project_qkvz(
+        &self,
+        gpu: &Gpu,
+        scratch: &GdnPrefillScratch,
+        input: &ByteBuf,
+        rows: i32,
+    ) -> Result<()> {
+        let d = &self.dims;
+        let q = &self.qkvz;
+        let stream = gpu.raw_stream();
+        if rows <= SLICED_QKVZ_MAX {
+            // SAFETY: slice tables alias this layer's trellises. `c_ptrs`
+            // address `scratch.qkv` / `scratch.z`, which hold `max_rows`
+            // rows. `mgemm_had` has two slabs of at least `rows`. The
+            // carrier is `(slices, mgemm_rows, width)` with `mgemm_rows >= rows`.
+            unsafe {
+                berth_kernels::prefill_lin::exl3_mgemm(
+                    ptr(input),
+                    raw(&q.b_list),
+                    ptr(&scratch.carrier),
+                    raw(&q.suh_list),
+                    ptr(&scratch.mgemm_had),
+                    raw(&q.svh_list),
+                    rows,
+                    d.hidden,
+                    q.width,
+                    q.qkv.k_bits,
+                    Codebook::Mul1,
+                    OutDtype::F32,
+                    1,
+                    q.slices,
+                    q.size_n_list.ptr().as_u64() as *const i32,
+                    raw(&scratch.c_ptrs),
+                    q.n_stride_list.ptr().as_u64() as *const i32,
+                    q.had_src_list.ptr().as_u64() as *const i32,
+                    2,
+                    stream,
+                )?;
+            }
+            return Ok(());
+        }
+        let weight = if rows > RECONSTRUCT_ABOVE {
+            ptr(&scratch.weight)
+        } else {
+            std::ptr::null_mut()
+        };
+        launch_exl3(
+            input,
+            &q.qkv,
+            &scratch.qkv,
+            &scratch.a_had,
+            weight,
+            rows,
+            d.hidden,
+            d.fdim,
+            stream,
+        )?;
+        launch_exl3(
+            input,
+            &q.z,
+            &scratch.z,
+            &scratch.a_had,
+            weight,
+            rows,
+            d.hidden,
+            d.v_dim,
+            stream,
+        )
+    }
+
+    /// `b_proj.forward` then `a_proj.forward` (`gated_delta_net.py` 1103–1104).
+    ///
+    /// Both are `LinearFP16` with `out_dtype` float (`gated_delta_net.py`
+    /// 480–483). `y` is fp32 and `x` is fp16, so `fp16.py` 93–96 calls
+    /// `ext.hgemm`, not `matmul`. Two `N = 48` GEMMs, not one `N = 96`.
+    fn project_ba(
+        &self,
+        gpu: &Gpu,
+        scratch: &GdnPrefillScratch,
+        input: &ByteBuf,
+        rows: i32,
+    ) -> Result<()> {
+        let stream = gpu.raw_stream();
+        hgemm_ba(
+            input,
+            &self.b_hgemm,
+            &scratch.b,
+            rows,
+            self.dims.hidden,
+            self.dims.num_v_heads,
+            stream,
+            "b",
+        )?;
+        hgemm_ba(
+            input,
+            &self.a_hgemm,
+            &scratch.a,
+            rows,
+            self.dims.hidden,
+            self.dims.num_v_heads,
+            stream,
+            "a",
+        )?;
+        Ok(())
+    }
+
+    /// Fused op 2, conv, delta rule, gated norm. Writes this layer's state.
+    fn run_gdn_prefill(&self, gpu: &Gpu, scratch: &GdnPrefillScratch, rows: i32) -> Result<()> {
+        let args = berth_kernels::gdn_prefill::GdnPrefillArgs {
+            qkv: scratch.qkv.ptr().as_u64(),
+            z: scratch.z.ptr().as_u64(),
+            b: scratch.b.ptr().as_u64(),
+            a: scratch.a.ptr().as_u64(),
+            dt_bias: self.dt_bias.ptr().as_u64(),
+            a_log: self.a_log.ptr().as_u64(),
+            conv_weight: self.conv_weight.ptr().as_u64(),
+            norm_weight: self.norm_weight.ptr().as_u64(),
+            conv_state: self.conv_state.ptr().as_u64(),
+            recurrent_state: self.recurrent_state.ptr().as_u64(),
+            out: scratch.core.ptr().as_u64(),
+            workspace: scratch.workspace.ptr().as_u64(),
+            workspace_bytes: scratch.workspace.num_bytes(),
+            seqlen: rows,
+            slot: 0,
+            num_slots: 1,
+            history_stride: 1,
+            beta_scale: BETA_SCALE,
+        };
+        // SAFETY: every address is a device allocation sized for this chunk
+        // (the scratch holds `max_rows >= rows`; state is the one-slot layer
+        // buffer). `conv_state` and `recurrent_state` are read and written.
+        // `gpu.stream` is the stream `GdnPrefill::load` was given a context for.
+        unsafe { scratch.kernels.run(&gpu.stream, &args)? };
+        Ok(())
+    }
+}
+
+/// One separate prefill linear, fp32 out. `weight` is null at or under 144 rows.
+#[allow(clippy::too_many_arguments)]
+fn launch_exl3(
+    a: &ByteBuf,
+    proj: &Projection,
+    c: &ByteBuf,
+    a_had: &ByteBuf,
+    weight: *mut c_void,
+    rows: i32,
+    size_k: i32,
+    size_n: i32,
+    stream: *mut c_void,
+) -> Result<()> {
+    // SAFETY: trellis, suh, and svh are the checkpoint uploads. `a_had` is
+    // `max_rows * hidden` fp16. `weight`, when non-null, is `hidden * fdim`
+    // fp16, which covers both projections (`size_n` is `fdim` or `v_dim`).
+    // `c` is fp32 `[rows, size_n]`. The caller's `rows` is at most `max_rows`.
+    unsafe {
+        berth_kernels::prefill_lin::exl3_linear(
+            ptr(a),
+            ptr(&proj.trellis),
+            ptr(c),
+            ptr(&proj.suh),
+            ptr(a_had),
+            ptr(&proj.svh),
+            weight,
+            rows,
+            size_k,
+            size_n,
+            proj.k_bits,
+            Codebook::Mul1,
+            OutDtype::F32,
+            stream,
+        )?;
+    }
+    Ok(())
+}
+
+/// One `N = 48` fp32 hgemm. A non-zero return means f16acc ran; `LinearFP16`
+/// never takes that path, so the result would not match the fork.
+#[allow(clippy::too_many_arguments)]
+fn hgemm_ba(
+    a: &ByteBuf,
+    weight: &ByteBuf,
+    c: &ByteBuf,
+    rows: i32,
+    k: i32,
+    n: i32,
+    stream: *mut c_void,
+    which: &str,
+) -> Result<()> {
+    // SAFETY: `a` is fp16 `[rows, k]`, `weight` is fp16 `[k, n]`, `c` is
+    // fp32 `[rows, n]`. All three stay alive until `stream` finishes.
+    // `berth_kernels::prefill_lin::hgemm` is the fork's `ext.hgemm` choice.
+    // For `N = 48` the f16acc tile does not divide `N`, so it runs
+    // `cublasGemmEx` with `hgemm_gemmex_impl`'s arguments
+    // (`exllamav3_ext/hgemm.cu` 65-75), which is what `LinearFP16` uses.
+    unsafe {
+        berth_kernels::prefill_lin::hgemm(
+            ptr(a),
+            ptr(weight),
+            ptr(c),
+            rows,
+            k,
+            n,
+            n,
+            OutDtype::F32,
+            stream,
+        )?;
+    }
+    let launched = berth_kernels::prefill_lin::last_launch();
+    if launched != "cublasGemmEx" {
+        return Err(Error::Kernel(berth_kernels::Error::Launch(format!(
+            "gdn prefill: in_proj_{which} ran {launched}; LinearFP16 always uses cublasGemmEx"
+        ))));
+    }
+    Ok(())
+}
+
+/// Host copy of the one live GDN slot (`max_batch` 1, `max_history` 0).
+pub(crate) struct GdnStateBytes {
+    pub conv: Vec<u8>,
+    pub recurrent: Vec<u8>,
+    pub fdim: u32,
+    pub conv_k: u32,
+    pub num_v_heads: u32,
+    pub k_head_dim: u32,
+    pub v_head_dim: u32,
+}
+
+impl GdnLayer {
+    /// Copy conv and recurrent state. Both buffers are that one slot.
+    ///
+    /// Conv is bf16 `[fdim, conv_k]`. Recurrent is fp32
+    /// `[num_v_heads, k_head_dim, v_head_dim]` (the reference shape has a
+    /// leading 1, which adds no elements). Decode does not call this.
+    pub(crate) fn copy_state(&self, gpu: &Gpu) -> Result<GdnStateBytes> {
+        let mut conv = vec![0u8; self.conv_state.num_bytes()];
+        self.conv_state.copy_to_host(&gpu.stream, &mut conv)?;
+        let mut recurrent = vec![0u8; self.recurrent_state.num_bytes()];
+        self.recurrent_state
+            .copy_to_host(&gpu.stream, &mut recurrent)?;
+        Ok(GdnStateBytes {
+            conv,
+            recurrent,
+            fdim: u32::try_from(self.dims.fdim).unwrap_or(0),
+            conv_k: u32::try_from(self.dims.conv_k).unwrap_or(0),
+            num_v_heads: u32::try_from(self.dims.num_v_heads).unwrap_or(0),
+            k_head_dim: u32::try_from(self.dims.k_head_dim).unwrap_or(0),
+            v_head_dim: u32::try_from(self.dims.v_head_dim).unwrap_or(0),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn transposes_ba_weight_to_hgemm_layout() {
+        // [2, 3] fp16 rows (1, 2, 3) and (4, 5, 6) become [3, 2] columns.
+        let src = [1u16, 2, 3, 4, 5, 6];
+        let bytes: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let out = super::transpose_fp16(&bytes, 2, 3).unwrap();
+        let got: Vec<u16> = out
+            .chunks_exact(2)
+            .map(|elem| u16::from_le_bytes([elem[0], elem[1]]))
+            .collect();
+        assert_eq!(got, vec![1, 4, 2, 5, 3, 6]);
+    }
 }

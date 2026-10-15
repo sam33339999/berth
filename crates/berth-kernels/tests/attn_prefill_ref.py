@@ -9,14 +9,18 @@ Fork path, bsz 1, cq3, EXL3_QC_STAGING=1:
   paged_attn_triton_prefill  (staging when q_len >= 256, else online dequant)
   ext.mul_sigmoid_
 
-Cases come from testdata/kernels/attn_prefill/meta.json: chunks of 47, 300,
-and 1499 tokens at position 0, then a 300-token chunk at position 1499 over
-the cache the 1499-token chunk wrote. q_norm and k_norm are the layer-3
-checkpoint weights. Other tensors are seeded fp16.
+Cases come from testdata/kernels/attn_prefill/meta.json. They cover every
+unsplit specialization class of `_paged_attn_prefill_kernel` the 27B
+prefill launches: qc and fp16 staging, q_len in {other, div16}, and
+num_pages_per_seq in {eq1, div16, other} wherever that combination fits.
+q_norm and k_norm are the layer-3 checkpoint weights. Other tensors are
+seeded fp16.
 
-Large outputs go to /tmp/berth-attn-prefill (or the directory on argv). They
-are not written under testdata. Exits before touching the GPU if :8889 is
-listening.
+Large outputs go to the directory on argv (the test passes
+CARGO_TARGET_TMPDIR). They are not written under testdata. Exits before
+touching the GPU if :8889 is listening. The first launch of each class must
+JIT a cubin byte-identical to target/triton-cubins; a later launch of the
+same class must not compile another one.
 """
 
 import importlib.util
@@ -175,17 +179,58 @@ def jit_map(fn):
     return found
 
 
-def expect_new_cubin(fn, before: set, filename: str):
+def int_class(value: int) -> str:
+    """Same rule as scripts/build_triton_cubins.py and attn_prefill::int_class."""
+    if value == 1:
+        return "eq1"
+    if value % 16 == 0:
+        return "div16"
+    return "other"
+
+
+def prefill_class_key(q_len: int, pages: int) -> str:
+    """Unsplit full-attention key. kv_append_len is q_len and both windows are -1."""
+    path = "fp16" if q_len >= 256 else "qc"
+    classes = {
+        "ns": int_class(1),
+        "q": int_class(q_len),
+        "kv": int_class(q_len),
+        "p": int_class(pages),
+        "wl": int_class(-1),
+        "wr": int_class(-1),
+    }
+    return (
+        f"_paged_attn_prefill_kernel_{path}"
+        f"_ns-{classes['ns']}_q-{classes['q']}_kv-{classes['kv']}"
+        f"_p-{classes['p']}_wl-{classes['wl']}_wr-{classes['wr']}"
+    )
+
+
+def load_class_cubins() -> dict:
+    manifest = json.loads((CUBIN_DIR / "manifest.json").read_text())
+    found = {}
+    for key in manifest["prefill"]["classes"]:
+        rec = manifest["kernels"][key]
+        found[key] = rec["cubin"]
+    if not found:
+        raise SystemExit(f"{CUBIN_DIR / 'manifest.json'} has no prefill classes")
+    return found
+
+
+def expect_class_cubin(fn, before: set, key: str, filename: str, first: bool):
     after = jit_map(fn)
-    new = [key for key in after if key not in before]
-    if len(new) != 1:
-        raise SystemExit(f"{filename}: expected 1 new prefill cubin, got {len(new)}")
-    blob = after[new[0]].asm["cubin"]
-    if not isinstance(blob, (bytes, bytearray)):
-        blob = bytes(blob)
-    disk = (CUBIN_DIR / filename).read_bytes()
-    if bytes(blob) != disk:
-        raise SystemExit(f"{filename}: JIT cubin bytes differ from {CUBIN_DIR / filename}")
+    new = [item for item in after if item not in before]
+    if first:
+        if len(new) != 1:
+            raise SystemExit(f"{key}: expected 1 new prefill cubin, got {len(new)}")
+        blob = after[new[0]].asm["cubin"]
+        if not isinstance(blob, (bytes, bytearray)):
+            blob = bytes(blob)
+        disk = (CUBIN_DIR / filename).read_bytes()
+        if bytes(blob) != disk:
+            raise SystemExit(f"{filename}: JIT cubin bytes differ from {CUBIN_DIR / filename}")
+    elif new:
+        raise SystemExit(f"{key}: compiled an unexpected prefill cubin")
     return set(after)
 
 
@@ -242,8 +287,8 @@ def run_chunk(torch, ext, paged, out, name, q_len, past_len, pages, bundle, gen,
 
 
 def main() -> None:
-    if len(sys.argv) > 2:
-        raise SystemExit("usage: attn_prefill_ref.py [OUT_DIR]")
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: attn_prefill_ref.py OUT_DIR")
     if port_busy():
         raise SystemExit("port 8889 is listening; not touching the GPU")
     reexec_with_runtime_env()
@@ -255,7 +300,7 @@ def main() -> None:
     spec = json.loads(SPEC.read_text())
     if spec["seed"] != SEED:
         raise SystemExit(f"meta seed {spec['seed']} != {SEED}")
-    out = Path(sys.argv[1] if len(sys.argv) > 1 else "/tmp/berth-attn-prefill")
+    out = Path(sys.argv[1])
     out.mkdir(parents=True, exist_ok=True)
 
     ext = load_ext()
@@ -278,13 +323,21 @@ def main() -> None:
     bundle = (q_norm, k_norm, inv_freq)
 
     fn = paged._paged_attn_prefill_kernel
-    seen = set(jit_map(fn))
+    cubins = load_class_cubins()
+    seen_class = set()
     produced = {}
     for case in spec["cases"]:
         name = case["name"]
         q_len = int(case["q_len"])
         past = int(case["past_len"])
         pages = int(case["pages"])
+        if past + q_len > pages * PAGE:
+            raise SystemExit(f"{name}: past {past} + q_len {q_len} does not fit in {pages} pages")
+        if pages * PAGE + q_len >= 8192:
+            raise SystemExit(f"{name}: bound wants more than one split")
+        key = prefill_class_key(q_len, pages)
+        if key not in cubins:
+            raise SystemExit(f"{name}: no captured cubin for {key}")
         cache = None
         if case.get("cache_in"):
             if name != "q300_at_1499":
@@ -298,14 +351,11 @@ def main() -> None:
         produced[name] = run_chunk(
             torch, ext, paged, out, name, q_len, past, pages, bundle, gen, cache, bool(case.get("cache_in"))
         )
-        if name == "q47":
-            seen = expect_new_cubin(fn, before, "_paged_attn_prefill_kernel_qc.cubin")
-        elif name == "q300":
-            seen = expect_new_cubin(fn, before, "_paged_attn_prefill_kernel_fp16.cubin")
-        else:
-            new = [key for key in jit_map(fn) if key not in seen]
-            if new:
-                raise SystemExit(f"{name} compiled an unexpected prefill cubin")
+        expect_class_cubin(fn, before, key, cubins[key], key not in seen_class)
+        seen_class.add(key)
+    missing = [key for key in cubins if key not in seen_class]
+    if missing:
+        raise SystemExit(f"cases did not launch every captured class: {missing}")
 
     manifest = {
         "seed": SEED,

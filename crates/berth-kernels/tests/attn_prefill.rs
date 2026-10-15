@@ -1,10 +1,11 @@
 //! Bit-exact GPU checks for the full-attention prefill core.
 //!
-//! `tests/attn_prefill_ref.py` writes `/tmp/berth-attn-prefill/`. Each case is
-//! the fork op on seeded fp16 input, with the layer-3 q/k norm weights: a
-//! chunk at position 0 of length 47, 300, and 1499, then a 300-token chunk at
-//! position 1499 over that cache. Outputs and the written cq3 pages are
-//! compared, 0 differing.
+//! `tests/attn_prefill_ref.py` writes under `CARGO_TARGET_TMPDIR`. Each case
+//! is the fork op on seeded fp16 input, with the layer-3 q/k norm weights.
+//! The cases hit every captured specialization class (qc and fp16 staging,
+//! q_len other and divisible by 16, page counts 1, 6, and 16, plus the
+//! longer chunks). Outputs and the written cq3 pages are compared, 0
+//! differing.
 //!
 //! Runs only with `BERTH_GPU_TESTS=1`. Skips when `:8889` is listening.
 
@@ -14,12 +15,12 @@ use std::process::Command;
 use berth_cuda::{Context, DeviceBuffer, Stream};
 use berth_kernels::attn::TRITON_CUBIN_BUILD as DECODE_BUILD;
 use berth_kernels::attn_prefill::{
-    dequant_cache_paged_window, needs_staging, prefill_num_splits, staging_pages, DequantWindow,
-    PagedPrefill, PrefillChunk, SplitShape, HEAD_DIM, KV_HEADS, PAGE_SIZE, Q_HEADS, TOKEN_DIM,
+    dequant_cache_paged_window, needs_staging, prefill_cubin_key, prefill_num_splits,
+    staging_pages, DequantWindow, PagedPrefill, PrefillChunk, SplitShape, HEAD_DIM, KV_HEADS,
+    PAGE_SIZE, Q_HEADS, TOKEN_DIM,
 };
 
 const REF_PY: &str = "/home/sam/qwen38-exl3-dflash2/env/bin/python";
-const OUT_DIR: &str = "/tmp/berth-attn-prefill";
 
 fn workspace() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -272,7 +273,8 @@ fn prefill_matches_fork() {
         return;
     }
     let root = workspace();
-    let out = PathBuf::from(OUT_DIR);
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("attn-prefill");
+    std::fs::create_dir_all(&out).unwrap();
     let status = Command::new(REF_PY)
         .arg(root.join("crates/berth-kernels/tests/attn_prefill_ref.py"))
         .arg(&out)
@@ -306,6 +308,15 @@ fn prefill_matches_fork() {
     nonzero(&read_bin(&out, "q_norm.bin"), "q_norm");
     nonzero(&read_bin(&out, "k_norm.bin"), "k_norm");
 
+    let cubin_manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(cubin_dir().join("manifest.json")).unwrap())
+            .unwrap();
+    let mut captured = std::collections::BTreeSet::new();
+    for key in cubin_manifest["prefill"]["classes"].as_array().unwrap() {
+        captured.insert(key.as_str().unwrap().to_string());
+    }
+    let mut hit = std::collections::BTreeSet::new();
+
     let mut failures = Vec::new();
     for case in manifest["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
@@ -332,6 +343,15 @@ fn prefill_matches_fork() {
         })
         .unwrap();
         assert_eq!(splits, 1, "{name}");
+        hit.insert(prefill_cubin_key(
+            needs_staging(q_len),
+            1,
+            q_len,
+            q_len,
+            pages,
+            -1,
+            -1,
+        ));
         run_case(
             &prefill,
             &stream,
@@ -347,6 +367,10 @@ fn prefill_matches_fork() {
             &mut failures,
         );
     }
+    assert_eq!(
+        hit, captured,
+        "every captured prefill class must be launched"
+    );
     assert!(failures.is_empty(), "{failures:?}");
 }
 

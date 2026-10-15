@@ -1,10 +1,12 @@
 //! Prefill reference against `testdata/prefill_ref/`.
 //!
 //! `chunk_bounds` is checked on the CPU against the fork's recorded chunks.
-//! The GPU test loads the 27B and calls `Model::prefill_prompt`. Until the
-//! kernels land, that returns `prefill not implemented` and the test passes.
-//! A second GPU test runs the 100-token prompt through `decode_step` and
-//! prints the max abs logit difference from the fork's prefill logits.
+//! The GPU test loads the 27B, prefills the stored prompts, and compares
+//! every chunk/block residual digest, the attention cache and GDN state
+//! digests, then the decode step's logits digest and argmax. Until the layer
+//! prefill methods land, that returns "layer prefill not implemented" and the
+//! test passes. A greedy `Engine::generate` of the 100-token prompt must
+//! sample the fork's argmax as its first token, with the same pass-through.
 //!
 //! ```text
 //! BERTH_GPU_TESTS=1 cargo test -p berth-engine --test prefill_ref -- --nocapture
@@ -12,14 +14,20 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use berth_engine::model::Model;
-use berth_engine::prefill::{self, AttnCacheDigest, GdnStateDigest, PrefillOutput, TensorDigest};
-use berth_engine::Gpu;
+use berth_engine::prefill::{
+    self, AttnCacheDigest, AttnCacheImage, BlockDigest, ChunkDigest, GdnStateDigest, GdnStateImage,
+    HostTensor, PrefillOutput, TensorDigest,
+};
+use berth_engine::{Engine, Finish, Flow, GenerateRequest, Gpu, SamplerConfig, Usage};
 use berth_exl3::Checkpoint;
 use berth_plan::{build_plan, from_exl3::model_shape};
+use blake2::digest::consts::U32;
+use blake2::digest::Digest;
+use blake2::Blake2b;
 
 /// One full-model load at a time inside this binary. `flock` covers other
 /// processes; it does not cover two tests of this process.
@@ -126,7 +134,7 @@ fn chunk_bounds_match_the_fork() {
 }
 
 #[test]
-fn prefill_prompt_matches_fork_or_skips() {
+fn prefill_matches_fork_digests() {
     let _guard = GPU_TESTS.lock().unwrap_or_else(|err| err.into_inner());
     let dir = match common::gpu_ready() {
         Ok(dir) => dir,
@@ -134,6 +142,7 @@ fn prefill_prompt_matches_fork_or_skips() {
     };
     let meta = meta();
     let max_tokens = cache_tokens(&meta);
+    let hidden = meta["hidden"].as_u64().unwrap() as usize;
     let _slot = match common::full_model_slot() {
         Ok(slot) => slot,
         Err(why) => return eprintln!("skipping: {why}"),
@@ -147,20 +156,47 @@ fn prefill_prompt_matches_fork_or_skips() {
     for name in ["100", "1500"] {
         let prompt = prompt(&meta, name);
         let ids = token_ids(prompt);
-        match model.prefill_prompt(&gpu, &ids) {
-            Err(err) if err.to_string().contains("prefill not implemented") => {
-                eprintln!("prefill not implemented");
+        eprintln!("prefill {name}");
+        model.reset_sequence(&gpu).unwrap();
+        let prefix = &ids[..ids.len() - 1];
+        let mut records = Vec::new();
+        let mut observe = |layer: u32, start: u32, end: u32, bytes: &[u8]| {
+            records.push((layer, start, end, blake2b_256(bytes)));
+            Ok(())
+        };
+        match model.prefill_with(&gpu, prefix, Some(&mut observe)) {
+            Err(err) if not_implemented(&err) => {
+                eprintln!("layer prefill not implemented");
                 return;
             }
-            Ok(output) => compare_prefill(name, prompt, &output),
             Err(err) => panic!("{name}: {err}"),
+            Ok(()) => {}
         }
-        model.reset_sequence(&gpu).unwrap();
+        let written = u32::try_from(prefix.len()).unwrap();
+        let output = PrefillOutput {
+            chunks: chunks_from(&records, hidden),
+            attn: model
+                .attn_cache(&gpu, written)
+                .unwrap()
+                .into_iter()
+                .map(cache_digest)
+                .collect(),
+            gdn: model
+                .gdn_state(&gpu)
+                .unwrap()
+                .into_iter()
+                .map(gdn_digest)
+                .collect(),
+        };
+        compare_prefill(name, prompt, &output);
+        compare_logits(&gpu, &mut model, name, prompt, &ids);
     }
 }
 
+/// Greedy `Engine::generate` on the 100-token prompt. The first sampled token
+/// is the fork's argmax of the prefill logits.
 #[test]
-fn decode_step_logits_versus_fork_prefill() {
+fn greedy_100_first_token_is_fork_argmax() {
     let _guard = GPU_TESTS.lock().unwrap_or_else(|err| err.into_inner());
     let dir = match common::gpu_ready() {
         Ok(dir) => dir,
@@ -170,40 +206,138 @@ fn decode_step_logits_versus_fork_prefill() {
     let max_tokens = cache_tokens(&meta);
     let prompt = prompt(&meta, "100");
     let ids = token_ids(prompt);
-    assert!(
-        ids.len() <= usize::try_from(max_tokens).unwrap(),
-        "100-token prompt does not fit the cache"
-    );
-    let want = std::fs::read(ref_dir().join(prompt["logits"]["file"].as_str().unwrap()))
-        .unwrap_or_else(|err| panic!("logits_100: {err}"));
-    let fork_argmax = prompt["logits"]["argmax"].as_u64().unwrap() as usize;
-
+    let want = prompt["logits"]["argmax"].as_u64().unwrap() as u32;
     let _slot = match common::full_model_slot() {
         Ok(slot) => slot,
         Err(why) => return eprintln!("skipping: {why}"),
     };
-    let ckpt = Checkpoint::open(&dir).unwrap();
-    let shape = model_shape(&ckpt.config).unwrap();
-    let plan = build_plan(&shape).unwrap();
-    let gpu = Gpu::new().unwrap();
-    let mut model = Model::load(&gpu, &ckpt, &plan, max_tokens).unwrap();
-
-    // 100 steps fit in the 128-deep staging buffer, so one sync at the end
-    // is enough. The logits are the forward of the last prompt token.
-    for (position, &token) in ids.iter().enumerate() {
-        let position = u32::try_from(position).unwrap();
-        model.decode_step(&gpu, token, position).unwrap();
+    let cubin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/triton-cubins");
+    let mut engine = Engine::load(Path::new(&dir), &cubin, max_tokens).unwrap();
+    let request = GenerateRequest {
+        prompt: ids,
+        max_new_tokens: 1,
+        stop_tokens: Vec::new(),
+        sampler: SamplerConfig::greedy(),
+    };
+    let mut first = None;
+    let result = engine.generate(&request, &mut |token| {
+        first = Some(token);
+        Flow::Continue
+    });
+    match result {
+        Err(err) if not_implemented(&err) => {
+            eprintln!("layer prefill not implemented");
+        }
+        Err(err) => panic!("{err}"),
+        Ok((finish, usage)) => {
+            assert_eq!(finish, Finish::Length);
+            assert_eq!(
+                usage,
+                Usage {
+                    prompt_tokens: 100,
+                    completion_tokens: 1,
+                }
+            );
+            assert_eq!(first, Some(want), "greedy first token");
+            eprintln!("greedy first token {want}");
+        }
     }
-    model.synchronize(&gpu).unwrap();
-    let got = common::download(&gpu, model.logits().unwrap());
-    assert!(
-        fp16_finite(&got),
-        "decode_step logits have a non-finite value"
-    );
-    let (max_abs, got_argmax) = max_abs_fp16(&got, &want);
-    eprintln!("max abs logit difference {max_abs}");
-    eprintln!("decode_step argmax {got_argmax}");
-    eprintln!("fork prefill argmax {fork_argmax}");
+}
+
+fn not_implemented(err: &impl std::fmt::Display) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("not implemented")
+}
+
+fn chunks_from(records: &[(u32, u32, u32, String)], hidden: usize) -> Vec<ChunkDigest> {
+    let mut chunks = Vec::new();
+    for (layer, start, end, digest) in records {
+        let new_chunk = chunks
+            .last()
+            .map(|chunk: &ChunkDigest| chunk.start != *start || chunk.end != *end)
+            .unwrap_or(true);
+        if new_chunk {
+            chunks.push(ChunkDigest {
+                start: *start,
+                end: *end,
+                blocks: Vec::new(),
+            });
+        }
+        let rows = usize::try_from(*end - *start).expect("chunk rows fit usize");
+        chunks.last_mut().unwrap().blocks.push(BlockDigest {
+            layer: *layer,
+            dtype: "float32".to_string(),
+            shape: vec![1, rows, hidden],
+            digest: digest.clone(),
+        });
+    }
+    chunks
+}
+
+fn cache_digest(image: AttnCacheImage) -> AttnCacheDigest {
+    AttnCacheDigest {
+        layer: image.layer,
+        qk: tensor_digest(image.qk),
+        qv: tensor_digest(image.qv),
+        sk: tensor_digest(image.sk),
+        sv: tensor_digest(image.sv),
+    }
+}
+
+fn gdn_digest(image: GdnStateImage) -> GdnStateDigest {
+    GdnStateDigest {
+        layer: image.layer,
+        conv: tensor_digest(image.conv),
+        recurrent: tensor_digest(image.recurrent),
+    }
+}
+
+fn tensor_digest(tensor: HostTensor) -> TensorDigest {
+    TensorDigest {
+        dtype: tensor.dtype,
+        shape: tensor.shape,
+        digest: blake2b_256(&tensor.bytes),
+    }
+}
+
+fn compare_logits(
+    gpu: &Gpu,
+    model: &mut Model,
+    name: &str,
+    prompt: &serde_json::Value,
+    ids: &[u32],
+) {
+    let last = *ids.last().unwrap();
+    let position = u32::try_from(ids.len() - 1).unwrap();
+    // The reference job has max_new_tokens 1, so the fork's decode block
+    // table covers prompt_len + 1 tokens, padded to 16 pages.
+    model.set_decode_width(u32::try_from(ids.len()).unwrap() + 1);
+    model.decode_step(gpu, last, position).unwrap();
+    model.synchronize(gpu).unwrap();
+    let got = common::download(gpu, model.logits().unwrap());
+    let file = prompt["logits"]["file"].as_str().unwrap();
+    let want = std::fs::read(ref_dir().join(file)).unwrap_or_else(|err| panic!("{file}: {err}"));
+    let want_digest = prompt["logits"]["digest"].as_str().unwrap();
+    let fork_argmax = prompt["logits"]["argmax"].as_u64().unwrap() as usize;
+    if !fp16_finite(&got) {
+        eprintln!("first difference: {name} logits have a non-finite value");
+        panic!("{name} logits have a non-finite value");
+    }
+    let digest = blake2b_256(&got);
+    if !hex_eq(&digest, want_digest) {
+        let (max_abs, index) = first_fp16_diff(&got, &want);
+        eprintln!(
+            "first difference: {name} logits digest {digest} != {want_digest}, element {index}, max abs {max_abs}"
+        );
+        panic!("{name} logits digest mismatch");
+    }
+    let got_argmax = argmax_fp16(&got);
+    if got_argmax != fork_argmax {
+        eprintln!("first difference: {name} logits argmax {got_argmax} != {fork_argmax}");
+        panic!("{name} logits argmax {got_argmax} != {fork_argmax}");
+    }
+    eprintln!("{name} logits digest matches, argmax {got_argmax}");
 }
 
 fn compare_prefill(name: &str, prompt: &serde_json::Value, output: &PrefillOutput) {
@@ -235,11 +369,13 @@ fn compare_prefill(name: &str, prompt: &serde_json::Value, output: &PrefillOutpu
                 "{name}"
             );
             let want_digest = want_block["digest"].as_str().unwrap();
-            assert!(
-                hex_eq(&block.digest, want_digest),
-                "{name} layer {layer}: {} != {want_digest}",
-                block.digest
-            );
+            if !hex_eq(&block.digest, want_digest) {
+                eprintln!(
+                    "first difference: {name} chunk [{}, {}) layer {layer} residual {} != {want_digest}",
+                    got.start, got.end, block.digest
+                );
+                panic!("{name} layer {layer}: {} != {want_digest}", block.digest);
+            }
         }
     }
     compare_tensors(
@@ -310,11 +446,16 @@ fn expect_tensor(
         "{name} layer {layer} {which}"
     );
     let want_digest = want["digest"].as_str().unwrap();
-    assert!(
-        hex_eq(&got.digest, want_digest),
-        "{name} layer {layer} {which}: {} != {want_digest}",
-        got.digest
-    );
+    if !hex_eq(&got.digest, want_digest) {
+        eprintln!(
+            "first difference: {name} layer {layer} {which} {} != {want_digest}",
+            got.digest
+        );
+        panic!(
+            "{name} layer {layer} {which}: {} != {want_digest}",
+            got.digest
+        );
+    }
 }
 
 fn numel(shape: &[usize]) -> usize {
@@ -362,23 +503,51 @@ fn fp16_to_f32(bits: u16) -> f32 {
     f32::from_bits(bits32)
 }
 
-fn max_abs_fp16(got: &[u8], want: &[u8]) -> (f32, usize) {
-    assert_eq!(got.len(), want.len(), "logit byte length");
-    assert_eq!(got.len() % 2, 0, "fp16 byte length");
-    let mut max_abs = 0f32;
+fn blake2b_256(bytes: &[u8]) -> String {
+    let mut hasher = Blake2b::<U32>::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0xf)]));
+    }
+    out
+}
+
+fn argmax_fp16(bytes: &[u8]) -> usize {
     let mut best = f32::NEG_INFINITY;
-    let mut argmax = 0usize;
-    for (index, (g, w)) in got.chunks(2).zip(want.chunks(2)).enumerate() {
-        let gv = fp16_to_f32(u16::from_le_bytes([g[0], g[1]]));
-        let wv = fp16_to_f32(u16::from_le_bytes([w[0], w[1]]));
+    let mut index = 0usize;
+    for (i, chunk) in bytes.chunks(2).enumerate() {
+        let value = fp16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+        if value > best {
+            best = value;
+            index = i;
+        }
+    }
+    index
+}
+
+fn first_fp16_diff(got: &[u8], want: &[u8]) -> (f32, usize) {
+    let mut max_abs = 0f32;
+    let mut first = 0usize;
+    let mut seen = false;
+    let n = got.len().min(want.len()) / 2;
+    for index in 0..n {
+        let gv = fp16_to_f32(u16::from_le_bytes([got[index * 2], got[index * 2 + 1]]));
+        let wv = fp16_to_f32(u16::from_le_bytes([want[index * 2], want[index * 2 + 1]]));
         let diff = (gv - wv).abs();
         if diff > max_abs {
             max_abs = diff;
         }
-        if gv > best {
-            best = gv;
-            argmax = index;
+        if !seen && got[index * 2..index * 2 + 2] != want[index * 2..index * 2 + 2] {
+            first = index;
+            seen = true;
         }
     }
-    (max_abs, argmax)
+    if got.len() != want.len() && !seen {
+        first = n;
+    }
+    (max_abs, first)
 }

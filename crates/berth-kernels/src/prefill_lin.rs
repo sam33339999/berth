@@ -51,6 +51,18 @@ mod ffi {
             stream: *mut c_void,
         ) -> c_int;
 
+        pub fn berth_prefill_hgemm(
+            a: *const c_void,
+            b: *const c_void,
+            c: *mut c_void,
+            size_m: c_int,
+            size_k: c_int,
+            size_n: c_int,
+            ldc: c_int,
+            c_fp32: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+
         pub fn berth_prefill_last_error() -> *const c_char;
         pub fn berth_prefill_last_launch() -> *const c_char;
     }
@@ -129,6 +141,52 @@ pub unsafe fn exl3_linear(
     let message = last_error();
     let message = if message.is_empty() {
         format!("prefill exl3 linear launch failed ({rc})")
+    } else {
+        message
+    };
+    Err(Error::Launch(message))
+}
+
+/// Plain fp16 GEMM, `C[m, n] = A[m, k] @ B[k, n]`, as the fork's `ext.hgemm`
+/// runs it: its own `f16acc::gemm_kernel` when that covers the shape,
+/// otherwise `cublasGemmEx` (torch's libcublas) with the fork's arguments.
+///
+/// * `a`: fp16 `[size_m, size_k]`, row-major.
+/// * `b`: fp16 `[size_k, size_n]`, row-major (the `x @ W` layout).
+/// * `c`: `[size_m, ldc]` of [`OutDtype`]; columns `0..size_n` are written.
+///
+/// GDN prefill uses this for the b / a projections.
+///
+/// # Errors
+///
+/// Null pointers or a bad shape return [`Error::Launch`] before any launch.
+/// A CUDA or cuBLAS failure is the same error.
+///
+/// # Safety
+///
+/// The pointers must address device memory of the sizes above and stay alive
+/// until `stream` completes.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn hgemm(
+    a: *const c_void,
+    b: *const c_void,
+    c: *mut c_void,
+    size_m: i32,
+    size_k: i32,
+    size_n: i32,
+    ldc: i32,
+    out: OutDtype,
+    stream: *mut c_void,
+) -> Result<()> {
+    let rc = unsafe {
+        ffi::berth_prefill_hgemm(a, b, c, size_m, size_k, size_n, ldc, out.as_c(), stream)
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let message = last_error();
+    let message = if message.is_empty() {
+        format!("prefill hgemm launch failed ({rc})")
     } else {
         message
     };

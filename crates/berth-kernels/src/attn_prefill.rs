@@ -19,13 +19,16 @@
 //! Q, K, and V projections are not in this module. The caller passes the
 //! projection outputs: interleaved `qg`, and `k` / `v` before RoPE.
 //!
-//! The two cubins are the unsplit specializations captured by
-//! `scripts/build_triton_cubins.py` (q_len not divisible by 16, `num_splits`
-//! 1). Triton bakes an integer argument whose value is 1, so both cubins bake
-//! `num_splits` and the online cubin (captured on a 1-page table) also bakes
-//! `num_pages_per_seq`. The staged cubin leaves the page count runtime, which
-//! covers widths 2, 6, and 8. A shape whose split count is not 1 is rejected.
-//! The split combine kernel is not linked.
+//! The cubins are the unsplit specializations captured by
+//! `scripts/build_triton_cubins.py`. Triton specializes every integer runtime
+//! argument of `_paged_attn_prefill_kernel`: value 1 becomes a constexpr,
+//! a multiple of 16 is a distinct cubin (`tt.divisibility = 16`), and any
+//! other value is a plain i32. [`prefill_cubin_key`] is that rule. The
+//! captured product is the qc path and the fp16 staging path over the q_len
+//! and page-count classes this call can take (`kv_append_len` equals
+//! `q_len`, both windows are -1, `num_splits` is 1). A shape whose class was
+//! not captured, including a split count other than 1, is an error. The
+//! split combine kernel is not linked.
 
 use std::ffi::{c_void, CStr};
 use std::path::Path;
@@ -62,8 +65,15 @@ pub const NORM_BIAS: f32 = 1.0;
 /// Ampere's default dynamic shared-memory cap. Above this, load opts in.
 const DEFAULT_DYNAMIC_SMEM: u32 = 48 * 1024;
 
-const ONLINE_KEY: &str = "_paged_attn_prefill_kernel_qc";
-const STAGED_KEY: &str = "_paged_attn_prefill_kernel_fp16";
+/// Integer runtime arguments of `_paged_attn_prefill_kernel`, definition order.
+const SPECIALIZED_INTS: &[&str] = &[
+    "num_splits",
+    "q_len",
+    "kv_append_len",
+    "num_pages_per_seq",
+    "WINDOW_LEFT",
+    "WINDOW_RIGHT",
+];
 
 const PREFILL_PARAMS: &[&str] = &[
     "q",
@@ -89,6 +99,50 @@ const PREFILL_PARAMS: &[&str] = &[
     "global_scratch",
     "profile_scratch",
 ];
+
+/// Triton's specialization class for one integer runtime argument.
+///
+/// `eq1` is a constexpr (the parameter is omitted). `div16` keeps the i32 and
+/// sets `tt.divisibility = 16`. `other` is a plain i32. The `%` is Python's:
+/// a negative multiple of 16 is `div16`, and `-1` is `other`.
+#[must_use]
+pub fn int_class(value: i32) -> &'static str {
+    if value == 1 {
+        "eq1"
+    } else if value.rem_euclid(16) == 0 {
+        "div16"
+    } else {
+        "other"
+    }
+}
+
+/// Manifest key of the cubin this call would JIT.
+///
+/// `staging` is the fp16 path (`q_len >= 256`). The six integers are
+/// `num_splits`, `q_len`, `kv_append_len`, `num_pages_per_seq`,
+/// `WINDOW_LEFT`, and `WINDOW_RIGHT`, in that order, each reduced with
+/// [`int_class`].
+#[must_use]
+pub fn prefill_cubin_key(
+    staging: bool,
+    num_splits: i32,
+    q_len: i32,
+    kv_append_len: i32,
+    num_pages_per_seq: i32,
+    window_left: i32,
+    window_right: i32,
+) -> String {
+    let path = if staging { "fp16" } else { "qc" };
+    format!(
+        "_paged_attn_prefill_kernel_{path}_ns-{}_q-{}_kv-{}_p-{}_wl-{}_wr-{}",
+        int_class(num_splits),
+        int_class(q_len),
+        int_class(kv_append_len),
+        int_class(num_pages_per_seq),
+        int_class(window_left),
+        int_class(window_right),
+    )
+}
 
 /// True when `paged_attn_triton_prefill` dequantizes into an fp16 scratch.
 #[must_use]
@@ -395,14 +449,18 @@ pub unsafe fn dequant_cache_paged_window(args: &DequantWindow, stream: *mut c_vo
     fail(rc, "dequant_cache_paged_window")
 }
 
-/// The online cq3 cubin and the staged fp16 cubin.
+/// Every unsplit prefill cubin the build script captured, keyed by
+/// [`prefill_cubin_key`].
 pub struct PagedPrefill {
-    online: PrefillImage,
-    staged: PrefillImage,
+    images: Vec<PrefillImage>,
     sm_count: i32,
 }
 
 struct PrefillImage {
+    /// [`prefill_cubin_key`] for the class this cubin was captured with.
+    key: String,
+    /// Fp16 staging path (`QCK == 0`). The qc path dequantizes in the kernel.
+    staging: bool,
     function: Function,
     name: String,
     shared: u32,
@@ -428,11 +486,12 @@ enum ParamKind {
 }
 
 impl PagedPrefill {
-    /// Load both prefill cubins from `dir` (`manifest.json` plus the two files).
+    /// Load every prefill class from `dir` (`manifest.json` plus one cubin each).
     ///
     /// # Errors
     ///
-    /// A missing manifest or cubin, a constexpr that is not the 27B tile, a
+    /// A missing manifest or cubin, a class key that does not match the
+    /// recorded specialization, a constexpr that is not the 27B tile, a
     /// parameter list that is not the prefill launch order, or a driver error.
     /// The missing-file error includes [`TRITON_CUBIN_BUILD`].
     pub fn load(ctx: &Context, dir: &Path) -> Result<Self> {
@@ -452,30 +511,56 @@ impl PagedPrefill {
         let kernels = manifest
             .get("kernels")
             .ok_or_else(|| Error::Launch("manifest has no kernels object".into()))?;
-        let online = load_image(ctx, dir, kernels, ONLINE_KEY, 3, 64, "*i32")?;
-        let staged = load_image(ctx, dir, kernels, STAGED_KEY, 0, 32, "*fp16")?;
+        let classes = manifest
+            .get("prefill")
+            .and_then(|prefill| prefill.get("classes"))
+            .and_then(Json::as_array)
+            .ok_or_else(|| Error::Launch("manifest prefill.classes is missing".into()))?;
+        if classes.is_empty() {
+            return Err(Error::Launch("manifest prefill.classes is empty".into()));
+        }
+        let mut images = Vec::with_capacity(classes.len());
+        for item in classes {
+            let key = item.as_str().ok_or_else(|| {
+                Error::Launch("manifest prefill.classes entry is not a string".into())
+            })?;
+            images.push(load_image(ctx, dir, kernels, key)?);
+        }
+        let qc = images.iter().any(|image| !image.staging);
+        let staged = images.iter().any(|image| image.staging);
+        if !qc || !staged {
+            return Err(Error::Launch(
+                "prefill manifest is missing the qc path or the fp16 staging path".into(),
+            ));
+        }
         let sms = ctx.multiprocessor_count().map_err(cuda_err)?;
         let sm_count = i32::try_from(sms)
             .map_err(|_| Error::Launch("multiprocessor count does not fit in i32".into()))?;
         if sm_count < 1 {
             return Err(Error::Launch("multiprocessor count is 0".into()));
         }
-        Ok(Self {
-            online,
-            staged,
-            sm_count,
-        })
+        Ok(Self { images, sm_count })
     }
 
     /// Triton scratch bytes `(global, profile)` for this `q_len`.
     ///
-    /// Both are 0 for the captured 27B cubins. A nonzero value is the buffer
-    /// the launch reads from [`PrefillChunk::global_scratch`] and
-    /// [`PrefillChunk::profile_scratch`].
+    /// The larger of every cubin on that path (qc when `q_len < 256`, fp16
+    /// staging otherwise). Both are 0 for the captured 27B cubins. A nonzero
+    /// value is the buffer the launch reads from
+    /// [`PrefillChunk::global_scratch`] and [`PrefillChunk::profile_scratch`].
     #[must_use]
     pub fn scratch_bytes(&self, q_len: i32) -> (u32, u32) {
-        let image = self.image(q_len);
-        (image.global_scratch, image.profile_scratch)
+        let staging = needs_staging(q_len);
+        let mut global = 0u32;
+        let mut profile = 0u32;
+        for image in &self.images {
+            if image.staging != staging {
+                continue;
+            }
+            global = global.max(image.global_scratch);
+            profile = profile.max(image.profile_scratch);
+        }
+        (global, profile)
     }
 
     /// Run one prefill chunk and write the gated output and the cq3 cache.
@@ -485,8 +570,10 @@ impl PagedPrefill {
     ///
     /// # Errors
     ///
-    /// The chunk does not fit, the shape wants more than one split, the cubin
-    /// would need `WIDE_INDEX`, a required pointer is null, or a launch fails.
+    /// The chunk does not fit, no cubin was captured for this argument class,
+    /// the cubin would need `WIDE_INDEX`, a required pointer is null, or a
+    /// launch fails. The missing-class error names the key from
+    /// [`prefill_cubin_key`].
     ///
     /// # Safety
     ///
@@ -544,28 +631,27 @@ impl PagedPrefill {
             sm_count: self.sm_count,
         };
         let splits = prefill_num_splits(&shape)?;
-        if splits != 1 {
-            return Err(Error::Launch(format!(
-                "prefill cubin is the unsplit specialization (IS_SPLIT=false); this shape wants {splits} splits"
-            )));
-        }
         if wide_index(&shape, splits) {
             return Err(Error::Launch(
                 "prefill cubin is the WIDE_INDEX=false specialization".into(),
             ));
         }
-        let image = self.image(q_len);
+        // kv_append_len is q_len: k is None and the new rows are already in
+        // the cache. Windows stay -1 (full attention, HAS_WINDOW_* false).
+        let image = self.select(q_len, q_len, bt_width, splits, -1, -1)?;
         if let Some(pages) = image.baked_pages {
             if bt_width != pages {
                 return Err(Error::Launch(format!(
-                    "prefill cubin baked num_pages_per_seq={pages}; this block table is {bt_width} wide"
+                    "prefill cubin {} baked num_pages_per_seq={pages}; this block table is {bt_width} wide",
+                    image.key
                 )));
             }
         }
         if let Some(n) = image.baked_splits {
             if splits != n {
                 return Err(Error::Launch(format!(
-                    "prefill cubin baked num_splits={n}; this shape wants {splits} splits"
+                    "prefill cubin {} baked num_splits={n}; this shape wants {splits} splits",
+                    image.key
                 )));
             }
         }
@@ -650,12 +736,37 @@ impl PagedPrefill {
         Ok(())
     }
 
-    fn image(&self, q_len: i32) -> &PrefillImage {
-        if needs_staging(q_len) {
-            &self.staged
-        } else {
-            &self.online
-        }
+    fn select(
+        &self,
+        q_len: i32,
+        kv_append_len: i32,
+        bt_width: i32,
+        splits: i32,
+        window_left: i32,
+        window_right: i32,
+    ) -> Result<&PrefillImage> {
+        let key = prefill_cubin_key(
+            needs_staging(q_len),
+            splits,
+            q_len,
+            kv_append_len,
+            bt_width,
+            window_left,
+            window_right,
+        );
+        self.images
+            .iter()
+            .find(|image| image.key == key)
+            .ok_or_else(|| {
+                Error::Launch(format!(
+                    "prefill cubin {key} is missing \
+                     (q_len={q_len}, kv_append_len={kv_append_len}, \
+                     num_pages_per_seq={bt_width}, num_splits={splits}, \
+                     WINDOW_LEFT={window_left}, WINDOW_RIGHT={window_right}). \
+                     Triton class is eq1 when the value is 1, div16 when it is \
+                     divisible by 16, and other otherwise. Run: {TRITON_CUBIN_BUILD}"
+                ))
+            })
     }
 }
 
@@ -862,15 +973,7 @@ fn slot(param: &Param, runtime: &PrefillRuntime) -> Result<Slot> {
     Ok(item)
 }
 
-fn load_image(
-    ctx: &Context,
-    dir: &Path,
-    kernels: &Json,
-    key: &str,
-    qck: i32,
-    block_n: i32,
-    cache_ty: &str,
-) -> Result<PrefillImage> {
+fn load_image(ctx: &Context, dir: &Path, kernels: &Json, key: &str) -> Result<PrefillImage> {
     let record = kernels
         .get(key)
         .ok_or_else(|| Error::Launch(format!("manifest has no {key}")))?;
@@ -904,8 +1007,26 @@ fn load_image(
     let consts = record
         .get("constexprs")
         .ok_or_else(|| Error::Launch(format!("{key}: constexprs missing")))?;
+    let qck = need_i32(consts, "QCK")?;
+    let (block_n, cache_ty, staging) = match qck {
+        3 => (64, "*i32", false),
+        0 => (32, "*fp16", true),
+        other => {
+            return Err(Error::Launch(format!(
+                "{key}: constexpr QCK is {other}, want 3 (qc) or 0 (fp16 staging)"
+            )))
+        }
+    };
     check_constexprs(consts, key, qck, block_n)?;
+    let spec = specialization(record, key)?;
+    let built = key_from_classes(staging, &spec);
+    if built != key {
+        return Err(Error::Launch(format!(
+            "{key}: specialization does not match the class key ({built})"
+        )));
+    }
     let (params, baked_splits, baked_pages) = param_list(record, key, cache_ty, consts)?;
+    check_spec_against_params(&spec, &params, consts, key)?;
     let path = dir.join(file);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) if !bytes.is_empty() => bytes,
@@ -924,6 +1045,8 @@ fn load_image(
             .map_err(cuda_err)?;
     }
     Ok(PrefillImage {
+        key: key.to_string(),
+        staging,
         function,
         name: symbol.to_string(),
         shared,
@@ -934,6 +1057,84 @@ fn load_image(
         baked_splits,
         baked_pages,
     })
+}
+
+fn key_from_classes(staging: bool, classes: &[(&'static str, String)]) -> String {
+    let path = if staging { "fp16" } else { "qc" };
+    let mut out = format!("_paged_attn_prefill_kernel_{path}");
+    for (tag, name) in [
+        ("ns", "num_splits"),
+        ("q", "q_len"),
+        ("kv", "kv_append_len"),
+        ("p", "num_pages_per_seq"),
+        ("wl", "WINDOW_LEFT"),
+        ("wr", "WINDOW_RIGHT"),
+    ] {
+        let kind = classes
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, kind)| kind.as_str())
+            .unwrap_or("missing");
+        out.push('_');
+        out.push_str(tag);
+        out.push('-');
+        out.push_str(kind);
+    }
+    out
+}
+
+fn specialization(record: &Json, key: &str) -> Result<Vec<(&'static str, String)>> {
+    let obj = record
+        .get("specialization")
+        .ok_or_else(|| Error::Launch(format!("{key}: specialization missing")))?;
+    let mut out = Vec::with_capacity(SPECIALIZED_INTS.len());
+    for name in SPECIALIZED_INTS {
+        let kind = obj
+            .get(name)
+            .and_then(Json::as_str)
+            .ok_or_else(|| Error::Launch(format!("{key}: specialization {name} missing")))?;
+        if !matches!(kind, "eq1" | "div16" | "other") {
+            return Err(Error::Launch(format!(
+                "{key}: specialization {name} is {kind}, want eq1, div16, or other"
+            )));
+        }
+        out.push((*name, kind.to_string()));
+    }
+    Ok(out)
+}
+
+fn check_spec_against_params(
+    spec: &[(&'static str, String)],
+    params: &[Param],
+    consts: &Json,
+    key: &str,
+) -> Result<()> {
+    for (name, kind) in spec {
+        let present = params.iter().any(|param| param.name == *name);
+        let baked = consts.get(name).and_then(Json::as_i64);
+        match kind.as_str() {
+            "eq1" => {
+                if present || baked != Some(1) {
+                    return Err(Error::Launch(format!(
+                        "{key}: {name} is eq1 but present={present} baked={baked:?}"
+                    )));
+                }
+            }
+            "div16" | "other" => {
+                if !present || baked.is_some() {
+                    return Err(Error::Launch(format!(
+                        "{key}: {name} is {kind} but present={present} baked={baked:?}"
+                    )));
+                }
+            }
+            other => {
+                return Err(Error::Launch(format!(
+                    "{key}: specialization {name} is {other}"
+                )))
+            }
+        }
+    }
+    Ok(())
 }
 
 fn scratch_size(record: &Json, key: &str, field: &str) -> Result<u32> {
@@ -1009,9 +1210,9 @@ fn param_list(
     consts: &Json,
 ) -> Result<(Vec<Param>, Option<i32>, Option<i32>)> {
     // Triton drops an integer argument from the launch signature when its value
-    // is 1 and bakes that 1 as a constexpr. num_splits is 1 on both cubins. The
-    // online cubin's 1-page table also drops num_pages_per_seq. Every other
-    // prefill argument has to stay a runtime parameter.
+    // is 1 and bakes that 1 as a constexpr. div16 and other both stay i32
+    // parameters; the cubin file, not the parameter list, tells them apart.
+    // A pointer or scratch argument is never specialized away.
     let list = record
         .get("parameters")
         .and_then(Json::as_array)
@@ -1027,30 +1228,21 @@ fn param_list(
             .and_then(Json::as_str)
             == Some(*expected);
         if !matches_next {
+            if !SPECIALIZED_INTS.contains(expected) {
+                return Err(Error::Launch(format!(
+                    "{key}: manifest is missing parameter {expected}"
+                )));
+            }
+            let v = need_i32(consts, expected)?;
+            if v != 1 {
+                return Err(Error::Launch(format!(
+                    "{key}: baked {expected} is {v}; Triton only specializes the value 1 to a constexpr"
+                )));
+            }
             match *expected {
-                "num_splits" => {
-                    let v = need_i32(consts, "num_splits")?;
-                    if v != 1 {
-                        return Err(Error::Launch(format!(
-                            "{key}: baked num_splits is {v}, the unsplit cubin bakes 1"
-                        )));
-                    }
-                    baked_splits = Some(v);
-                }
-                "num_pages_per_seq" => {
-                    let v = need_i32(consts, "num_pages_per_seq")?;
-                    if v < 1 {
-                        return Err(Error::Launch(format!(
-                            "{key}: baked num_pages_per_seq is {v}"
-                        )));
-                    }
-                    baked_pages = Some(v);
-                }
-                other => {
-                    return Err(Error::Launch(format!(
-                        "{key}: manifest is missing parameter {other}"
-                    )));
-                }
+                "num_splits" => baked_splits = Some(v),
+                "num_pages_per_seq" => baked_pages = Some(v),
+                _ => {}
             }
             continue;
         }
@@ -1443,6 +1635,44 @@ mod tests {
             hd_pad: HEAD_DIM,
             sm_count,
         }
+    }
+
+    #[test]
+    fn integer_class_matches_triton() {
+        assert_eq!(int_class(1), "eq1");
+        assert_eq!(int_class(0), "div16");
+        assert_eq!(int_class(16), "div16");
+        assert_eq!(int_class(-16), "div16");
+        assert_eq!(int_class(256), "div16");
+        assert_eq!(int_class(1280), "div16");
+        assert_eq!(int_class(240), "div16");
+        assert_eq!(int_class(-1), "other");
+        assert_eq!(int_class(6), "other");
+        assert_eq!(int_class(47), "other");
+        assert_eq!(int_class(219), "other");
+        assert_eq!(int_class(300), "other");
+        assert_eq!(int_class(5), "other");
+        // The three layer-test launches, plus a 16-page table.
+        assert_eq!(
+            prefill_cubin_key(false, 1, 99, 99, 1, -1, -1),
+            "_paged_attn_prefill_kernel_qc_ns-eq1_q-other_kv-other_p-eq1_wl-other_wr-other"
+        );
+        assert_eq!(
+            prefill_cubin_key(false, 1, 219, 219, 6, -1, -1),
+            "_paged_attn_prefill_kernel_qc_ns-eq1_q-other_kv-other_p-other_wl-other_wr-other"
+        );
+        assert_eq!(
+            prefill_cubin_key(true, 1, 1280, 1280, 5, -1, -1),
+            "_paged_attn_prefill_kernel_fp16_ns-eq1_q-div16_kv-div16_p-other_wl-other_wr-other"
+        );
+        assert_eq!(
+            prefill_cubin_key(false, 1, 47, 47, 16, -1, -1),
+            "_paged_attn_prefill_kernel_qc_ns-eq1_q-other_kv-other_p-div16_wl-other_wr-other"
+        );
+        assert_eq!(
+            prefill_cubin_key(true, 1, 256, 256, 1, -1, -1),
+            "_paged_attn_prefill_kernel_fp16_ns-eq1_q-div16_kv-div16_p-eq1_wl-other_wr-other"
+        );
     }
 
     #[test]

@@ -170,3 +170,100 @@ pub fn find_linear<'a>(ckpt: &'a Checkpoint, prefix: &str) -> Result<&'a LinearE
         .find(|linear| linear.prefix == prefix)
         .ok_or_else(|| Error::Weights(format!("{prefix} is not an EXL3 linear")))
 }
+
+/// Scratch for [`Exl3Linear::forward_rows`], shared by every linear of a
+/// prefill chunk: the fp16 Hadamard image of the input, and the fp16 weight
+/// the `rows > 144` path reconstructs into (rebuilt on every call; the fork
+/// does not cache it).
+pub struct RowScratch {
+    a_had: ByteBuf,
+    weight: ByteBuf,
+    max_rows: u32,
+    max_k: u32,
+    max_n: u32,
+}
+
+/// `prefill_lin` reconstructs at most this many output features at a time
+/// (`MAX_RECONSTRUCT_SLICE_N`).
+const MAX_RECONSTRUCT_N: u32 = 32768;
+
+impl RowScratch {
+    /// Room for up to `max_rows` rows of any linear with at most `max_k`
+    /// in-features and `max_n` out-features.
+    pub fn new(gpu: &Gpu, max_rows: u32, max_k: u32, max_n: u32) -> Result<Self> {
+        let rows_k = max_rows as usize * max_k as usize;
+        let k_n = max_k as usize * max_n.min(MAX_RECONSTRUCT_N) as usize;
+        Ok(Self {
+            a_had: gpu.zeroed(rows_k * 2)?,
+            weight: gpu.zeroed(k_n * 2)?,
+            max_rows,
+            max_k,
+            max_n,
+        })
+    }
+}
+
+impl Exl3Linear {
+    /// `c = a @ W` for `rows > 1` rows, the fork's prefill paths (cooperative
+    /// GEMM up to 144 rows, reconstruct + GEMM above). `a` is fp16
+    /// `[rows, size_k]`; `c` is `[rows, size_n]` of `out`.
+    pub fn forward_rows(
+        &self,
+        gpu: &Gpu,
+        scratch: &mut RowScratch,
+        a: &ByteBuf,
+        c: &mut ByteBuf,
+        rows: u32,
+        out: OutDtype,
+    ) -> Result<()> {
+        let out_bytes = match out {
+            OutDtype::F16 => 2,
+            OutDtype::F32 => 4,
+        };
+        if rows < 2 {
+            return Err(Error::Input(format!(
+                "{}: forward_rows needs rows > 1",
+                self.prefix
+            )));
+        }
+        if rows > scratch.max_rows
+            || self.size_k as u32 > scratch.max_k
+            || self.size_n as u32 > scratch.max_n
+        {
+            return Err(Error::Input(format!(
+                "{}: {rows} x {} x {} exceeds the row scratch",
+                self.prefix, self.size_k, self.size_n
+            )));
+        }
+        let (rows_u, k, n) = (rows as usize, self.size_k as usize, self.size_n as usize);
+        if a.num_bytes() < rows_u * k * 2 || c.num_bytes() < rows_u * n * out_bytes {
+            return Err(Error::Input(format!("{}: buffer too small", self.prefix)));
+        }
+        let weight = if rows > 144 {
+            ptr(&scratch.weight)
+        } else {
+            std::ptr::null_mut()
+        };
+        // SAFETY: every buffer is a live device allocation sized for this
+        // shape (checked above), all on `gpu.stream`.
+        unsafe {
+            berth_kernels::prefill_lin::exl3_linear(
+                ptr(a),
+                ptr(&self.trellis),
+                ptr(c),
+                ptr(&self.suh),
+                ptr(&scratch.a_had),
+                ptr(&self.svh),
+                weight,
+                rows as i32,
+                self.size_k,
+                self.size_n,
+                self.k_bits,
+                self.codebook,
+                out,
+                gpu.raw_stream(),
+            )?;
+        }
+        Ok(())
+    }
+}

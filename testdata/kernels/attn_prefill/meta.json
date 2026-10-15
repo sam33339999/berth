@@ -3,10 +3,20 @@
   "layer": 3,
   "q_norm": "model.language_model.layers.3.self_attn.q_norm.weight",
   "k_norm": "model.language_model.layers.3.self_attn.k_norm.weight",
-  "note": "Reference tensors are regenerated from this seed into /tmp/berth-attn-prefill. They are larger than 4 MB, so they are not stored here.",
+  "note": "Reference tensors are regenerated from this seed into CARGO_TARGET_TMPDIR. They are larger than 4 MB, so they are not stored here. Each case names a Triton integer class of _paged_attn_prefill_kernel: eq1 (value 1), div16 (divisible by 16), or other.",
   "cases": [
     {"name": "q47", "q_len": 47, "past_len": 0, "pages": 1},
+    {"name": "qc_p6", "q_len": 219, "past_len": 1280, "pages": 6},
+    {"name": "qc_p16", "q_len": 219, "past_len": 3840, "pages": 16},
+    {"name": "qc_q240_p1", "q_len": 240, "past_len": 0, "pages": 1},
+    {"name": "qc_q240_p6", "q_len": 240, "past_len": 1280, "pages": 6},
+    {"name": "qc_q240_p16", "q_len": 240, "past_len": 3840, "pages": 16},
+    {"name": "q256_p1", "q_len": 256, "past_len": 0, "pages": 1},
     {"name": "q300", "q_len": 300, "past_len": 0, "pages": 2},
+    {"name": "q300_p6", "q_len": 300, "past_len": 1024, "pages": 6},
+    {"name": "q300_p16", "q_len": 300, "past_len": 3600, "pages": 16},
+    {"name": "q1280_p6", "q_len": 1280, "past_len": 256, "pages": 6},
+    {"name": "q1280_p16", "q_len": 1280, "past_len": 2816, "pages": 16},
     {"name": "q1499", "q_len": 1499, "past_len": 0, "pages": 6},
     {"name": "q300_at_1499", "q_len": 300, "past_len": 1499, "pages": 8, "cache_in": true}
   ]

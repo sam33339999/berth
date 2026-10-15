@@ -103,21 +103,22 @@ fn main() {
         .filter(|path| path.is_dir())
         .unwrap_or_else(|| PathBuf::from("/usr/local/cuda-13.3/lib64"));
 
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=berth_exl3_kernels");
-    println!("cargo:rustc-link-search=native={}", cuda_lib.display());
-    println!("cargo:rustc-link-lib=dylib=cudart");
-    println!("cargo:rustc-link-lib=dylib=stdc++");
-
     // Prefill LIN. hgemm.cu's cublasGemmEx must be torch's libcublas, the
     // copy the serve loads (nvidia/cu13/lib/libcublas.so.13 via
     // reuse-torch.pth). The CUDA 13.3 toolkit also ships libcublas.so.13, and
     // a RUNPATH that lists that directory first binds the toolkit copy.
-    // OUT_DIR/cublas-torch holds symlinks of only the two torch sonames
-    // (libcublas.so.13 and libcublasLt.so.13). It is the first RUNPATH entry,
-    // so those resolve to torch. libcudart.so.13 is not in that directory, so
-    // it still comes from the toolkit entry that follows. libcublas's own
-    // RUNPATH is $ORIGIN; the Lt symlink sits beside the cublas symlink.
+    // The two are different releases (torch ships 13.1, the toolkit 13.6),
+    // so binding the toolkit copy would change the numbers.
+    //
+    // `<target>/cublas-torch` holds symlinks to torch's libcublas and
+    // libcublasLt only: `libcublas.so` for `-lcublas` at link time (searched
+    // before the toolkit's lib64, which has its own `libcublas.so`), and the
+    // `.so.13` sonames for run time. Every binary that links berth-kernels
+    // finds that directory through the `$ORIGIN` rpaths in
+    // `.cargo/config.toml` (`cargo:rustc-link-arg` would reach only this
+    // crate's own tests). libcudart.so.13 is not in it, so cudart still
+    // comes from the 13.3 toolkit. libcublas's own RUNPATH is `$ORIGIN`;
+    // the Lt symlink sits beside the cublas symlink.
     let cublas = torch_cublas();
     let cublas_dir = cublas.parent().unwrap_or_else(|| {
         panic!("berth-kernels: {} has no parent", cublas.display());
@@ -129,10 +130,16 @@ fn main() {
             cublas_lt.display()
         );
     }
-    let pin = out_dir.join("cublas-torch");
+    // OUT_DIR is <target>/<profile>/build/<pkg>-<hash>/out.
+    let target_dir = out_dir
+        .ancestors()
+        .nth(4)
+        .unwrap_or_else(|| panic!("berth-kernels: unexpected OUT_DIR {}", out_dir.display()));
+    let pin = target_dir.join("cublas-torch");
     std::fs::create_dir_all(&pin)
         .unwrap_or_else(|err| panic!("berth-kernels: cannot create {}: {err}", pin.display()));
     for (name, target) in [
+        ("libcublas.so", &cublas),
         ("libcublas.so.13", &cublas),
         ("libcublasLt.so.13", &cublas_lt),
     ] {
@@ -146,9 +153,14 @@ fn main() {
             panic!("berth-kernels: cannot symlink {}: {err}", link.display())
         });
     }
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", pin.display());
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", cuda_lib.display());
-    println!("cargo:rustc-link-arg={}", cublas.display());
+    println!("cargo:rustc-link-search=native={}", pin.display());
+    println!("cargo:rustc-link-lib=dylib=cublas");
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=berth_exl3_kernels");
+    println!("cargo:rustc-link-search=native={}", cuda_lib.display());
+    println!("cargo:rustc-link-lib=dylib=cudart");
+    println!("cargo:rustc-link-lib=dylib=stdc++");
 }
 
 /// `libcublas.so.13` from the torch the serve imports.

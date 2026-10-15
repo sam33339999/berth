@@ -40,10 +40,11 @@ use berth_kernels::ops::{self, NormWeight};
 use berth_kernels::OutDtype;
 use berth_plan::{Ffn, LayerKind, Mixer, ModelPlan, ModelShape, ARCH_QWEN3_5};
 
-use crate::attn::AttnLayer;
-use crate::device::{self, ptr, Exl3Linear};
-use crate::gdn::GdnLayer;
-use crate::mlp::MlpLayer;
+use crate::attn::{AttnLayer, AttnPrefillScratch};
+use crate::device::{self, ptr, Exl3Linear, RowScratch};
+use crate::gdn::{GdnLayer, GdnPrefillScratch};
+use crate::mlp::{MlpLayer, MlpPrefillScratch};
+use crate::prefill::{self, AttnCacheImage, GdnStateImage, HostTensor};
 use crate::{Error, Gpu, Result};
 
 /// Tensor prefix of every Qwen3.5 text module.
@@ -151,6 +152,37 @@ pub struct Model {
     ///
     /// The bytes are not ready to read until the stream is synchronized.
     captured: bool,
+    /// Chunk scratch for [`Self::prefill`], or absent while a layer prefill
+    /// scratch is still the unimplemented stub.
+    ///
+    /// Allocated once for [`prefill::MAX_CHUNK_SIZE`] rows and shared by every
+    /// layer. Decode keeps its own one-row buffers: enlarging those would
+    /// break the equal-length residual snapshot copy.
+    prefill_ws: Option<PrefillWorkspace>,
+}
+
+/// Device buffers for one prefill chunk, shared across layers.
+///
+/// `residual` is fp32 `[max_rows, hidden]`. The norm outputs are fp16, the
+/// mixer and MLP outputs are fp32. `ids` is `max_rows` i32 token ids; a chunk
+/// occupies the prefix. `seq_start` and `seq_end` are the shared cache-length
+/// word for the chunk. `residual_host` is only filled when a caller asks for
+/// the per-block residual.
+struct PrefillWorkspace {
+    rows_scratch: RowScratch,
+    gdn: GdnPrefillScratch,
+    attn: AttnPrefillScratch,
+    mlp: MlpPrefillScratch,
+    residual: ByteBuf,
+    norm_out: ByteBuf,
+    mixer_out: ByteBuf,
+    mlp_in: ByteBuf,
+    mlp_out: ByteBuf,
+    ids: ByteBuf,
+    seq_start: PinnedBuf<u8>,
+    seq_end: PinnedBuf<u8>,
+    residual_host: Vec<u8>,
+    max_rows: u32,
 }
 
 /// How many decode steps may be queued before [`Model::synchronize`].
@@ -341,6 +373,16 @@ impl Model {
                 layer.bind_sequence(seq_addr, seq_addr);
             }
         }
+        // Layer scratches first. A "not implemented" stub returns before
+        // `RowScratch` and the chunk activations, which are the large buffers.
+        // One failing scratch drops any scratch that did allocate.
+        let prefill_ws = prefill_workspace(
+            gpu,
+            &shape,
+            max_tokens,
+            cubin_dir,
+            ckpt.config.intermediate_size,
+        )?;
         Ok(Self {
             hidden,
             vocab,
@@ -360,6 +402,7 @@ impl Model {
             logits: gpu.zeroed(row_bytes(vocab, 2)?)?,
             block_residuals,
             captured: false,
+            prefill_ws,
         })
     }
 
@@ -464,6 +507,17 @@ impl Model {
     ///
     /// Finishes any queued kernels first. After this returns, [`Self::logits`]
     /// is not readable until the next [`Self::decode_step`].
+    /// Size every attention layer's decode block table for a request of
+    /// `max_seq_len` tokens (prompt plus `max_new_tokens`), as the fork's
+    /// `iterate_gen` does. The split count, and so the logits bits, follow it.
+    pub fn set_decode_width(&mut self, max_seq_len: u32) {
+        for block in &mut self.blocks {
+            if let MixerSlot::FullAttn(attn) = &mut block.mixer {
+                attn.set_decode_width(max_seq_len);
+            }
+        }
+    }
+
     pub fn reset_sequence(&mut self, gpu: &Gpu) -> Result<()> {
         self.synchronize(gpu)?;
         self.captured = false;
@@ -573,19 +627,37 @@ impl Model {
         hidden: i32,
         norm: TextNorm,
     ) -> Result<()> {
+        Self::norm_rows(gpu, x, weight, y, hidden, 1, norm)
+    }
+
+    /// [`Self::norm_fp32_to_fp16`] for `rows` independent rows.
+    ///
+    /// `x` is fp32 `[rows, hidden]`, `y` is fp16 `[rows, hidden]`, and
+    /// `weight` is one bf16 row. One CUDA block per row, the same kernel
+    /// decode uses.
+    pub fn norm_rows(
+        gpu: &Gpu,
+        x: &ByteBuf,
+        weight: &ByteBuf,
+        y: &mut ByteBuf,
+        hidden: i32,
+        rows: u32,
+        norm: TextNorm,
+    ) -> Result<()> {
         let hidden = checked_hidden(hidden)?;
-        expect_row(x, hidden, 4, "norm input")?;
+        let rows_i = positive_rows(rows)?;
+        expect_bytes(x, rows_bytes(hidden, rows, 4)?, "norm input")?;
         expect_row(weight, hidden, 2, "norm weight")?;
-        expect_row(y, hidden, 2, "norm output")?;
-        // SAFETY: `x` is fp32, `weight` is bf16, and `y` is fp16, one row of
-        // `hidden` each. They stay allocated until `gpu.stream` finishes.
-        // Callers synchronize before reading `y`.
+        expect_bytes(y, rows_bytes(hidden, rows, 2)?, "norm output")?;
+        // SAFETY: `x` is fp32, `weight` is bf16, and `y` is fp16, `rows` rows
+        // of `hidden` (the weight is one row). They stay allocated until
+        // `gpu.stream` finishes. Callers synchronize before reading `y`.
         unsafe {
             ops::rms_norm(
                 ptr(x),
                 ptr(weight),
                 ptr(y),
-                1,
+                rows_i,
                 hidden,
                 norm.epsilon,
                 norm.constant_bias,
@@ -612,22 +684,42 @@ impl Model {
         hidden: i32,
         norm: TextNorm,
     ) -> Result<()> {
+        Self::norm_residual_rows(gpu, mixer, weight, mlp_in, residual, hidden, 1, norm)
+    }
+
+    /// [`Self::norm_residual`] for `rows` rows.
+    ///
+    /// `mixer` and `residual` are fp32 `[rows, hidden]`. `residual` becomes
+    /// `residual + mixer`. `mlp_in` is the fp16 norm of that sum.
+    /// `weight` is one bf16 row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn norm_residual_rows(
+        gpu: &Gpu,
+        mixer: &ByteBuf,
+        weight: &ByteBuf,
+        mlp_in: &mut ByteBuf,
+        residual: &mut ByteBuf,
+        hidden: i32,
+        rows: u32,
+        norm: TextNorm,
+    ) -> Result<()> {
         let hidden = checked_hidden(hidden)?;
-        expect_row(mixer, hidden, 4, "mixer output")?;
+        let rows_i = positive_rows(rows)?;
+        expect_bytes(mixer, rows_bytes(hidden, rows, 4)?, "mixer output")?;
         expect_row(weight, hidden, 2, "post-attention norm weight")?;
-        expect_row(mlp_in, hidden, 2, "mlp input")?;
-        expect_row(residual, hidden, 4, "residual")?;
+        expect_bytes(mlp_in, rows_bytes(hidden, rows, 2)?, "mlp input")?;
+        expect_bytes(residual, rows_bytes(hidden, rows, 4)?, "residual")?;
         // SAFETY: `mixer` and `residual` are fp32, `weight` is bf16, and
-        // `mlp_in` is fp16, one row of `hidden` each. `residual` is
-        // overwritten with `residual + mixer`. All four stay allocated
-        // until `gpu.stream` finishes.
+        // `mlp_in` is fp16, `rows` rows of `hidden` (the weight is one row).
+        // `residual` is overwritten with `residual + mixer`. All four stay
+        // allocated until `gpu.stream` finishes.
         unsafe {
             ops::rms_norm_res_in(
                 ptr(mixer),
                 ptr(weight),
                 ptr(mlp_in),
                 ptr(residual),
-                1,
+                rows_i,
                 hidden,
                 norm.epsilon,
                 norm.constant_bias,
@@ -648,17 +740,32 @@ impl Model {
         mlp: &ByteBuf,
         hidden: i32,
     ) -> Result<()> {
-        let hidden = checked_hidden(hidden)?;
-        expect_row(residual, hidden, 4, "residual")?;
-        expect_row(mlp, hidden, 4, "mlp output")?;
+        Self::add_residual_rows(gpu, residual, mlp, hidden, 1)
+    }
+
+    /// `x += m` in fp32 over `rows * hidden` elements.
+    ///
+    /// Prefill's `TransformerBlock` does this on the whole chunk
+    /// (`modules/transformer.py`, `x += y`). `mlp` is fp32 `[rows, hidden]`.
+    /// `residual` is both an addend and the destination.
+    pub fn add_residual_rows(
+        gpu: &Gpu,
+        residual: &mut ByteBuf,
+        mlp: &ByteBuf,
+        hidden: i32,
+        rows: u32,
+    ) -> Result<()> {
+        let n = f32_count(rows, hidden)?;
+        expect_bytes(residual, rows_bytes(hidden, rows, 4)?, "residual")?;
+        expect_bytes(mlp, rows_bytes(hidden, rows, 4)?, "mlp output")?;
         let stream = gpu.raw_stream();
         let a = ptr(residual);
         let b = ptr(mlp);
-        // SAFETY: both buffers are fp32 of `hidden` elements. The kernel
-        // allows the destination to alias the first addend. They stay
-        // allocated until `gpu.stream` finishes.
+        // SAFETY: both buffers are fp32 of `n` elements. The kernel allows
+        // the destination to alias the first addend. They stay allocated
+        // until `gpu.stream` finishes.
         unsafe {
-            ops::add_f32(a, b, a, hidden, stream)?;
+            ops::add_f32(a, b, a, n, stream)?;
         }
         Ok(())
     }
@@ -1042,6 +1149,676 @@ fn expect_bytes(buf: &ByteBuf, bytes: usize, what: &str) -> Result<()> {
     Ok(())
 }
 
+fn rows_bytes(hidden: i32, rows: u32, elem: usize) -> Result<usize> {
+    row_bytes(hidden, elem)?
+        .checked_mul(usize::try_from(rows).unwrap_or(usize::MAX))
+        .ok_or_else(|| Error::Input("row byte count overflows".into()))
+}
+
+fn positive_rows(rows: u32) -> Result<i32> {
+    let rows =
+        i32::try_from(rows).map_err(|_| Error::Input("prefill rows do not fit in i32".into()))?;
+    if rows < 1 {
+        return Err(Error::Input("prefill rows must be positive".into()));
+    }
+    Ok(rows)
+}
+
+fn f32_count(rows: u32, hidden: i32) -> Result<i32> {
+    let rows = positive_rows(rows)?;
+    let hidden = checked_hidden(hidden)?;
+    let n = i64::from(rows) * i64::from(hidden);
+    i32::try_from(n).map_err(|_| Error::Input("prefill element count overflows i32".into()))
+}
+
+fn prefill_unimplemented(err: &Error) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("not implemented")
+}
+
+/// Build the shared chunk scratch, or `None` when a layer scratch is still
+/// the unimplemented stub.
+///
+/// Constructors run GDN, then attention, then MLP, and only then
+/// [`RowScratch`]. A stub error drops whatever the earlier constructors
+/// allocated and leaves decode's load unchanged.
+fn prefill_workspace(
+    gpu: &Gpu,
+    shape: &ModelShape,
+    max_tokens: u32,
+    cubin_dir: &Path,
+    intermediate: Option<u32>,
+) -> Result<Option<PrefillWorkspace>> {
+    let max_rows = prefill::MAX_CHUNK_SIZE;
+    let gdn = match GdnPrefillScratch::new(gpu, shape, max_rows) {
+        Ok(scratch) => scratch,
+        Err(err) if prefill_unimplemented(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let attn = match AttnPrefillScratch::new(gpu, shape, max_rows, max_tokens, cubin_dir) {
+        Ok(scratch) => scratch,
+        Err(err) if prefill_unimplemented(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let Some(intermediate) = intermediate else {
+        return Err(Error::Weights(
+            "config.json has no intermediate_size; the MLP prefill scratch needs it".into(),
+        ));
+    };
+    let mlp = match MlpPrefillScratch::new(gpu, shape.hidden_size, intermediate, max_rows) {
+        Ok(scratch) => scratch,
+        Err(err) if prefill_unimplemented(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let (max_k, max_n) = prefill_linear_limits(shape, intermediate)?;
+    let hidden = i32_width(shape.hidden_size, "hidden_size")?;
+    let f32_bytes = rows_bytes(hidden, max_rows, 4)?;
+    let f16_bytes = rows_bytes(hidden, max_rows, 2)?;
+    Ok(Some(PrefillWorkspace {
+        rows_scratch: RowScratch::new(gpu, max_rows, max_k, max_n)?,
+        gdn,
+        attn,
+        mlp,
+        residual: gpu.zeroed(f32_bytes)?,
+        norm_out: gpu.zeroed(f16_bytes)?,
+        mixer_out: gpu.zeroed(f32_bytes)?,
+        mlp_in: gpu.zeroed(f16_bytes)?,
+        mlp_out: gpu.zeroed(f32_bytes)?,
+        ids: gpu.zeroed(
+            usize::try_from(max_rows)
+                .expect("max chunk rows fit usize")
+                .saturating_mul(4),
+        )?,
+        seq_start: PinnedBuf::zeroed(&gpu.ctx, 4)?,
+        seq_end: PinnedBuf::zeroed(&gpu.ctx, 4)?,
+        residual_host: Vec::new(),
+        max_rows,
+    }))
+}
+
+/// Largest prefill linear, excluding `lm_head` (that GEMM is the decode step).
+///
+/// `max_k` covers MLP down and attention `o_proj`. `max_n` covers MLP gate/up,
+/// attention `q_proj` with the interleaved gate, and GDN `in_proj_qkv`.
+fn prefill_linear_limits(shape: &ModelShape, intermediate: u32) -> Result<(u32, u32)> {
+    let hidden = shape.hidden_size;
+    let q = checked_mul(shape.num_q_heads, shape.head_dim, "q features")?;
+    let q_gate = checked_mul(q, 2, "q features with the gate")?;
+    let g = &shape.gdn;
+    let k_part = checked_mul(
+        checked_mul(g.num_k_heads, g.key_head_dim, "gdn k width")?,
+        2,
+        "gdn k width",
+    )?;
+    let v_dim = checked_mul(g.num_v_heads, g.value_head_dim, "gdn v width")?;
+    let fdim = k_part
+        .checked_add(v_dim)
+        .ok_or_else(|| Error::Weights("gdn fdim overflows".into()))?;
+    let max_k = hidden.max(intermediate).max(q).max(v_dim);
+    let max_n = hidden.max(intermediate).max(q_gate).max(fdim).max(v_dim);
+    Ok((max_k, max_n))
+}
+
+fn checked_mul(a: u32, b: u32, what: &str) -> Result<u32> {
+    a.checked_mul(b)
+        .ok_or_else(|| Error::Weights(format!("{what} overflows")))
+}
+
+/// Used rows of a paged cache, in block-table order.
+///
+/// Page `p` is physical `table[p]`. Only `min(page, tokens_left)` rows are
+/// copied, so the tail of a partial page is left out. `row_bytes` is one
+/// token's stride inside a page.
+fn gather_used_rows(
+    raw: &[u8],
+    table: &[i32],
+    tokens: u32,
+    page: usize,
+    row_bytes: usize,
+) -> Result<Vec<u8>> {
+    if page == 0 || row_bytes == 0 {
+        return Err(Error::Input("cache page geometry is empty".into()));
+    }
+    let mut out = Vec::new();
+    let mut left = usize::try_from(tokens).unwrap_or(usize::MAX);
+    let mut logical = 0usize;
+    while left > 0 {
+        let n = left.min(page);
+        let phys = table.get(logical).copied().ok_or_else(|| {
+            Error::Input(format!(
+                "block table has {} pages, cache page {logical} is needed",
+                table.len()
+            ))
+        })?;
+        if phys < 0 {
+            return Err(Error::Input(format!(
+                "block table page {logical} is {phys}"
+            )));
+        }
+        let phys = usize::try_from(phys).expect("phys was non-negative");
+        let off = phys
+            .checked_mul(page)
+            .and_then(|rows| rows.checked_mul(row_bytes))
+            .ok_or_else(|| Error::Input("cache offset overflows".into()))?;
+        let len = n
+            .checked_mul(row_bytes)
+            .ok_or_else(|| Error::Input("cache row span overflows".into()))?;
+        let end = off
+            .checked_add(len)
+            .ok_or_else(|| Error::Input("cache offset overflows".into()))?;
+        if end > raw.len() {
+            return Err(Error::Input(format!(
+                "cache page {phys} needs {end} bytes, the allocation has {}",
+                raw.len()
+            )));
+        }
+        out.extend_from_slice(&raw[off..end]);
+        left -= n;
+        logical += 1;
+    }
+    Ok(out)
+}
+
+fn write_seq(slot: &mut PinnedBuf<u8>, value: u32) -> Result<()> {
+    let seq = i32::try_from(value)
+        .map_err(|_| Error::Input(format!("position {value} does not fit in i32")))?;
+    let dst = slot.as_mut_slice();
+    if dst.len() != 4 {
+        return Err(Error::Input("sequence slot is not 4 bytes".into()));
+    }
+    dst.copy_from_slice(&seq.to_le_bytes());
+    Ok(())
+}
+
+fn stage_chunk_ids(gpu: &Gpu, ids_buf: &mut ByteBuf, tokens: &[u32]) -> Result<()> {
+    let bytes = ids_buf.num_bytes();
+    if tokens.len().saturating_mul(4) > bytes {
+        return Err(Error::Input(format!(
+            "prefill chunk of {} tokens exceeds the id buffer",
+            tokens.len()
+        )));
+    }
+    let mut host = vec![0u8; bytes];
+    for (index, token) in tokens.iter().enumerate() {
+        let id = i32::try_from(*token)
+            .map_err(|_| Error::Input(format!("token {token} does not fit in i32")))?;
+        host[index * 4..index * 4 + 4].copy_from_slice(&id.to_le_bytes());
+    }
+    ids_buf.copy_from_host(&gpu.stream, &host)?;
+    Ok(())
+}
+
+/// Host observer for one block's fp32 residual after a prefill chunk.
+///
+/// Arguments are `(layer, start, end, residual)`. `residual` is little-endian
+/// fp32, `(end - start) * hidden` elements. The slice is live only for the
+/// call. `'cb` is the closure's own borrow, not the residual slice.
+pub type BlockResidualCb<'cb> = dyn for<'a> FnMut(u32, u32, u32, &'a [u8]) -> Result<()> + 'cb;
+
+struct ResidualSnap<'a> {
+    residual: &'a ByteBuf,
+    host: &'a mut Vec<u8>,
+    layer: u32,
+    start: u32,
+    end: u32,
+    rows: u32,
+    hidden: i32,
+}
+
+fn snapshot_residual(
+    gpu: &Gpu,
+    snap: ResidualSnap<'_>,
+    on_block: &mut Option<&mut BlockResidualCb<'_>>,
+) -> Result<()> {
+    let Some(callback) = on_block else {
+        return Ok(());
+    };
+    let bytes = snap.residual.num_bytes();
+    if snap.host.len() != bytes {
+        snap.host.resize(bytes, 0);
+    }
+    snap.residual.copy_to_host(&gpu.stream, snap.host)?;
+    let used = rows_bytes(snap.hidden, snap.rows, 4)?;
+    if used > snap.host.len() {
+        return Err(Error::Input(
+            "prefill residual is shorter than the chunk".into(),
+        ));
+    }
+    callback(snap.layer, snap.start, snap.end, &snap.host[..used])
+}
+
+impl Model {
+    /// Prefill `tokens` at positions `0 .. tokens.len()` in the fork's chunks
+    /// ([`crate::prefill::chunk_bounds`]), filling every attention cache and
+    /// GDN state. The caller passes the prompt without its last token, which
+    /// then goes through [`Self::decode_step`] for the logits, as
+    /// `Job.prefill` does.
+    ///
+    /// See [`Self::prefill_with`]. An empty slice is a no-op.
+    pub fn prefill(&mut self, gpu: &Gpu, tokens: &[u32]) -> Result<()> {
+        self.prefill_with(gpu, tokens, None)
+    }
+
+    /// [`Self::prefill`], with an optional residual observer.
+    ///
+    /// Fork: `Job.prefill` (`generator/job.py`) forwards `ids[:-1]`, one chunk
+    /// per call. Each `TransformerBlock` (`modules/transformer.py`) is
+    /// `rms_norm`, the mixer, `rms_norm_res_in`, the MLP, then `x += y`.
+    /// The last KV module (`model_ls.py` `prefill_ls`, layer 63 on the 27B)
+    /// runs the mixer and returns the residual it was given, skipping the MLP
+    /// (`transformer.py`). Final norm and `lm_head` do not run.
+    ///
+    /// `on_block` is `(layer, start, end, residual)` after that block.
+    /// `residual` is fp32 little-endian, `rows * hidden` bytes, with
+    /// `rows = end - start`. The last block's bytes are the residual it
+    /// received, which equals the previous block's output. `None` does not
+    /// copy the residual to the host.
+    ///
+    /// The shared attention `cache_seqlens` / rope position word is set to the
+    /// chunk start before each attention mixer and to the chunk end afterwards.
+    /// After the last chunk that word is `tokens.len()`, the position of the
+    /// following [`Self::decode_step`].
+    ///
+    /// Returns [`Error::Input`] `"layer prefill not implemented"` when a layer
+    /// scratch constructor is still the stub. The decode load still succeeds
+    /// in that case.
+    pub fn prefill_with(
+        &mut self,
+        gpu: &Gpu,
+        tokens: &[u32],
+        mut on_block: Option<&mut BlockResidualCb<'_>>,
+    ) -> Result<()> {
+        if tokens.is_empty() {
+            self.captured = false;
+            return Ok(());
+        }
+        self.with_prefill(gpu, |model, ws| {
+            model.prefill_loaded(gpu, ws, tokens, &mut on_block)
+        })
+    }
+
+    /// One chunk of absolute positions `[start, start + ids.len())`.
+    ///
+    /// `ids` is that chunk, not the whole prompt. [`crate::prefill::prefill_chunk`]
+    /// is this method.
+    pub(crate) fn prefill_chunk_at(&mut self, gpu: &Gpu, ids: &[u32], start: u32) -> Result<()> {
+        if ids.is_empty() {
+            return Err(Error::Input("prefill chunk is empty".into()));
+        }
+        self.with_prefill(gpu, |model, ws| {
+            model.prefill_chunk_loaded(gpu, ws, ids, start, &mut None)
+        })
+    }
+
+    /// Used rows of every attention cache, in layer order.
+    ///
+    /// `tokens_written` is how many tokens prefill stored (`prompt_len - 1`
+    /// after a full prompt prefill). Page `p` contributes physical
+    /// `block_table[p]`, and only the live rows of a partial page.
+    pub fn attn_cache(&self, gpu: &Gpu, tokens_written: u32) -> Result<Vec<AttnCacheImage>> {
+        let mut out = Vec::new();
+        for (index, block) in self.blocks.iter().enumerate() {
+            let MixerSlot::FullAttn(layer) = &block.mixer else {
+                continue;
+            };
+            let pages = layer.copy_cache(gpu)?;
+            let layer_id = u32::try_from(index).expect("layer count fits u32");
+            let tokens = usize::try_from(tokens_written).unwrap_or(0);
+            let qk = gather_used_rows(
+                &pages.qk,
+                &pages.block_table,
+                tokens_written,
+                pages.page_tokens,
+                pages.q_cols.saturating_mul(4),
+            )?;
+            let qv = gather_used_rows(
+                &pages.qv,
+                &pages.block_table,
+                tokens_written,
+                pages.page_tokens,
+                pages.q_cols.saturating_mul(4),
+            )?;
+            let sk = gather_used_rows(
+                &pages.sk,
+                &pages.block_table,
+                tokens_written,
+                pages.page_tokens,
+                pages.s_cols.saturating_mul(2),
+            )?;
+            let sv = gather_used_rows(
+                &pages.sv,
+                &pages.block_table,
+                tokens_written,
+                pages.page_tokens,
+                pages.s_cols.saturating_mul(2),
+            )?;
+            out.push(AttnCacheImage {
+                layer: layer_id,
+                qk: HostTensor {
+                    dtype: "int32".to_string(),
+                    shape: vec![tokens, pages.q_cols],
+                    bytes: qk,
+                },
+                qv: HostTensor {
+                    dtype: "int32".to_string(),
+                    shape: vec![tokens, pages.q_cols],
+                    bytes: qv,
+                },
+                sk: HostTensor {
+                    dtype: "float16".to_string(),
+                    shape: vec![tokens, pages.s_cols],
+                    bytes: sk,
+                },
+                sv: HostTensor {
+                    dtype: "float16".to_string(),
+                    shape: vec![tokens, pages.s_cols],
+                    bytes: sv,
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    /// Live GDN slot of every linear-attention layer, in layer order.
+    ///
+    /// Conv is bf16. Recurrent is fp32. `max_batch` 1 and `max_history` 0, so
+    /// the allocation is the slot the fork hashes after prefill.
+    pub fn gdn_state(&self, gpu: &Gpu) -> Result<Vec<GdnStateImage>> {
+        let mut out = Vec::new();
+        for (index, block) in self.blocks.iter().enumerate() {
+            let MixerSlot::Gdn(layer) = &block.mixer else {
+                continue;
+            };
+            let state = layer.copy_state(gpu)?;
+            let layer_id = u32::try_from(index).expect("layer count fits u32");
+            out.push(GdnStateImage {
+                layer: layer_id,
+                conv: HostTensor {
+                    dtype: "bfloat16".to_string(),
+                    shape: vec![
+                        usize::try_from(state.fdim).unwrap_or(0),
+                        usize::try_from(state.conv_k).unwrap_or(0),
+                    ],
+                    bytes: state.conv,
+                },
+                recurrent: HostTensor {
+                    dtype: "float32".to_string(),
+                    shape: vec![
+                        1,
+                        usize::try_from(state.num_v_heads).unwrap_or(0),
+                        usize::try_from(state.k_head_dim).unwrap_or(0),
+                        usize::try_from(state.v_head_dim).unwrap_or(0),
+                    ],
+                    bytes: state.recurrent,
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    fn with_prefill<T>(
+        &mut self,
+        gpu: &Gpu,
+        body: impl FnOnce(&mut Self, &mut PrefillWorkspace) -> Result<T>,
+    ) -> Result<T> {
+        if self.prefill_ws.is_none() {
+            return Err(Error::Input("layer prefill not implemented".into()));
+        }
+        self.captured = false;
+        // The pinned sequence slots must not be rewritten while a copy of
+        // them is queued. Decode may have left one in flight.
+        self.synchronize(gpu)?;
+        let mut ws = self
+            .prefill_ws
+            .take()
+            .ok_or_else(|| Error::Input("layer prefill not implemented".into()))?;
+        let result = body(self, &mut ws);
+        self.prefill_ws = Some(ws);
+        result
+    }
+
+    fn prefill_loaded(
+        &mut self,
+        gpu: &Gpu,
+        ws: &mut PrefillWorkspace,
+        tokens: &[u32],
+        on_block: &mut Option<&mut BlockResidualCb<'_>>,
+    ) -> Result<()> {
+        let written = u32::try_from(tokens.len())
+            .map_err(|_| Error::Input("prefill is longer than u32::MAX".into()))?;
+        if written > self.max_tokens {
+            return Err(Error::Input(format!(
+                "prefill of {written} tokens does not fit the {}-token cache",
+                self.max_tokens
+            )));
+        }
+        // `chunk_bounds` covers `ids[:-1]`. `tokens` is already that prefix,
+        // so the prompt length the fork chunked is one more.
+        let prompt_len = written
+            .checked_add(1)
+            .ok_or_else(|| Error::Input("prefill length overflows".into()))?;
+        let bounds = prefill::chunk_bounds(prompt_len);
+        let mut cursor = 0u32;
+        for &(start, end) in &bounds {
+            if start != cursor || end <= start || end > written {
+                return Err(Error::Input(format!(
+                    "prefill chunk [{start}, {end}) does not continue from {cursor}"
+                )));
+            }
+            cursor = end;
+        }
+        if cursor != written {
+            return Err(Error::Input(
+                "prefill chunks do not cover the tokens".into(),
+            ));
+        }
+        for (start, end) in bounds {
+            let chunk = &tokens[usize::try_from(start).expect("chunk start fits usize")
+                ..usize::try_from(end).expect("chunk end fits usize")];
+            self.prefill_chunk_loaded(gpu, ws, chunk, start, on_block)?;
+        }
+        Ok(())
+    }
+
+    fn prefill_chunk_loaded(
+        &mut self,
+        gpu: &Gpu,
+        ws: &mut PrefillWorkspace,
+        ids: &[u32],
+        start: u32,
+        on_block: &mut Option<&mut BlockResidualCb<'_>>,
+    ) -> Result<()> {
+        let rows = u32::try_from(ids.len())
+            .map_err(|_| Error::Input("prefill chunk is longer than u32::MAX".into()))?;
+        let end = start
+            .checked_add(rows)
+            .ok_or_else(|| Error::Input("prefill chunk end overflows".into()))?;
+        if end > self.max_tokens {
+            return Err(Error::Input(format!(
+                "prefill chunk [{start}, {end}) does not fit the {}-token cache",
+                self.max_tokens
+            )));
+        }
+        if rows > ws.max_rows {
+            return Err(Error::Input(format!(
+                "prefill chunk of {rows} rows exceeds the {}-row scratch",
+                ws.max_rows
+            )));
+        }
+        let vocab = u32::try_from(self.vocab).expect("vocab is a positive i32");
+        for &token in ids {
+            if token >= vocab {
+                return Err(Error::Input(format!(
+                    "token {token} is past the vocabulary ({vocab})"
+                )));
+            }
+        }
+        match self.blocks.last().map(|block| &block.mixer) {
+            Some(MixerSlot::FullAttn(_)) => {}
+            _ => {
+                return Err(Error::Weights(
+                    "the last KV module is not full attention".into(),
+                ))
+            }
+        }
+        // Host writes happen after the previous chunk's sync (or the sync in
+        // `with_prefill`). The device copies are queued later, on this stream.
+        write_seq(&mut ws.seq_start, start)?;
+        write_seq(&mut ws.seq_end, end)?;
+        stage_chunk_ids(gpu, &mut ws.ids, ids)?;
+        let hidden = self.hidden;
+        let n = positive_rows(rows)?;
+        embed_ids(gpu, &self.embed, &ws.ids, hidden, n, &mut ws.residual)?;
+        let layers = self.blocks.len();
+        for index in 0..layers {
+            self.forward_prefill_block(gpu, ws, index, start, rows, on_block)?;
+        }
+        // The next chunk, and the decode step at `tokens.len()`, read this
+        // length. `end` of the last chunk is the number of tokens written.
+        // SAFETY: `seq_end` is not rewritten until `synchronize` returns, and
+        // the device word outlives the copy.
+        unsafe {
+            self.staged
+                .seq
+                .copy_from_pinned_async(&gpu.stream, &ws.seq_end)?;
+        }
+        self.synchronize(gpu)?;
+        Ok(())
+    }
+
+    fn forward_prefill_block(
+        &mut self,
+        gpu: &Gpu,
+        ws: &mut PrefillWorkspace,
+        index: usize,
+        start: u32,
+        rows: u32,
+        on_block: &mut Option<&mut BlockResidualCb<'_>>,
+    ) -> Result<()> {
+        let hidden = self.hidden;
+        let norm = self.norm;
+        let early = index + 1 == self.blocks.len();
+        let layer = u32::try_from(index).expect("layer count fits u32");
+        let end = start
+            .checked_add(rows)
+            .ok_or_else(|| Error::Input("prefill chunk end overflows".into()))?;
+        let Model {
+            blocks,
+            paged,
+            staged,
+            ..
+        } = self;
+        let block = &mut blocks[index];
+        Self::norm_rows(
+            gpu,
+            &ws.residual,
+            &block.input_norm,
+            &mut ws.norm_out,
+            hidden,
+            rows,
+            norm,
+        )?;
+        match &mut block.mixer {
+            MixerSlot::FullAttn(layer_attn) => {
+                // `cache_seqlens` is the chunk start. Rope's scalar position
+                // word is the same address (`modules/attn.py` sets
+                // `positions = cache_seqlens` with no MRoPE offset). Restoring
+                // `start` before each layer undoes a mixer that stored
+                // `start + rows` for the following decode.
+                // SAFETY: `seq_start` stays unchanged until this chunk's
+                // `synchronize`. The device word outlives the copy.
+                unsafe {
+                    staged
+                        .seq
+                        .copy_from_pinned_async(&gpu.stream, &ws.seq_start)?;
+                }
+                if rows == 1 {
+                    layer_attn.forward_bound(gpu, paged, &ws.norm_out, &mut ws.mixer_out)?;
+                } else {
+                    layer_attn.prefill(
+                        gpu,
+                        &mut ws.rows_scratch,
+                        &mut ws.attn,
+                        &ws.norm_out,
+                        &mut ws.mixer_out,
+                        start,
+                        rows,
+                    )?;
+                }
+            }
+            MixerSlot::Gdn(layer_gdn) => {
+                if rows == 1 {
+                    layer_gdn.forward(gpu, &ws.norm_out, &mut ws.mixer_out)?;
+                } else {
+                    layer_gdn.prefill(
+                        gpu,
+                        &mut ws.rows_scratch,
+                        &mut ws.gdn,
+                        &ws.norm_out,
+                        &mut ws.mixer_out,
+                        rows,
+                    )?;
+                }
+            }
+        }
+        if early {
+            // The mixer updated the cache. The residual is the one this block
+            // received (`transformer.py` returns `x` when `params["prefill"]`).
+            snapshot_residual(
+                gpu,
+                ResidualSnap {
+                    residual: &ws.residual,
+                    host: &mut ws.residual_host,
+                    layer,
+                    start,
+                    end,
+                    rows,
+                    hidden,
+                },
+                on_block,
+            )?;
+            return Ok(());
+        }
+        Self::norm_residual_rows(
+            gpu,
+            &ws.mixer_out,
+            &block.post_norm,
+            &mut ws.mlp_in,
+            &mut ws.residual,
+            hidden,
+            rows,
+            norm,
+        )?;
+        if rows == 1 {
+            block.mlp.forward(gpu, &ws.mlp_in, &mut ws.mlp_out)?;
+        } else {
+            block.mlp.prefill(
+                gpu,
+                &mut ws.rows_scratch,
+                &mut ws.mlp,
+                &ws.mlp_in,
+                &mut ws.mlp_out,
+                rows,
+            )?;
+        }
+        Self::add_residual_rows(gpu, &mut ws.residual, &ws.mlp_out, hidden, rows)?;
+        snapshot_residual(
+            gpu,
+            ResidualSnap {
+                residual: &ws.residual,
+                host: &mut ws.residual_host,
+                layer,
+                start,
+                end,
+                rows,
+                hidden,
+            },
+            on_block,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1065,6 +1842,24 @@ mod tests {
             parse_rms_eps(r#"{"rms_norm_eps": 1e-06, "text_config": {"rms_norm_eps": 1e-05}}"#)
                 .unwrap_err();
         assert!(disagree.to_string().contains("disagree"), "{disagree}");
+    }
+
+    #[test]
+    fn gathers_used_cache_rows_and_drops_the_partial_page_tail() {
+        // Three physical pages, two tokens each, one byte per token.
+        // Logical order is page 2 then page 0. Three tokens: both of page 2,
+        // then the first byte of page 0. The tail of page 0 stays out.
+        let raw = [10u8, 11, 20, 21, 30, 31];
+        let table = [2, 0, 1];
+        let got = gather_used_rows(&raw, &table, 3, 2, 1).unwrap();
+        assert_eq!(got, vec![30, 31, 10]);
+        let full = gather_used_rows(&raw, &table, 4, 2, 1).unwrap();
+        assert_eq!(full, vec![30, 31, 10, 11]);
+        // Five tokens take one more row of physical page 1 and still fit.
+        let partial = gather_used_rows(&raw, &table, 5, 2, 1).unwrap();
+        assert_eq!(partial, vec![30, 31, 10, 11, 20]);
+        // Seven tokens need a fourth logical page. The table has three.
+        assert!(gather_used_rows(&raw, &table, 7, 2, 1).is_err());
     }
 
     #[test]

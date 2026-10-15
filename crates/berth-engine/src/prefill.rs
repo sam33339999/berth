@@ -140,9 +140,11 @@
 //! * Decode-only, not a prefill chunk: `_paged_attn_decode_split_kernel`,
 //!   `_paged_attn_decode_combine_kernel`.
 //!
-//! [`Model::prefill_chunk`] and [`Model::prefill_prompt`] return
-//! `Error::Input("prefill not implemented")` until those kernels exist.
-//! They do not launch anything.
+//! [`Model::prefill`] runs this loop. [`Model::prefill_chunk`] is one chunk
+//! and [`Model::prefill_prompt`] runs `ids[:-1]`. Digest hex is not computed
+//! in the library (`blake2` is a test dependency). The reference test hashes
+//! residuals from [`Model::prefill_with`], and the cache and GDN state from
+//! [`Model::attn_cache`] and [`Model::gdn_state`].
 
 use crate::model::Model;
 use crate::{Error, Gpu, Result};
@@ -212,10 +214,47 @@ pub struct GdnStateDigest {
     pub recurrent: TensorDigest,
 }
 
-/// What [`Model::prefill_prompt`] will return once the kernels exist.
+/// Little-endian bytes of one tensor, for a caller to hash.
 ///
-/// Logits are not here. They come from [`Model::decode_step`] on the last
-/// prompt token, after this returns.
+/// [`Model::attn_cache`] and [`Model::gdn_state`] return these. The digest
+/// hex stays in the test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostTensor {
+    pub dtype: String,
+    pub shape: Vec<usize>,
+    pub bytes: Vec<u8>,
+}
+
+/// Used rows of one attention layer, in block-table order.
+///
+/// `qk` and `qv` are int32. `sk` and `sv` are fp16. The tail of a partial
+/// page is not included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttnCacheImage {
+    pub layer: u32,
+    pub qk: HostTensor,
+    pub qv: HostTensor,
+    pub sk: HostTensor,
+    pub sv: HostTensor,
+}
+
+/// One GDN layer's live slot.
+///
+/// `conv` is bf16. `recurrent` is fp32. `max_batch` 1 and `max_history` 0,
+/// so the allocation is the slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GdnStateImage {
+    pub layer: u32,
+    pub conv: HostTensor,
+    pub recurrent: HostTensor,
+}
+
+/// Chunk ranges from [`Model::prefill_prompt`].
+///
+/// `blocks`, `attn`, and `gdn` are empty. The forward has run; the bytes are
+/// read through [`Model::prefill_with`], [`Model::attn_cache`], and
+/// [`Model::gdn_state`]. Logits are not here. They come from
+/// [`Model::decode_step`] on the last prompt token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrefillOutput {
     pub chunks: Vec<ChunkDigest>,
@@ -265,23 +304,37 @@ impl Model {
     /// attention pages, and the GDN slot are updated in place. Layer 63
     /// returns the residual it was given.
     ///
-    /// `needless_pass_by_ref_mut` is the real signature: the body will write
-    /// the cache. The stub does not.
-    #[allow(clippy::needless_pass_by_ref_mut)]
     pub fn prefill_chunk(&mut self, gpu: &Gpu, ids: &[u32], start: u32) -> Result<()> {
-        let _ = (self, gpu, ids, start);
-        Err(Error::Input("prefill not implemented".into()))
+        self.prefill_chunk_at(gpu, ids, start)
     }
 
     /// Prefill `ids[:-1]` in [`chunk_bounds`] order.
     ///
     /// Does not decode the last id and does not write logits. The caller
     /// runs [`Model::decode_step`] on `ids[ids.len() - 1]` at position
-    /// `ids.len() - 1` when it wants the first sampled token.
-    #[allow(clippy::needless_pass_by_ref_mut)]
+    /// `ids.len() - 1` when it wants the first sampled token. A prompt shorter
+    /// than two tokens does not launch anything.
+    ///
+    /// The returned chunk ranges are the fork's cuts. Block, cache, and state
+    /// digests are not filled here.
     pub fn prefill_prompt(&mut self, gpu: &Gpu, ids: &[u32]) -> Result<PrefillOutput> {
-        let n = u32::try_from(ids.len()).unwrap_or(0);
-        let _ = (self, gpu, ids, chunk_bounds(n));
-        Err(Error::Input("prefill not implemented".into()))
+        let n = u32::try_from(ids.len())
+            .map_err(|_| Error::Input("prompt is longer than u32::MAX".into()))?;
+        let bounds = chunk_bounds(n);
+        if ids.len() >= 2 {
+            self.prefill(gpu, &ids[..ids.len() - 1])?;
+        }
+        Ok(PrefillOutput {
+            chunks: bounds
+                .into_iter()
+                .map(|(start, end)| ChunkDigest {
+                    start,
+                    end,
+                    blocks: Vec::new(),
+                })
+                .collect(),
+            attn: Vec::new(),
+            gdn: Vec::new(),
+        })
     }
 }
