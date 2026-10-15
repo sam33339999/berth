@@ -1,13 +1,15 @@
 //! HTTP routes, the single backend thread, and the request queue.
 //!
 //! One generation runs at a time. The backend thread pulls jobs from an
-//! unbounded queue. Dropping the response body sets a cancel flag; the next
-//! token returns [`Flow::Cancel`].
+//! unbounded queue. [`ServeConfig::max_concurrent`] caps how many requests are
+//! admitted (the running one plus the queued ones); 0 leaves the queue
+//! uncapped. Dropping the response body sets a cancel flag; the next token
+//! returns [`Flow::Cancel`].
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
@@ -31,16 +33,57 @@ use tokio_stream::{Stream, StreamExt};
 use crate::assets::Assets;
 use crate::think::split_nonstream;
 use crate::turn::{send_outbound, Outbound, Turn};
-use crate::{Backend, Error, GenerateRequest, Result, SamplerConfig, Usage, MAX_BODY};
+use crate::{
+    Backend, Error, GenerateRequest, Result, SamplerConfig, Usage, DEFAULT_CHAT_MAX_TOKENS,
+    DEFAULT_COMPLETION_MAX_TOKENS, DEFAULT_DRY_ALLOWED_LENGTH, DEFAULT_DRY_BASE,
+    DEFAULT_DRY_MULTIPLIER, DEFAULT_DRY_RANGE, DEFAULT_FREQ_PENALTY, DEFAULT_FREQ_RANGE,
+    DEFAULT_HOST, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_MODEL_LEN, DEFAULT_MODEL_NAME, DEFAULT_PORT,
+    DEFAULT_PRESENCE_PENALTY, DEFAULT_REP_PENALTY, MAX_BODY,
+};
 
-/// Bind address and the sampling defaults that are not per request.
+/// Bind address, queue limit, and the sampling defaults that are not per request.
 #[derive(Clone, Debug)]
 pub struct ServeConfig {
     pub host: String,
     pub port: u16,
     pub model_name: String,
+    /// Prompt plus generated tokens. Length checks and `/v1/models` use this.
+    pub max_model_len: u32,
+    /// Admitted requests, running plus queued. 0 means unlimited.
+    pub max_concurrent: u32,
     pub chat_max_tokens: u32,
     pub completion_max_tokens: u32,
+    pub rep_penalty: f32,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
+    /// Lookback for repetition, frequency, and presence penalties.
+    pub freq_range: u32,
+    pub dry_multiplier: f32,
+    pub dry_base: f32,
+    pub dry_allowed_length: u32,
+    pub dry_range: u32,
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            host: DEFAULT_HOST.to_string(),
+            port: DEFAULT_PORT,
+            model_name: DEFAULT_MODEL_NAME.to_string(),
+            max_model_len: DEFAULT_MAX_MODEL_LEN,
+            max_concurrent: DEFAULT_MAX_CONCURRENT,
+            chat_max_tokens: DEFAULT_CHAT_MAX_TOKENS,
+            completion_max_tokens: DEFAULT_COMPLETION_MAX_TOKENS,
+            rep_penalty: DEFAULT_REP_PENALTY,
+            presence_penalty: DEFAULT_PRESENCE_PENALTY,
+            frequency_penalty: DEFAULT_FREQ_PENALTY,
+            freq_range: DEFAULT_FREQ_RANGE,
+            dry_multiplier: DEFAULT_DRY_MULTIPLIER,
+            dry_base: DEFAULT_DRY_BASE,
+            dry_allowed_length: DEFAULT_DRY_ALLOWED_LENGTH,
+            dry_range: DEFAULT_DRY_RANGE,
+        }
+    }
 }
 
 pub struct ServeHandle {
@@ -70,26 +113,16 @@ impl Drop for ServeHandle {
     }
 }
 
+#[derive(Clone)]
 struct AppState {
     assets: Arc<Assets>,
     jobs: std::sync::mpsc::Sender<Job>,
-    max_tokens: u32,
+    gate: Arc<Gate>,
+    max_model_len: u32,
     model_name: String,
     chat_max_tokens: u32,
     completion_max_tokens: u32,
-}
-
-impl Clone for AppState {
-    fn clone(&self) -> Self {
-        Self {
-            assets: Arc::clone(&self.assets),
-            jobs: self.jobs.clone(),
-            max_tokens: self.max_tokens,
-            model_name: self.model_name.clone(),
-            chat_max_tokens: self.chat_max_tokens,
-            completion_max_tokens: self.completion_max_tokens,
-        }
-    }
+    sampler: SamplerConfig,
 }
 
 struct Job {
@@ -100,8 +133,116 @@ struct Job {
     repetition: CheckConfig,
     request: GenerateRequest,
     cancel: Arc<AtomicBool>,
+    ticket: SlotGuard,
     tokens: mpsc::Sender<Outbound>,
     done: oneshot::Sender<TurnOutcome>,
+}
+
+/// Admitted requests (running plus queued). `limit == 0` does not count.
+///
+/// A ticket is released when the worker finishes the job, or earlier when the
+/// client disconnects before the worker starts. Release is idempotent.
+struct Gate {
+    limit: u32,
+    inflight: AtomicU32,
+}
+
+const QUEUED: u8 = 0;
+const STARTED: u8 = 1;
+const RELEASED: u8 = 2;
+
+struct Ticket {
+    gate: Arc<Gate>,
+    state: AtomicU8,
+}
+
+impl Ticket {
+    /// `true` when this worker is the one that moved the job from queued to started.
+    fn mark_started(&self) -> bool {
+        self.state
+            .compare_exchange(QUEUED, STARTED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Free the slot if the worker has not taken the job yet.
+    fn release_if_queued(&self) {
+        if self.gate.limit == 0 {
+            return;
+        }
+        if self
+            .state
+            .compare_exchange(QUEUED, RELEASED, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.decrement();
+        }
+    }
+
+    fn release(&self) {
+        if self.gate.limit == 0 {
+            self.state.store(RELEASED, Ordering::SeqCst);
+            return;
+        }
+        loop {
+            let state = self.state.load(Ordering::SeqCst);
+            if state == RELEASED {
+                return;
+            }
+            if self
+                .state
+                .compare_exchange(state, RELEASED, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                self.decrement();
+                return;
+            }
+        }
+    }
+
+    fn decrement(&self) {
+        let prev = self.gate.inflight.fetch_sub(1, Ordering::SeqCst);
+        debug_assert!(prev > 0, "admission slot released twice");
+    }
+}
+
+/// Drops the admission count even if the worker panics mid-job.
+struct SlotGuard(Arc<Ticket>);
+
+impl SlotGuard {
+    fn mark_started(&self) -> bool {
+        self.0.mark_started()
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+fn admit(gate: &Arc<Gate>) -> std::result::Result<Arc<Ticket>, u32> {
+    if gate.limit == 0 {
+        return Ok(Arc::new(Ticket {
+            gate: Arc::clone(gate),
+            state: AtomicU8::new(QUEUED),
+        }));
+    }
+    loop {
+        let inflight = gate.inflight.load(Ordering::SeqCst);
+        if inflight >= gate.limit {
+            return Err(inflight);
+        }
+        if gate
+            .inflight
+            .compare_exchange(inflight, inflight + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Ok(Arc::new(Ticket {
+                gate: Arc::clone(gate),
+                state: AtomicU8::new(QUEUED),
+            }));
+        }
+    }
 }
 
 struct TurnOutcome {
@@ -133,7 +274,6 @@ pub fn serve(
     backend: Box<dyn Backend>,
     config: ServeConfig,
 ) -> Result<ServeHandle> {
-    let max_tokens = backend.max_tokens();
     let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
     let worker_assets = Arc::clone(&assets);
     let worker = std::thread::Builder::new()
@@ -141,13 +281,19 @@ pub fn serve(
         .spawn(move || worker_loop(backend, worker_assets, job_rx))
         .map_err(|err| Error::new(format!("spawn backend thread: {err}")))?;
 
+    let sampler = base_sampler(&config);
     let state = AppState {
         assets,
         jobs: job_tx,
-        max_tokens,
+        gate: Arc::new(Gate {
+            limit: config.max_concurrent,
+            inflight: AtomicU32::new(0),
+        }),
+        max_model_len: config.max_model_len,
         model_name: config.model_name,
         chat_max_tokens: config.chat_max_tokens,
         completion_max_tokens: config.completion_max_tokens,
+        sampler,
     };
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -240,10 +386,52 @@ fn worker_loop(
     jobs: std::sync::mpsc::Receiver<Job>,
 ) {
     while let Ok(job) = jobs.recv() {
-        let outcome = execute(&mut *backend, &assets, &job);
-        let Job { tokens, done, .. } = job;
+        // A client that left before we dequeued already released the slot.
+        let started = job.ticket.mark_started();
+        let outcome = if !started || job.cancel.load(Ordering::SeqCst) {
+            cancelled_outcome(&job)
+        } else {
+            execute(&mut *backend, &assets, &job)
+        };
+        let Job {
+            tokens,
+            done,
+            ticket,
+            ..
+        } = job;
+        // Free the slot once generation is over, before the client is told.
+        drop(ticket);
         let _ = done.send(outcome);
         drop(tokens);
+    }
+}
+
+fn cancelled_outcome(job: &Job) -> TurnOutcome {
+    TurnOutcome {
+        finish: Finish::Cancelled,
+        usage: Usage {
+            prompt_tokens: job.request.prompt.len() as u32,
+            completion_tokens: 0,
+        },
+        triggers: Vec::new(),
+        raw: String::new(),
+        stop_string: false,
+        error: None,
+    }
+}
+
+fn base_sampler(config: &ServeConfig) -> SamplerConfig {
+    SamplerConfig {
+        temperature: 0.0,
+        rep_penalty: config.rep_penalty,
+        presence_penalty: config.presence_penalty,
+        frequency_penalty: config.frequency_penalty,
+        penalty_range: config.freq_range,
+        dry_multiplier: config.dry_multiplier,
+        dry_base: config.dry_base,
+        dry_allowed_length: config.dry_allowed_length,
+        dry_range: config.dry_range,
+        seed: 0,
     }
 }
 
@@ -316,7 +504,7 @@ async fn models(State(state): State<AppState>) -> Response {
                 "object": "model",
                 "created": unix_now(),
                 "owned_by": "local",
-                "max_model_len": state.max_tokens,
+                "max_model_len": state.max_model_len,
             }],
         }),
     )
@@ -393,6 +581,16 @@ async fn dispatch(state: AppState, prepared: Prepared) -> Response {
         stream,
         model,
     } = prepared;
+    let ticket = match admit(&state.gate) {
+        Ok(ticket) => ticket,
+        Err(inflight) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                &format!("server busy: {inflight} requests in flight"),
+                "rate_limit_error",
+            );
+        }
+    };
     let cancel = Arc::new(AtomicBool::new(false));
     let (token_tx, token_rx) = mpsc::channel(1);
     let (done_tx, done_rx) = oneshot::channel();
@@ -404,6 +602,7 @@ async fn dispatch(state: AppState, prepared: Prepared) -> Response {
         repetition,
         request,
         cancel: Arc::clone(&cancel),
+        ticket: SlotGuard(Arc::clone(&ticket)),
         tokens: token_tx,
         done: done_tx,
     };
@@ -421,9 +620,9 @@ async fn dispatch(state: AppState, prepared: Prepared) -> Response {
         chat,
     };
     if stream {
-        stream_response(meta, token_rx, done_rx, cancel)
+        stream_response(meta, token_rx, done_rx, cancel, ticket)
     } else {
-        json_completion(meta, token_rx, done_rx, cancel).await
+        json_completion(meta, token_rx, done_rx, cancel, ticket).await
     }
 }
 
@@ -439,8 +638,9 @@ async fn json_completion(
     mut token_rx: mpsc::Receiver<Outbound>,
     done_rx: oneshot::Receiver<TurnOutcome>,
     cancel: Arc<AtomicBool>,
+    ticket: Arc<Ticket>,
 ) -> Response {
-    let _guard = CancelFlag(cancel);
+    let _guard = DisconnectGuard { cancel, ticket };
     while token_rx.recv().await.is_some() {}
     let outcome = match done_rx.await {
         Ok(outcome) => outcome,
@@ -469,9 +669,9 @@ fn stream_response(
     token_rx: mpsc::Receiver<Outbound>,
     done_rx: oneshot::Receiver<TurnOutcome>,
     cancel: Arc<AtomicBool>,
+    ticket: Arc<Ticket>,
 ) -> Response {
     let (out_tx, out_rx) = mpsc::channel::<Bytes>(8);
-    let flag = Arc::clone(&cancel);
     tokio::spawn(async move {
         if meta.chat
             && out_tx
@@ -529,7 +729,8 @@ fn stream_response(
     let stream = ReceiverStream::new(out_rx).map(Ok::<Bytes, Infallible>);
     let stream = FlagStream {
         inner: stream,
-        flag,
+        cancel,
+        ticket,
     };
     Response::builder()
         .status(StatusCode::OK)
@@ -757,21 +958,21 @@ fn prepare_common(
     chat: bool,
     in_think: bool,
 ) -> std::result::Result<Prepared, String> {
-    if prompt.len() as u32 >= state.max_tokens {
+    if prompt.len() as u32 >= state.max_model_len {
         return Err(format!(
-            "prompt of {} tokens exceeds the {} token cache",
+            "prompt of {} tokens exceeds the {} token context",
             prompt.len(),
-            state.max_tokens
+            state.max_model_len
         ));
     }
-    let room = state.max_tokens - prompt.len() as u32;
+    let room = state.max_model_len - prompt.len() as u32;
     let requested = max_new_tokens(body, default_max)?;
     let max_new_tokens = requested.min(room);
     if max_new_tokens == 0 {
         return Err(format!(
-            "prompt of {} tokens exceeds the {} token cache",
+            "prompt of {} tokens exceeds the {} token context",
             prompt.len(),
-            state.max_tokens
+            state.max_model_len
         ));
     }
     let (extra_ids, stop_strings) = classify_stops(&state.assets, body.get("stop"))?;
@@ -781,7 +982,7 @@ fn prepare_common(
             stop_tokens.push(id);
         }
     }
-    let sampler = sampler_config(body)?;
+    let sampler = sampler_config(state, body)?;
     let model = body
         .get("model")
         .and_then(Value::as_str)
@@ -822,14 +1023,19 @@ fn repetition_config(headers: &HeaderMap) -> CheckConfig {
     )
 }
 
-fn sampler_config(body: &Map<String, Value>) -> std::result::Result<SamplerConfig, String> {
+fn sampler_config(
+    state: &AppState,
+    body: &Map<String, Value>,
+) -> std::result::Result<SamplerConfig, String> {
     let temperature = temperature(body)?;
     let seed = match body.get("seed") {
         None | Some(Value::Null) => 0,
         Some(Value::Number(number)) => number_u64(number).ok_or_else(|| "bad seed".to_string())?,
         Some(_) => return Err("bad seed".to_string()),
     };
-    let mut sampler = SamplerConfig::serve_defaults(temperature, seed);
+    let mut sampler = state.sampler.clone();
+    sampler.temperature = temperature;
+    sampler.seed = seed;
     sampler.rep_penalty = opt_f32(body, "repetition_penalty", sampler.rep_penalty)?;
     sampler.frequency_penalty = opt_f32(body, "frequency_penalty", sampler.frequency_penalty)?;
     sampler.presence_penalty = opt_f32(body, "presence_penalty", sampler.presence_penalty)?;
@@ -1076,22 +1282,31 @@ fn new_id(prefix: &str) -> String {
     id
 }
 
-struct CancelFlag(Arc<AtomicBool>);
+struct DisconnectGuard {
+    cancel: Arc<AtomicBool>,
+    ticket: Arc<Ticket>,
+}
 
-impl Drop for CancelFlag {
+impl Drop for DisconnectGuard {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
+        note_disconnect(&self.cancel, &self.ticket);
     }
+}
+
+fn note_disconnect(cancel: &AtomicBool, ticket: &Ticket) {
+    cancel.store(true, Ordering::SeqCst);
+    ticket.release_if_queued();
 }
 
 struct FlagStream<S> {
     inner: S,
-    flag: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+    ticket: Arc<Ticket>,
 }
 
 impl<S> Drop for FlagStream<S> {
     fn drop(&mut self) {
-        self.flag.store(true, Ordering::SeqCst);
+        note_disconnect(&self.cancel, &self.ticket);
     }
 }
 

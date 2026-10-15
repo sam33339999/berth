@@ -10,8 +10,7 @@ use std::time::{Duration, Instant};
 
 use berth::{
     load_assets, serve, Assets, Backend, Finish, Flow, GenerateRequest, SamplerConfig, ServeConfig,
-    Usage, DEFAULT_CHAT_MAX_TOKENS, DEFAULT_COMPLETION_MAX_TOKENS, DEFAULT_MODEL_DIR,
-    DEFAULT_MODEL_NAME,
+    Usage, DEFAULT_MODEL_DIR, DEFAULT_MODEL_NAME,
 };
 use serde_json::{json, Value};
 
@@ -29,13 +28,16 @@ struct Shared {
     tokens: Vec<u32>,
     hold: Duration,
     delay: Duration,
-    max_tokens: u32,
     active: AtomicUsize,
     max_active: AtomicUsize,
     cancelled: AtomicBool,
     starts: Mutex<Vec<Instant>>,
     ends: Mutex<Vec<Instant>>,
     requests: Mutex<Vec<GenerateRequest>>,
+    /// Taken by the first `generate`, before any token.
+    hold_start: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// Taken by the first `generate`, after the first token is delivered.
+    hold_after_token: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 struct Fake {
@@ -45,10 +47,6 @@ struct Fake {
 impl Backend for Fake {
     fn vocab_size(&self) -> u32 {
         262_144
-    }
-
-    fn max_tokens(&self) -> u32 {
-        self.shared.max_tokens
     }
 
     fn generate(
@@ -66,6 +64,9 @@ impl Backend for Fake {
             .lock()
             .expect("starts")
             .push(Instant::now());
+        if let Some(rx) = self.shared.hold_start.lock().expect("hold").take() {
+            let _ = rx.recv();
+        }
         let active = self.shared.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.shared.max_active.fetch_max(active, Ordering::SeqCst);
         if !self.shared.hold.is_zero() {
@@ -83,6 +84,11 @@ impl Backend for Fake {
             }
             let flow = on_token(token);
             produced += 1;
+            if produced == 1 {
+                if let Some(rx) = self.shared.hold_after_token.lock().expect("hold").take() {
+                    let _ = rx.recv();
+                }
+            }
             if flow == Flow::Cancel {
                 self.shared.cancelled.store(true, Ordering::SeqCst);
                 finish = Finish::Cancelled;
@@ -110,32 +116,155 @@ fn shared(tokens: Vec<u32>, hold: Duration, delay: Duration) -> Arc<Shared> {
         tokens,
         hold,
         delay,
-        max_tokens: 8192,
         active: AtomicUsize::new(0),
         max_active: AtomicUsize::new(0),
         cancelled: AtomicBool::new(false),
         starts: Mutex::new(Vec::new()),
         ends: Mutex::new(Vec::new()),
         requests: Mutex::new(Vec::new()),
+        hold_start: Mutex::new(None),
+        hold_after_token: Mutex::new(None),
     })
 }
 
 fn start(fake: Arc<Shared>) -> berth::ServeHandle {
+    start_with(
+        fake,
+        ServeConfig {
+            max_model_len: 8192,
+            ..ServeConfig::default()
+        },
+    )
+}
+
+/// Always loopback and an ephemeral port. A test must not bind 8889.
+fn start_with(fake: Arc<Shared>, mut config: ServeConfig) -> berth::ServeHandle {
+    config.host = "127.0.0.1".into();
+    config.port = 0;
     let backend = Fake {
         shared: Arc::clone(&fake),
     };
-    serve(
-        assets(),
-        Box::new(backend),
-        ServeConfig {
-            host: "127.0.0.1".into(),
-            port: 0,
-            model_name: DEFAULT_MODEL_NAME.into(),
-            chat_max_tokens: DEFAULT_CHAT_MAX_TOKENS,
-            completion_max_tokens: DEFAULT_COMPLETION_MAX_TOKENS,
-        },
+    let handle = serve(assets(), Box::new(backend), config).expect("bind ephemeral port");
+    assert_ne!(handle.addr().port(), 8889);
+    handle
+}
+
+fn post_json(addr: SocketAddr, path: &str, body: Value) -> RawResponse {
+    http(
+        addr,
+        "POST",
+        path,
+        &[("content-type", "application/json")],
+        body.to_string().as_bytes(),
     )
-    .expect("bind ephemeral port")
+}
+
+fn assert_busy(response: &RawResponse, inflight: u32) {
+    assert_eq!(
+        response.status,
+        429,
+        "{}",
+        String::from_utf8_lossy(&response.body)
+    );
+    let body: Value = serde_json::from_slice(&response.body).expect("json");
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert_eq!(
+        body["error"]["message"],
+        format!("server busy: {inflight} requests in flight")
+    );
+}
+
+fn wait_until(mut pred: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !pred() {
+        assert!(Instant::now() < deadline, "timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+struct Hold(Option<std::sync::mpsc::Sender<()>>);
+
+impl Hold {
+    fn release(mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        self.0.take();
+    }
+}
+
+fn begin_stream(addr: SocketAddr, body: &Value) -> TcpStream {
+    let mut sock = TcpStream::connect(addr).expect("connect");
+    sock.set_nodelay(true).expect("nodelay");
+    sock.set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("timeout");
+    write_request(
+        &mut sock,
+        "POST",
+        "/v1/completions",
+        &[("content-type", "application/json")],
+        body.to_string().as_bytes(),
+    );
+    sock
+}
+
+fn read_status(sock: &mut TcpStream) -> u16 {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        if buf.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        match sock.read(&mut tmp) {
+            Ok(0) => panic!("eof before headers: {}", String::from_utf8_lossy(&buf)),
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(err) => panic!("read headers: {err}"),
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    text.split_whitespace()
+        .nth(1)
+        .expect("code")
+        .parse()
+        .expect("status number")
+}
+
+fn read_until_body(sock: &mut TcpStream) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        let n = sock
+            .read(&mut tmp)
+            .unwrap_or_else(|err| panic!("read: {err}"));
+        assert!(n > 0, "eof before body");
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(split) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+            if buf.len() > split + 4 {
+                return buf;
+            }
+        }
+    }
+}
+
+fn drain(sock: &mut TcpStream) {
+    sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut tmp = [0u8; 4096];
+    loop {
+        match sock.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break;
+            }
+            Err(err) => panic!("drain: {err}"),
+        }
+    }
 }
 
 struct RawResponse {
@@ -703,4 +832,333 @@ fn two_concurrent_requests_run_one_at_a_time() {
         starts[1] >= ends[0],
         "requests overlapped: {starts:?} {ends:?}"
     );
+}
+
+#[test]
+fn max_concurrent_returns_429_and_releases_after_the_job_finishes() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let state = shared(vec![11, 12, 13], Duration::ZERO, Duration::ZERO);
+    *state.hold_start.lock().expect("hold") = Some(rx);
+    let server = start_with(
+        Arc::clone(&state),
+        ServeConfig {
+            max_concurrent: 1,
+            max_model_len: 8192,
+            ..ServeConfig::default()
+        },
+    );
+    let addr = server.addr();
+    let hold = Hold(Some(tx));
+    let running = thread::spawn(move || {
+        post_json(
+            addr,
+            "/v1/completions",
+            json!({"prompt": "a", "max_tokens": 4}),
+        )
+    });
+    wait_until(|| !state.starts.lock().expect("starts").is_empty());
+
+    let busy = post_json(
+        addr,
+        "/v1/completions",
+        json!({"prompt": "b", "max_tokens": 4}),
+    );
+    assert_busy(&busy, 1);
+
+    hold.release();
+    let first = running.join().expect("client");
+    assert_eq!(
+        first.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&first.body)
+    );
+    let again = post_json(
+        addr,
+        "/v1/completions",
+        json!({"prompt": "c", "max_tokens": 4}),
+    );
+    assert_eq!(
+        again.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&again.body)
+    );
+}
+
+#[test]
+fn max_concurrent_releases_after_mid_stream_disconnect() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let state = shared(vec![11, 12, 13, 14], Duration::ZERO, Duration::ZERO);
+    *state.hold_after_token.lock().expect("hold") = Some(rx);
+    let server = start_with(
+        Arc::clone(&state),
+        ServeConfig {
+            max_concurrent: 1,
+            max_model_len: 8192,
+            ..ServeConfig::default()
+        },
+    );
+    let addr = server.addr();
+    let hold = Hold(Some(tx));
+    let mut sock = begin_stream(
+        addr,
+        &json!({"prompt": "x", "max_tokens": 8, "stream": true}),
+    );
+    let head = read_until_body(&mut sock);
+    let text = String::from_utf8_lossy(&head);
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+
+    let busy = post_json(
+        addr,
+        "/v1/completions",
+        json!({"prompt": "y", "max_tokens": 4}),
+    );
+    assert_busy(&busy, 1);
+
+    sock.shutdown(Shutdown::Both).ok();
+    drop(sock);
+    hold.release();
+    wait_until(|| !state.ends.lock().expect("ends").is_empty());
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut last = String::new();
+    let freed = loop {
+        let again = post_json(
+            addr,
+            "/v1/completions",
+            json!({"prompt": "z", "max_tokens": 4}),
+        );
+        if again.status == 200 {
+            break true;
+        }
+        last = format!("{} {}", again.status, String::from_utf8_lossy(&again.body));
+        if Instant::now() > deadline {
+            break false;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert!(freed, "slot did not return after disconnect: {last}");
+}
+
+#[test]
+fn max_concurrent_releases_when_a_queued_client_disconnects() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let state = shared(vec![11, 12, 13], Duration::ZERO, Duration::ZERO);
+    *state.hold_start.lock().expect("hold") = Some(rx);
+    let server = start_with(
+        Arc::clone(&state),
+        ServeConfig {
+            max_concurrent: 2,
+            max_model_len: 8192,
+            ..ServeConfig::default()
+        },
+    );
+    let addr = server.addr();
+    let hold = Hold(Some(tx));
+    let running = thread::spawn(move || {
+        post_json(
+            addr,
+            "/v1/completions",
+            json!({"prompt": "a", "max_tokens": 4}),
+        )
+    });
+    wait_until(|| !state.starts.lock().expect("starts").is_empty());
+
+    let mut queued = begin_stream(
+        addr,
+        &json!({"prompt": "b", "max_tokens": 4, "stream": true}),
+    );
+    assert_eq!(read_status(&mut queued), 200, "queued stream was refused");
+    let full = post_json(
+        addr,
+        "/v1/completions",
+        json!({"prompt": "c", "max_tokens": 4}),
+    );
+    assert_busy(&full, 2);
+
+    queued.shutdown(Shutdown::Both).ok();
+    drop(queued);
+
+    let mut admitted = None;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let mut sock = begin_stream(
+            addr,
+            &json!({"prompt": "d", "max_tokens": 4, "stream": true}),
+        );
+        if read_status(&mut sock) == 200 {
+            admitted = Some(sock);
+            break;
+        }
+        drop(sock);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let mut admitted = admitted.expect("slot did not return after the queued client left");
+
+    let mut extra = begin_stream(
+        addr,
+        &json!({"prompt": "e", "max_tokens": 4, "stream": true}),
+    );
+    let extra_status = read_status(&mut extra);
+    if extra_status == 200 {
+        extra.shutdown(Shutdown::Both).ok();
+    }
+    assert_eq!(extra_status, 429, "a third request was admitted");
+    drop(extra);
+
+    hold.release();
+    let first = running.join().expect("client");
+    assert_eq!(
+        first.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&first.body)
+    );
+    drain(&mut admitted);
+    drop(admitted);
+    wait_until(|| {
+        state.active.load(Ordering::SeqCst) == 0
+            && state.ends.lock().expect("ends").len() == state.starts.lock().expect("starts").len()
+    });
+    let again = post_json(
+        addr,
+        "/v1/completions",
+        json!({"prompt": "f", "max_tokens": 4}),
+    );
+    assert_eq!(
+        again.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&again.body)
+    );
+}
+
+#[test]
+fn models_reports_the_configured_name_and_max_model_len() {
+    let state = shared(vec![1], Duration::ZERO, Duration::ZERO);
+    let server = start_with(
+        state,
+        ServeConfig {
+            model_name: "berth-test".into(),
+            max_model_len: 4096,
+            ..ServeConfig::default()
+        },
+    );
+    let models = http(server.addr(), "GET", "/v1/models", &[], b"");
+    assert_eq!(models.status, 200);
+    let models: Value = serde_json::from_slice(&models.body).unwrap();
+    assert_eq!(models["data"][0]["id"], "berth-test");
+    assert_eq!(models["data"][0]["max_model_len"], 4096);
+}
+
+#[test]
+fn omitted_max_tokens_uses_the_server_default() {
+    let state = shared(vec![11, 12, 13], Duration::ZERO, Duration::ZERO);
+    let server = start_with(
+        Arc::clone(&state),
+        ServeConfig {
+            max_model_len: 8192,
+            chat_max_tokens: 41,
+            completion_max_tokens: 13,
+            ..ServeConfig::default()
+        },
+    );
+    let addr = server.addr();
+    let completion = post_json(addr, "/v1/completions", json!({"prompt": "x"}));
+    assert_eq!(
+        completion.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&completion.body)
+    );
+    let chat = post_json(
+        addr,
+        "/v1/chat/completions",
+        json!({"messages": [{"role": "user", "content": "hi"}]}),
+    );
+    assert_eq!(chat.status, 200, "{}", String::from_utf8_lossy(&chat.body));
+    let explicit = post_json(
+        addr,
+        "/v1/completions",
+        json!({"prompt": "x", "max_tokens": 4}),
+    );
+    assert_eq!(explicit.status, 200);
+    let requests = state.requests.lock().expect("requests");
+    assert_eq!(requests[0].max_new_tokens, 13);
+    assert_eq!(requests[1].max_new_tokens, 41);
+    assert_eq!(requests[2].max_new_tokens, 4);
+}
+
+#[test]
+fn server_sampler_defaults_reach_the_backend_and_requests_override_them() {
+    let state = shared(vec![11, 12], Duration::ZERO, Duration::ZERO);
+    let server = start_with(
+        Arc::clone(&state),
+        ServeConfig {
+            max_model_len: 8192,
+            rep_penalty: 1.25,
+            presence_penalty: 0.4,
+            frequency_penalty: 0.25,
+            freq_range: 64,
+            dry_multiplier: 0.8,
+            dry_base: 2.5,
+            dry_allowed_length: 9,
+            dry_range: 1000,
+            ..ServeConfig::default()
+        },
+    );
+    let addr = server.addr();
+    let plain = post_json(
+        addr,
+        "/v1/completions",
+        json!({"prompt": [1, 2, 3], "max_tokens": 4}),
+    );
+    assert_eq!(
+        plain.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&plain.body)
+    );
+    let over = post_json(
+        addr,
+        "/v1/completions",
+        json!({
+            "prompt": [1, 2, 3],
+            "max_tokens": 4,
+            "temperature": 0.3,
+            "seed": 3,
+            "repetition_penalty": 1.4,
+            "dry_multiplier": 0,
+            "frequency_penalty": 0.5,
+        }),
+    );
+    assert_eq!(over.status, 200, "{}", String::from_utf8_lossy(&over.body));
+    let requests = state.requests.lock().expect("requests");
+    assert_eq!(
+        requests[0].sampler,
+        SamplerConfig {
+            temperature: 0.0,
+            rep_penalty: 1.25,
+            presence_penalty: 0.4,
+            frequency_penalty: 0.25,
+            penalty_range: 64,
+            dry_multiplier: 0.8,
+            dry_base: 2.5,
+            dry_allowed_length: 9,
+            dry_range: 1000,
+            seed: 0,
+        }
+    );
+    let sampler = &requests[1].sampler;
+    assert_eq!(sampler.temperature, 0.3f64 as f32);
+    assert_eq!(sampler.seed, 3);
+    assert_eq!(sampler.rep_penalty, 1.4f64 as f32);
+    assert_eq!(sampler.dry_multiplier, 0.0);
+    assert_eq!(sampler.frequency_penalty, 0.5f64 as f32);
+    assert_eq!(sampler.presence_penalty, 0.4);
+    assert_eq!(sampler.penalty_range, 64);
+    assert_eq!(sampler.dry_base, 2.5);
+    assert_eq!(sampler.dry_allowed_length, 9);
+    assert_eq!(sampler.dry_range, 1000);
 }

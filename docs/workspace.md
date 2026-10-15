@@ -147,12 +147,39 @@ eager decode（`tests/decode_bench.rs`，64 步）是 26.25 ms/token，fork 加 
 
 `berth-engine` 的 `Engine` 加上 GPU 抽樣（`Sampler`，rep / pres-freq / DRY 懲罰、溫度、Gumbel 抽樣，同一個 seed 和 fork 抽出同一串 token），`crates/berth` 是 OpenAI 相容的 HTTP 服務：`/health`、`/v1/models`、`/v1/chat/completions`（含 SSE、`reasoning_content`、重複檢查事件）、`/v1/completions`。一次只跑一個 GPU job，斷線就取消。
 
+試跑換 port，不要佔正式服務的 8889。載模型之前 stderr 會印一行有效設定（模型目錄、名稱、cache-tokens、max-model-len、max-concurrent、host:port）。`--port` 已經有人聽就退出，不載模型（`port N is in use; not loading the model`）。
+
 ```text
 cargo build --release -p berth
-./target/release/berth --host 127.0.0.1 --port 18889
+./target/release/berth --host 127.0.0.1 --port 18889 \
+  --cache-tokens 270336 --max-model-len 262144 \
+  --default-max-tokens 32768 --max-concurrent 0
 ```
 
-預設 port 是 8889，和正式服務一樣；兩個不能同時開，VRAM 只放得下一份 27B。
+預設 port 是 8889，和正式服務一樣；兩個不能同時開，VRAM 只放得下一份 27B。每個旗標都能用環境變數蓋掉（命令列優先），名字對齊 `scripts/serve-host.sh`。`--cache-tokens` 要是 256 的正倍數，`--max-model-len` 不能比它大，否則啟動失敗。`--max-tokens` 是 `--cache-tokens` 的隱藏別名。
+
+| 旗標 | 環境變數 | 預設 |
+| --- | --- | --- |
+| `--model` | `BERTH_MODEL` | `/home/sam/qwen38-exl3-dflash2/models/qwen38-27b-exl3` |
+| `--model-name` | `BERTH_MODEL_NAME` | `qwen38-27b-exl3-dflash2` |
+| `--host` | `BERTH_HOST` | `0.0.0.0` |
+| `--port` | `BERTH_PORT` | `8889` |
+| `--cache-tokens` | `CACHE_TOKENS` | `270336`（KV cache，傳給 `Engine::load`） |
+| `--max-model-len` | `CTX` | `262144`（單次請求的 prompt + 生成上限） |
+| `--default-max-tokens` | `MAX_TOKENS` | `32768`（聊天沒帶 `max_tokens` 時） |
+| `--default-completion-max-tokens` | `COMPLETION_MAX_TOKENS` | `256` |
+| `--max-concurrent` | `MAX_CONCURRENT` | `0`（不限制排隊） |
+| `--cubins` | `BERTH_CUBINS` | `target/triton-cubins` |
+| `--dry-multiplier` | `DRY_MULTIPLIER` | `0.2` |
+| `--dry-base` | `DRY_BASE` | `1.75` |
+| `--dry-allowed-length` | `DRY_ALLOWED_LENGTH` | `6` |
+| `--dry-range` | `DRY_RANGE` | `4096` |
+| `--rep-penalty` | `REP_PENALTY` | `1.0` |
+| `--freq-penalty` | `FREQ_PENALTY` | `0` |
+| `--freq-range` | `FREQ_RANGE` | `512` |
+| `--presence-penalty` | `PRESENCE_PENALTY` | `0` |
+
+`/v1/models` 的 `max_model_len` 和請求的長度檢查用 `--max-model-len`，不是整份 KV cache。抽樣旗標是全伺服器的起點，請求裡的同名欄位仍可蓋過。`--max-concurrent` 只限制同時收下的請求數（正在跑的加上排隊的）；超過回 HTTP 429。GPU 還是一次一個 job。0 表示不限制排隊。
 
 greedy 299 步和 fork 的 argmax 完全一樣（`crates/berth-engine/tests/generate.rs`）。
 

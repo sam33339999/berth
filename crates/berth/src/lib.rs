@@ -25,8 +25,14 @@ pub const DEFAULT_HOST: &str = "0.0.0.0";
 /// Default bind port. Tests bind an ephemeral port instead.
 pub const DEFAULT_PORT: u16 = 8889;
 
-/// Default `--max-tokens`: KV cache length (`CACHE_TOKENS` in `serve-host.sh`).
+/// Default `--cache-tokens`: KV cache length (`CACHE_TOKENS` in `serve-host.sh`).
 pub const DEFAULT_CACHE_TOKENS: u32 = 270336;
+
+/// Default `--max-model-len` (`CTX` in `serve-host.sh`).
+pub const DEFAULT_MAX_MODEL_LEN: u32 = 262144;
+
+/// Default `--max-concurrent`. 0 admits every request; the GPU still runs one job.
+pub const DEFAULT_MAX_CONCURRENT: u32 = 0;
 
 /// Default `--cubins` directory.
 pub const DEFAULT_CUBINS: &str = "target/triton-cubins";
@@ -39,6 +45,23 @@ pub const DEFAULT_CHAT_MAX_TOKENS: u32 = 32768;
 
 /// Completion `max_tokens` when the client omits it (`serve_openai.py`).
 pub const DEFAULT_COMPLETION_MAX_TOKENS: u32 = 256;
+
+/// `--dry-multiplier` (`DRY_MULTIPLIER`). Same as [`SamplerConfig::serve_defaults`].
+pub const DEFAULT_DRY_MULTIPLIER: f32 = 0.2;
+/// `--dry-base` (`DRY_BASE`).
+pub const DEFAULT_DRY_BASE: f32 = 1.75;
+/// `--dry-allowed-length` (`DRY_ALLOWED_LENGTH`).
+pub const DEFAULT_DRY_ALLOWED_LENGTH: u32 = 6;
+/// `--dry-range` (`DRY_RANGE`). 0 means the whole context.
+pub const DEFAULT_DRY_RANGE: u32 = 4096;
+/// `--rep-penalty` (`REP_PENALTY`). 1.0 is off.
+pub const DEFAULT_REP_PENALTY: f32 = 1.0;
+/// `--freq-penalty` (`FREQ_PENALTY`). 0 is off.
+pub const DEFAULT_FREQ_PENALTY: f32 = 0.0;
+/// `--freq-range` (`FREQ_RANGE`). Window for rep, frequency, and presence.
+pub const DEFAULT_FREQ_RANGE: u32 = 512;
+/// `--presence-penalty` (`PRESENCE_PENALTY`). 0 is off.
+pub const DEFAULT_PRESENCE_PENALTY: f32 = 0.0;
 
 /// Request body cap (`MAX_BODY`).
 pub const MAX_BODY: usize = 32 * 1024 * 1024;
