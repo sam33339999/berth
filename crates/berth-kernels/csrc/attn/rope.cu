@@ -1,7 +1,8 @@
 // rope_gr for the profiled instance rope_kernel<2,1>: NEOX, bf16 q/k norm.
 //
 // The device function is defined in rope.cu, and rope.cuh includes ATen, so
-// the kernel is transcribed here and instantiated only for that pair. Other
+// build.rs extracts it into OUT_DIR/fork/rope_kernel.cuh; this file launches
+// only that pair. Other
 // rope modes and fp16 norms fail closed. reduction.cuh supplies
 // warp_reduce_sum_f. ROPESTYLE_* match rope.cuh.
 
@@ -21,9 +22,6 @@
 
 #include "reduction.cuh"
 
-#define MAX_NUM_THREADS 1024
-#define MAX_ROTATE_DIMS 4
-
 #define ROPESTYLE_NONE 0
 #define ROPESTYLE_GPTJ 1
 #define ROPESTYLE_NEOX 2
@@ -31,204 +29,9 @@
 using bfloat16 = __nv_bfloat16;
 using bfloat162 = __nv_bfloat162;
 
-template <int rope_mode, bool norm_bf16>
-__global__ void rope_kernel(
-    const half* __restrict__ q,
-    half* __restrict__ out_q,
-    const half* __restrict__ k,
-    half* __restrict__ out_k,
-    const float* __restrict__ inv_freq,
-    const int bsz,
-    const int seq_len,
-    const int num_heads_q,
-    const int num_heads_k,
-    const int head_dim,
-    const int q_head_stride,
-    const int k_head_stride,
-    const int partial_head_dim,
-    const int position,
-    const uint32_t* __restrict__ positions,
-    const uint32_t* __restrict__ position_ids,
-    float attn_factor,
-    const void* __restrict__ q_norm,
-    const void* __restrict__ k_norm,
-    const float norm_eps,
-    const float norm_constant_bias,
-    const bool inv_freq_table,
-    const int inv_freq_stride,
-    const float llama_4_scaling_beta,
-    const int llama_4_scaling_original,
-    int position_ids_stride,
-    int rotate_dims,
-    int rotate_offset)
-{
-    int batch = blockIdx.y;
-    int token_pos = blockIdx.x;
-    int t = threadIdx.x;
-    int t_head = threadIdx.y;
-
-    auto get_pos = [&] (int rdim) -> int {
-        int pos = token_pos + position;
-        if (positions)
-            pos = token_pos + positions[batch];
-        else if (position_ids) {
-            int idx = (batch * seq_len + token_pos) * position_ids_stride;
-            if (position_ids_stride > 1) idx += rdim;
-            pos = position_ids[idx];
-        }
-        return pos;
-    };
-
-    auto get_sincos = [&] (int rdim, float& sin, float& cos) {
-        int pos = get_pos(rdim);
-        if (!inv_freq_table) {
-            float fr = inv_freq[t];
-            float pf = __int2float_rn(pos);
-            sin = __sinf(fr * pf) * attn_factor;
-            cos = __cosf(fr * pf) * attn_factor;
-        } else {
-            float fr = inv_freq[batch * inv_freq_stride + pos * partial_head_dim / 2 + t];
-            sin = __sinf(fr) * attn_factor;
-            cos = __cosf(fr) * attn_factor;
-        }
-    };
-
-    // Llama 4 scaling: position-dependent scale on the full query head, queries only.
-    float l4_scaling = 1.0f;
-    if (llama_4_scaling_beta > 0.0f)
-        l4_scaling = 1.0f + llama_4_scaling_beta * __logf(1.0f + (float) (get_pos(0) / llama_4_scaling_original));
-
-    float sin_cache[MAX_ROTATE_DIMS];
-    float cos_cache[MAX_ROTATE_DIMS];
-    if (t < partial_head_dim / 2) {
-        for (int rdim = 0; rdim < rotate_dims; ++rdim)
-            get_sincos(rdim, sin_cache[rdim], cos_cache[rdim]);
-    }
-
-    __shared__ half norm_head[MAX_NUM_THREADS * 2];
-    __shared__ float sums[MAX_NUM_THREADS / 32];
-
-    int head_dim_pad = (head_dim + 63) / 64 * 64;
-
-    for (int head_idx = blockIdx.z * blockDim.y + threadIdx.y;
-         head_idx < num_heads_q + num_heads_k;
-         head_idx += gridDim.z * blockDim.y) {
-        const half* g_head_in_ptr = nullptr;
-        half* g_head_out_ptr = nullptr;
-        const void* norm_weight = nullptr;
-        if (head_idx < num_heads_q) {
-            g_head_in_ptr = q + ((batch * seq_len + token_pos) * num_heads_q + head_idx) * q_head_stride;
-            g_head_out_ptr = out_q + ((batch * seq_len + token_pos) * num_heads_q + head_idx) * q_head_stride;
-            norm_weight = q_norm;
-        } else if (head_idx < num_heads_q + num_heads_k) {
-            g_head_in_ptr = k + ((batch * seq_len + token_pos) * num_heads_k + head_idx - num_heads_q) * k_head_stride;
-            g_head_out_ptr = out_k + ((batch * seq_len + token_pos) * num_heads_k + head_idx - num_heads_q) * k_head_stride;
-            norm_weight = k_norm;
-        }
-
-        half* sh_head = norm_head + t_head * head_dim_pad;
-        auto load_head = [&] () {
-            if (t < head_dim / 2)
-                ((half2*) sh_head)[t] = ((half2*) g_head_in_ptr)[t];
-            else
-                ((half2*) sh_head)[t] = {};
-            __syncthreads();
-        };
-        auto store_head = [&] () {
-            if (t < head_dim / 2)
-                ((half2*) g_head_out_ptr)[t] = ((half2*) sh_head)[t];
-            __syncthreads();
-        };
-
-        auto apply_rope = [&] () {
-            for (int rdim = 0; rdim < rotate_dims; ++rdim) {
-                int offset = rotate_offset + partial_head_dim * rdim;
-                if (t < partial_head_dim / 2) {
-                    float sin = sin_cache[rdim];
-                    float cos = cos_cache[rdim];
-
-                    if constexpr (rope_mode == ROPESTYLE_NEOX) {
-                        float v1 = __half2float(sh_head[offset + t]);
-                        float v2 = __half2float(sh_head[offset + t + partial_head_dim / 2]);
-                        float r1 = v1 * cos - v2 * sin;
-                        float r2 = v2 * cos + v1 * sin;
-                        sh_head[offset + t] = __float2half_rn(r1);
-                        sh_head[offset + t + partial_head_dim / 2] = __float2half_rn(r2);
-                    } else if constexpr (rope_mode == ROPESTYLE_GPTJ) {
-                        half2* tptr = (half2*) (sh_head + offset + t * 2);
-                        half2 v = *tptr;
-                        float v1 = __low2float(v);
-                        float v2 = __high2float(v);
-                        float r1 = v1 * cos - v2 * sin;
-                        float r2 = v2 * cos + v1 * sin;
-                        v = __floats2half2_rn(r1, r2);
-                        *tptr = v;
-                    }
-                }
-            }
-            __syncthreads();
-        };
-
-        auto apply_norm = [&] () {
-            half2* tptr = (half2*) (sh_head + t * 2);
-            int lane_id = threadIdx.x % 32;
-            int warp_id = threadIdx.x / 32;
-            int warps = blockDim.x / 32;
-
-            half2 v = *tptr;
-            float v1 = __low2float(v);
-            float v2 = __high2float(v);
-            float sum = v1 * v1 + v2 * v2;
-            sum = warp_reduce_sum_f(sum);
-            if (lane_id == 0) sums[warps * t_head + warp_id] = sum;
-            __syncthreads();
-
-            sum = sums[warps * t_head];
-            for (int i = 1; i < warps; ++i) sum += sums[warps * t_head + i];
-
-            float rmf = rsqrtf(sum / (float) head_dim + norm_eps);
-            v1 *= rmf;
-            v2 *= rmf;
-
-            // Lanes past head_dim / 2 hold padding and must not read the weight.
-            if (t * 2 < head_dim) {
-                if constexpr (norm_bf16) {
-                    bfloat162* wptr = (bfloat162*) (((bfloat16*) norm_weight) + t * 2);
-                    float2 w = __bfloat1622float2(*wptr);
-                    w.x += norm_constant_bias;
-                    w.y += norm_constant_bias;
-                    v1 *= w.x;
-                    v2 *= w.y;
-                    v = __floats2half2_rn(v1, v2);
-                } else {
-                    half2 norm_constant_bias_h2 = __float2half2_rn(norm_constant_bias);
-                    half2* wptr = (half2*) (((half*) norm_weight) + t * 2);
-                    half2 w = __hadd2(*wptr, norm_constant_bias_h2);
-                    v = __floats2half2_rn(v1, v2);
-                    v = __hmul2(w, v);
-                }
-                *tptr = v;
-            }
-            __syncthreads();
-        };
-
-        // Whole block must call this (blockDim.y walks q and k together). K heads scale by 1.
-        auto apply_l4_scaling = [&] (float scaling) {
-            if (t < head_dim / 2) {
-                half2* tptr = ((half2*) sh_head) + t;
-                half2 v = *tptr;
-                *tptr = __floats2half2_rn(__low2float(v) * scaling, __high2float(v) * scaling);
-            }
-            __syncthreads();
-        };
-
-        load_head();
-        if (q_norm) apply_norm();
-        apply_rope();
-        if (l4_scaling != 1.0f) apply_l4_scaling(head_idx < num_heads_q ? l4_scaling : 1.0f);
-        store_head();
-    }
-}
+// rope_kernel (and rope.cu's MAX_NUM_THREADS / MAX_ROTATE_DIMS) is the fork's,
+// extracted at build time (build.rs FORK_EXTRACTS).
+#include "fork/rope_kernel.cuh"
 
 extern "C" int berth_attn_rope(
     const void* q,

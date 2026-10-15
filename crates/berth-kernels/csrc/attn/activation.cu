@@ -4,8 +4,8 @@
 // include guard, and the MLP kernels include it at global scope. The include
 // is inside a namespace so the __global__ symbols do not collide at link.
 // deinterleave_qg_kernel is defined in activation.cu (it includes ATen), so
-// the device function is transcribed here. NUM_THREADS is 256, matching
-// activation.cu.
+// build.rs extracts it into OUT_DIR/fork/deinterleave_qg.cuh. NUM_THREADS is
+// 256, matching activation.cu.
 
 #include "attn/error.h"
 #include "check.cuh"
@@ -48,24 +48,12 @@ namespace berth_attn_act {
 
 }  // namespace berth_attn_act
 
-// activation.cu: per head, qg is [q head_dim | g head_dim]. uint4 covers 8 halves.
-
-__global__ __launch_bounds__(256)
-void berth_deinterleave_qg_kernel(
-    const uint4* __restrict__ qg,
-    uint4* __restrict__ q,
-    uint4* __restrict__ g,
-    const int hd8,
-    const size_t n8)
-{
-    size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x;
-    if (i >= n8) return;
-    size_t d = i % hd8;
-    size_t h = i / hd8;
-    size_t src = h * 2 * hd8 + d;
-    q[i] = qg[src];
-    g[i] = qg[src + hd8];
-}
+// activation.cu: per head, qg is [q head_dim | g head_dim]. uint4 covers 8
+// halves. The kernel is the fork's, extracted at build time (build.rs
+// FORK_EXTRACTS); its __launch_bounds__ names NUM_THREADS, 256 in activation.cu.
+#define NUM_THREADS 256
+#include "fork/deinterleave_qg.cuh"
+#undef NUM_THREADS
 
 extern "C" int berth_attn_deinterleave_qg(
     const void* qg,
@@ -85,7 +73,7 @@ extern "C" int berth_attn_deinterleave_qg(
         int hd8 = head_dim / 8;
         size_t n8 = (size_t) q_numel / 8;
         size_t blocks = (n8 + 256 - 1) / 256;
-        berth_deinterleave_qg_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(
+        deinterleave_qg_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(
             (const uint4*) qg,
             (uint4*) q,
             (uint4*) g,

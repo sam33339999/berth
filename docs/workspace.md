@@ -73,7 +73,13 @@ cuda-core 自己寫明是早期研究專案，API 會改。`berth-cuda` 是隔�
 
 檢查 tree hash，不檢查 commit。fork 只改 Python 時（例如 `355c6ee` 到 `dc0e608` 加了 MiniCPM-V 4.7），kernel 沒變，照常 build。
 
-shim 放在 `crates/berth-kernels` 裡，只 include fork 的 `.cuh`。fork 外層吃 `at::Tensor` 的 launcher 不編進來。
+shim 放在 `crates/berth-kernels` 裡，只 include fork 的 `.cuh`。fork 外層吃 `at::Tensor` 的 launcher 不編進來，launcher 在 `csrc/` 裡自己寫。
+
+有些 kernel 本體不在 `.cuh` 裡，而是和 ATen 寫在同一個 `.cu`：GDN 的五支（`gdn.cu`）、`rms_norm_kernel` 和 `gated_rms_norm_kernel`（`norm.cu`）、`deinterleave_qg_kernel`（`activation.cu`）、`rope_kernel`（`rope.cu`）。這些由 `build.rs` 的 `FORK_EXTRACTS` 照行號從 fork 讀出來，寫成 `OUT_DIR/fork/*.cuh`，`csrc/` 再 include 那幾個檔。repo 裡不存 fork 的程式碼，也不重寫 fork 已經有的 kernel。
+
+行號以 tree `de35ffb` 為準。每一段都要含一個指定的字串，行號錯了 build 就停；tree hash 一變也停，那時要重對行號。產生的檔案每段前面有 `#line`，編譯錯誤會指回 fork 原檔。
+
+`csrc/` 自己寫的 kernel 只有兩支，都是 fork 沒有對應 kernel 的：fp32 殘差相加（fork 用 ATen 的 `x += y`）和 bf16 embedding 查表（fork 用 `nn.Embedding`）。
 
 ## Triton cubin
 
