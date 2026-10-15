@@ -101,4 +101,3 @@ shim 放在 `crates/berth-kernels` 裡，只 include fork 的 `.cuh`。fork 外�
 ## 純 Rust 四個的待辦
 
 - `berth-repetition`：原樣重複每長一輪送一條 `64x2`、`64x3`……，長迴圈可能把 64 條標記用完，之後的尾端標記送不出去。這是照 [repetition.md](repetition.md) 字面寫的，要不要改還沒定
-- `berth-cache`：驅逐時「斷掉的鏈」那段沒有專門的測試。要補一個和 Python 頁表並排跑的對照測試
