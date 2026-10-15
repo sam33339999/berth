@@ -7,4 +7,9 @@ publish.workspace = true
 description = "exllamav3 kernel bindings for the berth runtime"
 
 [dependencies]
+berth-cuda = { path = "../berth-cuda" }
 thiserror.workspace = true
+
+[dev-dependencies]
+berth-exl3 = { path = "../berth-exl3" }
+serde_json = "1"

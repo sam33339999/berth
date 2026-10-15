@@ -1,0 +1,1029 @@
+{
+  "target": "/home/sam/qwen38-exl3-dflash2/models/qwen38-27b-exl3",
+  "fork_commit": "e0c7fe623304df3acf8fe40bcdbaf96e65cf0c88",
+  "ext_tree": "de35ffbe336bdc6d617e49e208cd7c730a789787",
+  "torch": "2.13.0+cu130",
+  "token": 32,
+  "token_text": "A",
+  "argmax_token": 220,
+  "names": [
+    "embedding",
+    "block_00_mixer_in",
+    "block_00_mixer",
+    "block_00_mlp_in",
+    "block_00_mlp",
+    "block_00",
+    "block_01",
+    "block_02",
+    "block_03_mixer_in",
+    "block_03_mixer",
+    "block_03_mlp_in",
+    "block_03_mlp",
+    "block_03",
+    "block_04",
+    "block_05",
+    "block_06",
+    "block_07",
+    "block_08",
+    "block_09",
+    "block_10",
+    "block_11",
+    "block_12",
+    "block_13",
+    "block_14",
+    "block_15",
+    "block_16",
+    "block_17",
+    "block_18",
+    "block_19",
+    "block_20",
+    "block_21",
+    "block_22",
+    "block_23",
+    "block_24",
+    "block_25",
+    "block_26",
+    "block_27",
+    "block_28",
+    "block_29",
+    "block_30",
+    "block_31",
+    "block_32",
+    "block_33",
+    "block_34",
+    "block_35",
+    "block_36",
+    "block_37",
+    "block_38",
+    "block_39",
+    "block_40",
+    "block_41",
+    "block_42",
+    "block_43",
+    "block_44",
+    "block_45",
+    "block_46",
+    "block_47",
+    "block_48",
+    "block_49",
+    "block_50",
+    "block_51",
+    "block_52",
+    "block_53",
+    "block_54",
+    "block_55",
+    "block_56",
+    "block_57",
+    "block_58",
+    "block_59",
+    "block_60",
+    "block_61",
+    "block_62",
+    "block_63",
+    "final_norm",
+    "logits"
+  ],
+  "tensors": [
+    {
+      "name": "embedding",
+      "file": "embedding.bin",
+      "key": "model.language_model.embed_tokens",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_00_mixer_in",
+      "file": "block_00_mixer_in.bin",
+      "key": "model.language_model.layers.0.input_layernorm",
+      "dtype": "float16",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 10240
+    },
+    {
+      "name": "block_00_mixer",
+      "file": "block_00_mixer.bin",
+      "key": "model.language_model.layers.0.linear_attn",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_00_mlp_in",
+      "file": "block_00_mlp_in.bin",
+      "key": "model.language_model.layers.0.post_attention_layernorm",
+      "dtype": "float16",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 10240
+    },
+    {
+      "name": "block_00_mlp",
+      "file": "block_00_mlp.bin",
+      "key": "model.language_model.layers.0.mlp",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_00",
+      "file": "block_00.bin",
+      "key": "model.language_model.layers.0",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_01",
+      "file": "block_01.bin",
+      "key": "model.language_model.layers.1",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_02",
+      "file": "block_02.bin",
+      "key": "model.language_model.layers.2",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_03_mixer_in",
+      "file": "block_03_mixer_in.bin",
+      "key": "model.language_model.layers.3.input_layernorm",
+      "dtype": "float16",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 10240
+    },
+    {
+      "name": "block_03_mixer",
+      "file": "block_03_mixer.bin",
+      "key": "model.language_model.layers.3.self_attn",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_03_mlp_in",
+      "file": "block_03_mlp_in.bin",
+      "key": "model.language_model.layers.3.post_attention_layernorm",
+      "dtype": "float16",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 10240
+    },
+    {
+      "name": "block_03_mlp",
+      "file": "block_03_mlp.bin",
+      "key": "model.language_model.layers.3.mlp",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_03",
+      "file": "block_03.bin",
+      "key": "model.language_model.layers.3",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_04",
+      "file": "block_04.bin",
+      "key": "model.language_model.layers.4",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_05",
+      "file": "block_05.bin",
+      "key": "model.language_model.layers.5",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_06",
+      "file": "block_06.bin",
+      "key": "model.language_model.layers.6",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_07",
+      "file": "block_07.bin",
+      "key": "model.language_model.layers.7",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_08",
+      "file": "block_08.bin",
+      "key": "model.language_model.layers.8",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_09",
+      "file": "block_09.bin",
+      "key": "model.language_model.layers.9",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_10",
+      "file": "block_10.bin",
+      "key": "model.language_model.layers.10",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_11",
+      "file": "block_11.bin",
+      "key": "model.language_model.layers.11",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_12",
+      "file": "block_12.bin",
+      "key": "model.language_model.layers.12",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_13",
+      "file": "block_13.bin",
+      "key": "model.language_model.layers.13",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_14",
+      "file": "block_14.bin",
+      "key": "model.language_model.layers.14",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_15",
+      "file": "block_15.bin",
+      "key": "model.language_model.layers.15",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_16",
+      "file": "block_16.bin",
+      "key": "model.language_model.layers.16",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_17",
+      "file": "block_17.bin",
+      "key": "model.language_model.layers.17",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_18",
+      "file": "block_18.bin",
+      "key": "model.language_model.layers.18",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_19",
+      "file": "block_19.bin",
+      "key": "model.language_model.layers.19",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_20",
+      "file": "block_20.bin",
+      "key": "model.language_model.layers.20",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_21",
+      "file": "block_21.bin",
+      "key": "model.language_model.layers.21",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_22",
+      "file": "block_22.bin",
+      "key": "model.language_model.layers.22",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_23",
+      "file": "block_23.bin",
+      "key": "model.language_model.layers.23",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_24",
+      "file": "block_24.bin",
+      "key": "model.language_model.layers.24",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_25",
+      "file": "block_25.bin",
+      "key": "model.language_model.layers.25",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_26",
+      "file": "block_26.bin",
+      "key": "model.language_model.layers.26",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_27",
+      "file": "block_27.bin",
+      "key": "model.language_model.layers.27",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_28",
+      "file": "block_28.bin",
+      "key": "model.language_model.layers.28",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_29",
+      "file": "block_29.bin",
+      "key": "model.language_model.layers.29",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_30",
+      "file": "block_30.bin",
+      "key": "model.language_model.layers.30",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_31",
+      "file": "block_31.bin",
+      "key": "model.language_model.layers.31",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_32",
+      "file": "block_32.bin",
+      "key": "model.language_model.layers.32",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_33",
+      "file": "block_33.bin",
+      "key": "model.language_model.layers.33",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_34",
+      "file": "block_34.bin",
+      "key": "model.language_model.layers.34",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_35",
+      "file": "block_35.bin",
+      "key": "model.language_model.layers.35",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_36",
+      "file": "block_36.bin",
+      "key": "model.language_model.layers.36",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_37",
+      "file": "block_37.bin",
+      "key": "model.language_model.layers.37",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_38",
+      "file": "block_38.bin",
+      "key": "model.language_model.layers.38",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_39",
+      "file": "block_39.bin",
+      "key": "model.language_model.layers.39",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_40",
+      "file": "block_40.bin",
+      "key": "model.language_model.layers.40",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_41",
+      "file": "block_41.bin",
+      "key": "model.language_model.layers.41",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_42",
+      "file": "block_42.bin",
+      "key": "model.language_model.layers.42",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_43",
+      "file": "block_43.bin",
+      "key": "model.language_model.layers.43",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_44",
+      "file": "block_44.bin",
+      "key": "model.language_model.layers.44",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_45",
+      "file": "block_45.bin",
+      "key": "model.language_model.layers.45",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_46",
+      "file": "block_46.bin",
+      "key": "model.language_model.layers.46",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_47",
+      "file": "block_47.bin",
+      "key": "model.language_model.layers.47",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_48",
+      "file": "block_48.bin",
+      "key": "model.language_model.layers.48",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_49",
+      "file": "block_49.bin",
+      "key": "model.language_model.layers.49",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_50",
+      "file": "block_50.bin",
+      "key": "model.language_model.layers.50",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_51",
+      "file": "block_51.bin",
+      "key": "model.language_model.layers.51",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_52",
+      "file": "block_52.bin",
+      "key": "model.language_model.layers.52",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_53",
+      "file": "block_53.bin",
+      "key": "model.language_model.layers.53",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_54",
+      "file": "block_54.bin",
+      "key": "model.language_model.layers.54",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_55",
+      "file": "block_55.bin",
+      "key": "model.language_model.layers.55",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_56",
+      "file": "block_56.bin",
+      "key": "model.language_model.layers.56",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_57",
+      "file": "block_57.bin",
+      "key": "model.language_model.layers.57",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_58",
+      "file": "block_58.bin",
+      "key": "model.language_model.layers.58",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_59",
+      "file": "block_59.bin",
+      "key": "model.language_model.layers.59",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_60",
+      "file": "block_60.bin",
+      "key": "model.language_model.layers.60",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_61",
+      "file": "block_61.bin",
+      "key": "model.language_model.layers.61",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_62",
+      "file": "block_62.bin",
+      "key": "model.language_model.layers.62",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "block_63",
+      "file": "block_63.bin",
+      "key": "model.language_model.layers.63",
+      "dtype": "float32",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 20480
+    },
+    {
+      "name": "final_norm",
+      "file": "final_norm.bin",
+      "key": "model.language_model.norm",
+      "dtype": "float16",
+      "shape": [
+        1,
+        1,
+        5120
+      ],
+      "bytes": 10240
+    },
+    {
+      "name": "logits",
+      "file": "logits.bin",
+      "key": "lm_head",
+      "dtype": "float16",
+      "shape": [
+        1,
+        1,
+        248320
+      ],
+      "bytes": 496640
+    }
+  ],
+  "total_bytes": 1960960,
+  "env": {
+    "EXL3_INT8_GEMV": "2",
+    "EXL3_INT8_GEMV_MAX_K": "5",
+    "EXL3_QC_STAGING": "1",
+    "EXL3_HGEMM_F16ACC": "auto"
+  },
+  "cache": {
+    "layer_type": "CacheLayer_quant",
+    "k_bits": 3,
+    "v_bits": 3,
+    "max_batch_size": 1,
+    "max_num_tokens": 4096,
+    "draft": false
+  },
+  "position": 0,
+  "cache_seqlens": [
+    0
+  ],
+  "positions": [
+    0
+  ],
+  "path": {
+    "saved_step": "BC CUDA graph replay",
+    "bc_calls_before_saved_step": 2,
+    "mixers": {
+      "block_0": "BC_GatedDeltaNetSplit::run_bszN",
+      "block_3": "BC_Attention::run",
+      "mlp": "BC_GatedMLP::run_bszN"
+    },
+    "layers_entered_bc": {
+      "gdn": 48,
+      "attn": 16,
+      "mlp": 64
+    },
+    "eager_warmup_bit_identical": true,
+    "replay_repeat_bit_identical": true,
+    "eager_warmup_differences": [],
+    "replay_repeat_differences": [],
+    "note": "Calls 1 and 2 of each (bsz=1, q_len=1) slot were discarded one-token decodes at position 0 (eager _gr warmup, then CUDA graph capture+launch). The files are call 3, graph replay only. Embedding, RMSNorm, residual add, and lm_head are direct launches outside those graphs. Activation clones run after each wrapped forward returns and are not inside the capture."
+  }
+}

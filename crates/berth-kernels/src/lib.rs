@@ -30,8 +30,11 @@
 //! not applied; the 27B language-model linears have none, and the reference
 //! outputs match the kernel output.
 
+pub mod attn;
 mod error;
 mod ffi;
+pub mod gdn;
+pub mod ops;
 
 pub use error::{Error, Result};
 

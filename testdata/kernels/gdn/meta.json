@@ -1,0 +1,96 @@
+{
+  "shapes": {
+    "hidden": 5120,
+    "num_k_heads": 16,
+    "num_v_heads": 48,
+    "head_dim": 128,
+    "f": 10240,
+    "ba_n": 96,
+    "conv_k": 4,
+    "beta_scale": 1.0,
+    "epsilon": 1e-06,
+    "constant_bias": 0.0,
+    "w_groups": 1,
+    "gate_first": 0,
+    "gate_act": 0,
+    "history_stride": 1,
+    "bsz": 1,
+    "seqlen": 1
+  },
+  "launches": {
+    "ba": "gdn_ba_gemv_kernel grid=12x1x1 block=256x1x1 smem=0",
+    "fused": "gated_delta_net_fused_op_3_kernel<bf16> grid=41x1x1 block=256x1x1 smem=0",
+    "conv": "conv1d_update_kernel<1,0> grid=40x1x1 block=256x1x1 smem=0",
+    "recurrent": "cuda_recurrent_gated_delta_rule_kernel_128<0,4,0> grid=1x48x4 block=128x4x1 smem=0",
+    "rms": "gated_rms_norm_kernel<32,half,bf16,float> grid=48x1x1 block=32x1x1 smem=0"
+  },
+  "torch_seed": 1835938119,
+  "lcg": {
+    "seed": 1835938119,
+    "count": 786432,
+    "prefix_hex": "fabd18bf11354cbf3c6b1bbf6b4d69bfce8313bfd5b80e3f3034203fcfb90cbf",
+    "sha256": "844a1994fb1c3d64275cb9775cbdfbb23053366b9325343298c7f9585a6d1418",
+    "algorithm": "x = seed; x = x*1664525+1013904223 mod 2^32; bits = (x & 0x007fffff) | 0x3f000000; if x & 0x100: bits |= 0x80000000; store le u32"
+  },
+  "zero": {
+    "slots": null,
+    "conv_state": "zeros",
+    "recurrent_state": "zeros",
+    "recurrent_sha256": "63ce4ade68213b1cf84e5288fcbc34ddab0bcb67566603953b21006a81340146"
+  },
+  "nonzero": {
+    "slots": [
+      0
+    ],
+    "conv_state": "conv_state_nz.bin",
+    "recurrent_state": "lcg",
+    "recurrent_sha256": "7b437a9846ffd8ab7c88d2063f59d1e5d30b08b57e33125b378e5bf004f761ff"
+  },
+  "bytes": {
+    "w_ba.bin": 983040,
+    "x_ba.bin": 10240,
+    "bias_ba.bin": 192,
+    "y_ba.bin": 384,
+    "y_ba_bias.bin": 384,
+    "qkv.bin": 40960,
+    "dt_bias.bin": 96,
+    "a_log.bin": 96,
+    "mixed_qkv.bin": 20480,
+    "beta.bin": 96,
+    "g.bin": 192,
+    "w_conv.bin": 81920,
+    "conv_state_nz.bin": 81920,
+    "conv_out_zero.bin": 20480,
+    "conv_state_zero_out.bin": 81920,
+    "conv_out_nz.bin": 20480,
+    "conv_state_nz_out.bin": 81920,
+    "core_zero.bin": 12288,
+    "core_nz.bin": 12288,
+    "w_norm.bin": 256,
+    "z.bin": 24576,
+    "y_rms_zero.bin": 12288,
+    "y_rms_nz.bin": 12288,
+    "slots_nz.bin": 4
+  },
+  "total_bytes": 1498788,
+  "fused_op_3": "No Python binding. mixed_qkv is qkv.transpose(1, 2).contiguous().to(bfloat16) (rn cast). beta and g are ext.gated_delta_net_fused_op_2 on b=ba[...,:H], a=ba[...,H:], same __expf / softplus / __float2bfloat16_rn as fused_op_3.",
+  "fork_ops": {
+    "y_ba": "ext.gdn_ba_gemv",
+    "y_ba_bias": "ext.gdn_ba_gemv",
+    "mixed_qkv": "torch transpose + bf16 cast (fused_op_3 substitute)",
+    "beta": "ext.gated_delta_net_fused_op_2",
+    "g": "ext.gated_delta_net_fused_op_2",
+    "conv": "ext.cuda_causal_conv1d_update(..., activation=True, history=False)",
+    "recurrent": "ext.cuda_recurrent_gated_delta_rule(..., history=False)",
+    "rms": "ext.gated_rms_norm"
+  },
+  "checkpoint": {
+    "w_ba": "cat of linear_attn.in_proj_b.weight and in_proj_a.weight as [96, 5120] fp16, b then a. No bias in the checkpoint; bias_ba.bin is an extra case.",
+    "dt_bias": "linear_attn.dt_bias bf16 [48]",
+    "a_log": "linear_attn.A_log bf16 [48]",
+    "w_conv": "linear_attn.conv1d.weight bf16 [10240, 1, 4] squeezed to [10240, 4]. No conv1d.bias.",
+    "w_norm": "linear_attn.norm.weight bf16 [128], w_groups=1",
+    "conv_state": "bf16 [num_slots, 10240, state_size]. Cache is [max_batch, F, conv_k + max_history]. history=false uses the first conv_k taps.",
+    "recurrent_state": "f32 [num_slots, history_stride, 48, 128, 128], k-major. history=false uses history index 0. Not stored; input is the LCG, updated state is sha256."
+  }
+}

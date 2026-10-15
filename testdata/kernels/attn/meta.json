@@ -1,0 +1,113 @@
+{
+  "seed": 20261015,
+  "sm_count": 82,
+  "programs": 4,
+  "splits_cap": 41,
+  "n_q_heads": 24,
+  "n_kv_heads": 4,
+  "head_dim": 256,
+  "page_size": 256,
+  "rotary_dim": 64,
+  "rope_theta": 10000000.0,
+  "norm_eps": 1e-06,
+  "norm_constant_bias": 1.0,
+  "attn_factor": 1.0,
+  "compand_a": 0.0,
+  "token_dim": 1024,
+  "shared": {
+    "h32": "h32.bin",
+    "inv_freq": "inv_freq.bin",
+    "q_norm": "q_norm.bin",
+    "k_norm": "k_norm.bin"
+  },
+  "deinterleave": {
+    "qg": "deinterleave_qg.bin",
+    "q": "deinterleave_q.bin",
+    "g": "deinterleave_g.bin",
+    "head_dim": 256,
+    "q_numel": 6144
+  },
+  "rope": {
+    "q_in": "rope_q_in.bin",
+    "k_in": "rope_k_in.bin",
+    "q_out": "rope_q_out.bin",
+    "k_out": "rope_k_out.bin",
+    "position": 300
+  },
+  "mul_sigmoid": {
+    "x_in": "mul_x_in.bin",
+    "y": "mul_y.bin",
+    "x_out": "mul_x_out.bin",
+    "numel": 6144
+  },
+  "quant": {
+    "k_in": "quant_k_in.bin",
+    "v_in": "quant_v_in.bin",
+    "k_pages": "quant_k_pages.bin",
+    "v_pages": "quant_v_pages.bin",
+    "k_scales": "quant_k_scales.bin",
+    "v_scales": "quant_v_scales.bin",
+    "seq_len": 300,
+    "blocks_per_seq": 2,
+    "block_table": [
+      0,
+      1
+    ],
+    "cache_seqlens": [
+      0
+    ],
+    "num_pages": 2
+  },
+  "core_empty": {
+    "qg": "core_empty_qg.bin",
+    "k": "core_empty_k.bin",
+    "v": "core_empty_v.bin",
+    "o": "core_empty_o.bin",
+    "k_pages": "core_empty_k_pages.bin",
+    "v_pages": "core_empty_v_pages.bin",
+    "k_scales": "core_empty_k_scales.bin",
+    "v_scales": "core_empty_v_scales.bin",
+    "position": 0,
+    "cache_seqlens": [
+      0
+    ],
+    "block_table": [
+      0
+    ],
+    "bt_width": 1,
+    "num_pages": 1,
+    "num_splits": 3,
+    "split_len": 96,
+    "k_pages_in": null,
+    "v_pages_in": null,
+    "k_scales_in": null,
+    "v_scales_in": null
+  },
+  "core_cached": {
+    "qg": "core_cached_qg.bin",
+    "k": "core_cached_k.bin",
+    "v": "core_cached_v.bin",
+    "o": "core_cached_o.bin",
+    "k_pages": "core_cached_k_pages.bin",
+    "v_pages": "core_cached_v_pages.bin",
+    "k_scales": "core_cached_k_scales.bin",
+    "v_scales": "core_cached_v_scales.bin",
+    "position": 300,
+    "cache_seqlens": [
+      300
+    ],
+    "block_table": [
+      0,
+      1
+    ],
+    "bt_width": 2,
+    "num_pages": 2,
+    "num_splits": 5,
+    "split_len": 128,
+    "k_pages_in": "quant_k_pages.bin",
+    "v_pages_in": "quant_v_pages.bin",
+    "k_scales_in": "quant_k_scales.bin",
+    "v_scales_in": "quant_v_scales.bin"
+  },
+  "paged_attn": "triton.compile of _paged_attn_decode_split_kernel and _paged_attn_decode_combine_kernel with the build_triton_cubins.py constexprs (FINAL false). Cubin bytes match target/triton-cubins/. ext.TritonKernel is constructible; TritonKernel.launch is not a Python binding. The saved outputs are cuLaunchKernel of that image with TritonKernel's argument layout, checked equal to CompiledKernel."
+}

@@ -2,3 +2,4 @@
 ptx/out/
 **/*.cubin
 **/*.o
+__pycache__/

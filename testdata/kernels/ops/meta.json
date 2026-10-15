@@ -1,0 +1,125 @@
+{
+  "hidden": 5120,
+  "intermediate": 17408,
+  "vocab": 248320,
+  "epsilon_f32_bits": 897988541,
+  "constant_bias": 1.0,
+  "constant_scale": 1.0,
+  "seed": 41616661,
+  "x_file": "mgemm.x.bin",
+  "mgemm": [
+    {
+      "name": "gdn_l0",
+      "out_dtype": "float32",
+      "c_fp32": 1,
+      "width": 2048,
+      "slices": 8,
+      "sources": 2,
+      "k_bits": 4,
+      "prefixes": [
+        "model.language_model.layers.0.linear_attn.in_proj_qkv",
+        "model.language_model.layers.0.linear_attn.in_proj_z"
+      ],
+      "out_files": [
+        "gdn_l0.qkv.bin",
+        "gdn_l0.z.bin"
+      ],
+      "out_elems": [
+        10240,
+        6144
+      ],
+      "kernel": "exl3_mgemm_kernel<4,1,2,16,16,512,4,3> block=256 grid=10x1x8 smem=92160",
+      "reference": "ext.exl3_mgemm, SlicedMultiLinear of in_proj_qkv and in_proj_z"
+    },
+    {
+      "name": "attn_l3",
+      "out_dtype": "float16",
+      "c_fp32": 0,
+      "width": 1024,
+      "slices": 14,
+      "sources": 3,
+      "k_bits": 4,
+      "prefixes": [
+        "model.language_model.layers.3.self_attn.q_proj",
+        "model.language_model.layers.3.self_attn.k_proj",
+        "model.language_model.layers.3.self_attn.v_proj"
+      ],
+      "out_files": [
+        "attn_l3.q.bin",
+        "attn_l3.k.bin",
+        "attn_l3.v.bin"
+      ],
+      "out_elems": [
+        12288,
+        1024,
+        1024
+      ],
+      "kernel": "exl3_mgemm_kernel<4,0,2,16,16,512,4,3> block=256 grid=10x1x8 smem=92160",
+      "reference": "ext.exl3_mgemm, SlicedMultiLinear of q_proj, k_proj, v_proj, before deinterleave_qg"
+    }
+  ],
+  "norms": [
+    {
+      "name": "input_layernorm",
+      "kind": "none",
+      "weight": "model.language_model.layers.0.input_layernorm.weight",
+      "x": "norm.x.bin",
+      "y": "norm_input.y.bin",
+      "kernel": "rms_norm_kernel<0,float,half,bfloat16,float> block=1024 grid=1",
+      "reference": "ext.rms_norm"
+    },
+    {
+      "name": "final",
+      "kind": "none",
+      "weight": "model.language_model.norm.weight",
+      "x": "norm.x.bin",
+      "y": "norm_final.y.bin",
+      "kernel": "rms_norm_kernel<0,float,half,bfloat16,float> block=1024 grid=1",
+      "reference": "ext.rms_norm"
+    },
+    {
+      "name": "post_attention",
+      "kind": "res_in",
+      "weight": "model.language_model.layers.0.post_attention_layernorm.weight",
+      "x": "norm_res.x.bin",
+      "residual": "norm_res.r.bin",
+      "y": "norm_res.y.bin",
+      "residual_out": "norm_res.r_out.bin",
+      "kernel": "rms_norm_kernel<2,float,half,bfloat16,float> block=1024 grid=1",
+      "reference": "ext.rms_norm_res_in"
+    }
+  ],
+  "silu": {
+    "numel": 17408,
+    "act_limit": 0.0,
+    "gate": "silu.gate.bin",
+    "up": "silu.up.bin",
+    "out": "silu.out.bin",
+    "kernel": "act_mul_kernel_h<0> block=256 grid=34",
+    "reference": "ext.silu_mul"
+  },
+  "add": {
+    "n": 5120,
+    "a": "add.a.bin",
+    "b": "add.b.bin",
+    "c": "add.c.bin",
+    "kernel": "add_f32 block=256 grid=20",
+    "reference": "torch.add; no exllamav3_ext binding. TransformerBlock post-MLP x += y"
+  },
+  "embed": {
+    "weight": "model.language_model.embed_tokens.weight",
+    "hidden": 5120,
+    "token_ids": [
+      0,
+      1,
+      42,
+      1024,
+      248056,
+      248319
+    ],
+    "local_ids": "embed.ids.bin",
+    "out": "embed.out.bin",
+    "kernel": "embed_bf16_f32 block=256 grid=6",
+    "reference": "F.embedding(local_ids, gathered_rows).float(); no exllamav3_ext binding"
+  }
+}

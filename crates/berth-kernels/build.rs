@@ -54,11 +54,13 @@ fn main() {
     }
 
     let csrc = manifest.join("csrc");
-    let units = ["int8_sq.cu", "gemm_k6.cu", "autotune.cu", "linear.cu"];
+    // Every `.cu` under csrc/, recursively, sorted. One object per file;
+    // a file under a subdirectory (`csrc/gdn/x.cu`) becomes `gdn__x.o` in OUT_DIR.
+    let units = cuda_units(&csrc);
     let mut objects = Vec::new();
     let mut handles = Vec::new();
     for unit in units {
-        let obj = out_dir.join(unit).with_extension("o");
+        let obj = out_dir.join(unit.replace('/', "__")).with_extension("o");
         objects.push(obj.clone());
         let nvcc = nvcc.clone();
         let src_file = csrc.join(unit);
@@ -105,6 +107,26 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=stdc++");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", cuda_lib.display());
+}
+
+fn cuda_units(csrc: &Path) -> Vec<String> {
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<String>) {
+        let entries = std::fs::read_dir(dir)
+            .unwrap_or_else(|err| panic!("berth-kernels: cannot read {}: {err}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("csrc entry").path();
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else if path.extension().is_some_and(|ext| ext == "cu") {
+                let rel = path.strip_prefix(root).expect("under csrc");
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let mut units = Vec::new();
+    walk(csrc, csrc, &mut units);
+    units.sort();
+    units
 }
 
 fn exl3_src() -> PathBuf {
