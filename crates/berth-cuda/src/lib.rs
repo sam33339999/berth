@@ -29,7 +29,8 @@ pub use copy::DeviceCopy;
 pub use error::{Error, Result};
 pub use event::Event;
 pub use graph::{
-    Capture, Graph, ParamSlot, ParamUpdate, MAX_PARAM_BYTES, MAX_PARAM_INDEX, PARAM_END,
+    Capture, Graph, KernelNodeInfo, ParamSlot, ParamUpdate, MAX_PARAM_BYTES, MAX_PARAM_INDEX,
+    PARAM_END,
 };
 pub use module::{Cubin, Dim3, Function};
 pub use pinned::PinnedBuf;

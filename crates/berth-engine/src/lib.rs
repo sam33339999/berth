@@ -5,8 +5,11 @@
 //! Tests that touch the GPU run only with `BERTH_GPU_TESTS=1`.
 //! Spec: `docs/runtime.md`.
 //!
-//! Stage 1 step 5 is one eager decode step of the Qwen3.8-27B, checked block by
-//! block against `testdata/decode_ref/`. Graph capture comes after that.
+//! One eager decode step of the Qwen3.8-27B matches `testdata/decode_ref/`.
+//! After a warm-up step the kernel sequence in [`model::Model::decode_step`]
+//! only reads device memory: the token id, rope positions, and `cache_seqlens`
+//! are staged with async copies before those kernels. Graph capture of that
+//! sequence comes next.
 //!
 //! One block, as the fork's `TransformerBlock.forward` runs it at decode:
 //!

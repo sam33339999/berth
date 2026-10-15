@@ -132,8 +132,13 @@ TRITON_LIBCUDA_PATH=/usr/lib/x86_64-linux-gnu \
 
 ## 第 4 步留下的
 
-- `berth-cuda` 的 `Capture::record` 只記得到透過 `berth-cuda` 的 `Function` launch 的 kernel。`berth-kernels` 在 nvcc 編的程式裡用 runtime 直接 launch，那些節點現在記不到參數。第 5 步把整層捕捉成 graph 之前要補
 - `berth-kernels` 還不依賴 `berth-cuda`，吃的是原始指標和 stream handle。`berth-engine` 接起兩邊
 - `rms_norm_eps`（1e-6）在 `berth-engine` 的 `gdn.rs` 和 `model.rs` 裡寫死，因為 `berth-exl3` 的 `ModelConfig` 沒讀這個欄位。要加進 `ModelConfig`，改成從 config 讀
-- attention 的 Triton cubin 在 `berth-kernels/csrc/attn/triton_launch.cu` 自己用 `dlsym` 找 libcuda 來 launch，因為 `berth-cuda` 的 `Function` 不能設超過 48 KiB 的 dynamic shared memory。27B 的兩支都不到 48 KiB。要在 `berth-cuda` 補上這個屬性，再拿掉這支 launcher
-- 位置 1 之後的 decode 還沒有對照資料。`AttnLayer` 在位置 1 跑得完、輸出有限，但沒有和 fork 比過。要多錄幾個 token 的參考
+
+## 第 5 步的實測
+
+`testdata/decode_seq/` 是 fork 300 步 greedy decode 的參考（每步每個 block、final norm、logits 的 blake2b-256），跨過 256 token 的頁邊界。`crates/berth-engine/tests/decode_seq.rs` teacher-force 同一串 token，300 步全部一致。
+
+fork 的 attention split 數照 block table 的寬度算，不照實際長度。4096 token 的 cache 是 16 頁，300 步裡 `num_splits` 一直是 33、`split_len` 一直是 128。
+
+eager decode（`tests/decode_bench.rs`，64 步）是 26.25 ms/token，fork 加 CUDA graph 是 25.81 ms/token，差 1.7%。debug 和 release 一樣快，瓶頸在 GPU：CPU 非同步排 kernel，一直跑在 GPU 前面。graph 捕捉在自回歸 decode 最多省這 1.7%，先不做；等 DFlash2 草稿和驗證讓 kernel 變多變小時再做。`berth-cuda` 已經能找到並改 nvcc 程式 launch 的 graph 節點（`Graph::kernel_nodes`、`set_node_param`），每個 token 會變的值在 `Model::decode_step` 前已經用非同步複製放進 device memory，剩下要改節點參數的是 Triton split / combine 的 `num_splits`、`split_len` 和 num_pages。

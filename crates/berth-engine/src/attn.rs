@@ -18,7 +18,7 @@
 
 use std::path::Path;
 
-use berth_cuda::{ByteBuf, DeviceBuffer};
+use berth_cuda::{ByteBuf, DeviceBuffer, PinnedBuf};
 use berth_exl3::{Bitrate, Checkpoint, DType, HadamardScale};
 use berth_kernels::attn::{
     deinterleave_qg, mul_sigmoid, quant_cache_paged, rope, splits_cap, PagedDecode,
@@ -89,7 +89,27 @@ pub struct AttnLayer {
     k_scales: ByteBuf,
     v_scales: ByteBuf,
     block_table: ByteBuf,
+    /// int32 length before this token, for the standalone [`Self::forward`].
+    ///
+    /// [`Self::bind_sequence`] points the kernels at the model's shared word
+    /// instead. The fork reads one `cache_seqlens` tensor from every layer
+    /// (`BC_Attention::run_gr`).
     seqlens: ByteBuf,
+    /// u32 rope base for the standalone path. Same integer as `seqlens` on
+    /// this decode (no MRoPE offset). Ignored when `bound_positions` is set.
+    positions: ByteBuf,
+    /// Pinned source for [`Self::forward`]'s async copy into `seqlens`.
+    ///
+    /// One slot. The caller synchronizes `gpu.stream` before the next
+    /// `forward`, which is what the layer test's download does. A second
+    /// `forward` without that wait races this page.
+    seq_host: PinnedBuf<u8>,
+    /// Pinned source for the matching copy into `positions`.
+    pos_host: PinnedBuf<u8>,
+    /// Device address of the shared int32 `cache_seqlens`, when the model owns it.
+    bound_seqlens: Option<u64>,
+    /// Device address of the shared u32 rope `positions`.
+    bound_positions: Option<u64>,
     partial_o: ByteBuf,
     partial_ml: ByteBuf,
     o_proj: Exl3Linear,
@@ -318,6 +338,11 @@ impl AttnLayer {
             v_scales: gpu.zeroed(scale_bytes(num_pages_u, token_dim)?)?,
             block_table: upload_i32(gpu, &table)?,
             seqlens: gpu.zeroed(4)?,
+            positions: gpu.zeroed(4)?,
+            seq_host: PinnedBuf::zeroed(&gpu.ctx, 4)?,
+            pos_host: PinnedBuf::zeroed(&gpu.ctx, 4)?,
+            bound_seqlens: None,
+            bound_positions: None,
             partial_o: gpu.zeroed(
                 partial_o
                     .checked_mul(4)
@@ -332,11 +357,30 @@ impl AttnLayer {
         })
     }
 
+    /// Point rope and the cache kernels at device words the model stages.
+    ///
+    /// `seqlens` is one int32 (length before this token). `positions` is one
+    /// u32, the rope base. On this decode they are the same address: the
+    /// value is the position, and `rope.cu`'s `get_pos` reads
+    /// `positions[batch]` as `uint32_t` while `quant_cache_paged` reads the
+    /// same bits as the int32 length. The fork aliases them the same way
+    /// when there is no MRoPE offset (`modules/attn.py`, `positions =
+    /// cache_seqlens`).
+    pub(crate) fn bind_sequence(&mut self, seqlens: u64, positions: u64) {
+        self.bound_seqlens = Some(seqlens);
+        self.bound_positions = Some(positions);
+    }
+
     /// `output = self_attn(input)` for the token at `position` (0-based; the
     /// cache holds `position` earlier tokens), writing this token's K/V.
     ///
     /// `input` is fp16 `[hidden]`; `output` is fp32 `[hidden]`. `kernels` is the
     /// Triton split/combine pair, loaded once and shared by every layer.
+    ///
+    /// Stages `position` into this layer's own device words with an async
+    /// copy from pinned memory, then launches. Synchronize `gpu.stream`
+    /// before calling this again: the pinned slot is single-buffered.
+    /// [`Self::forward_bound`] is the model path and does not copy.
     pub fn forward(
         &mut self,
         gpu: &Gpu,
@@ -345,14 +389,50 @@ impl AttnLayer {
         output: &mut ByteBuf,
         position: u32,
     ) -> Result<()> {
+        if self.bound_seqlens.is_some() {
+            return Err(Error::Input(
+                "attention reads the shared sequence buffers; do not pass a scalar position".into(),
+            ));
+        }
         self.check_forward(input, output, position)?;
-        self.write_seqlen(gpu, position)?;
+        self.stage_local(gpu, position)?;
+        self.launch(gpu, kernels, input, output)
+    }
+
+    /// Attention for a token whose `cache_seqlens` and rope `positions` are
+    /// already in the device words from [`Self::bind_sequence`].
+    ///
+    /// No copy and no host sync. The model writes those words before the step.
+    pub(crate) fn forward_bound(
+        &mut self,
+        gpu: &Gpu,
+        kernels: &PagedDecode,
+        input: &ByteBuf,
+        output: &mut ByteBuf,
+    ) -> Result<()> {
+        if self.bound_seqlens.is_none() || self.bound_positions.is_none() {
+            return Err(Error::Input(
+                "attention sequence buffers are not bound".into(),
+            ));
+        }
+        self.check_buffers(input, output)?;
+        self.launch(gpu, kernels, input, output)
+    }
+
+    fn launch(
+        &mut self,
+        gpu: &Gpu,
+        kernels: &PagedDecode,
+        input: &ByteBuf,
+        output: &mut ByteBuf,
+    ) -> Result<()> {
         // SAFETY: buffers are device allocations owned by `self` or the caller,
         // sized for this tile, and live until `gpu.stream` finishes. qg, q, and
         // g do not overlap. Rope writes q and k in place. The cache write is
         // ordered before the paged read on this stream. The gate buffers do
         // not overlap. `o_proj` reads `attn_out` only after these launches.
-        unsafe { self.run_attention(gpu, kernels, input, position)? };
+        // `cache_seqlens` and rope `positions` already hold this token.
+        unsafe { self.run_attention(gpu, kernels, input)? };
         self.o_proj
             .forward(gpu, &self.attn_out, output, OutDtype::F32)?;
         Ok(())
@@ -365,6 +445,15 @@ impl AttnLayer {
                 self.max_tokens
             )));
         }
+        if i32::try_from(position).is_err() {
+            return Err(Error::Input(format!(
+                "position {position} does not fit in i32"
+            )));
+        }
+        self.check_buffers(input, output)
+    }
+
+    fn check_buffers(&self, input: &ByteBuf, output: &ByteBuf) -> Result<()> {
         let hidden = usize::try_from(self.hidden).unwrap_or(0);
         if input.num_bytes() < hidden * 2 {
             return Err(Error::Input(
@@ -379,13 +468,31 @@ impl AttnLayer {
         Ok(())
     }
 
-    fn write_seqlen(&mut self, gpu: &Gpu, position: u32) -> Result<()> {
-        let seq = i32::try_from(position)
-            .map_err(|_| Error::Input(format!("position {position} does not fit in i32")))?;
-        // Synchronizes, so the previous step is done reading the old length
-        // and this copy is visible to the launches below.
-        self.seqlens
-            .copy_from_host(&gpu.stream, &seq.to_le_bytes())?;
+    /// Async H2D of `position` into this layer's seqlens and rope positions.
+    ///
+    /// The two words are the same four bytes. `get_pos` (`rope.cu`) adds
+    /// `positions[batch]` when the pointer is set. `cache_seqlens` is that
+    /// length as int32, which matches for every position this cache can hold.
+    fn stage_local(&mut self, gpu: &Gpu, position: u32) -> Result<()> {
+        let seq = i32::try_from(position).expect("check_forward rejected an oversized position");
+        let bytes = seq.to_le_bytes();
+        self.seq_host.as_mut_slice().copy_from_slice(&bytes);
+        self.pos_host.as_mut_slice().copy_from_slice(&bytes);
+        let AttnLayer {
+            seqlens,
+            positions,
+            seq_host,
+            pos_host,
+            ..
+        } = self;
+        // SAFETY: `seq_host` and `pos_host` stay allocated on `self`. The
+        // caller synchronizes `gpu.stream` before the next `stage_local`,
+        // so this copy is finished before those pages are written again.
+        // The device words outlive the copy.
+        unsafe {
+            seqlens.copy_from_pinned_async(&gpu.stream, seq_host)?;
+            positions.copy_from_pinned_async(&gpu.stream, pos_host)?;
+        }
         Ok(())
     }
 
@@ -394,7 +501,6 @@ impl AttnLayer {
         gpu: &Gpu,
         kernels: &PagedDecode,
         input: &ByteBuf,
-        position: u32,
     ) -> Result<()> {
         let programs = kernels.programs(1)?;
         if programs != self.programs {
@@ -448,7 +554,7 @@ impl AttnLayer {
                 stream,
             )?;
             deinterleave_qg(qg.cast_const(), q, g, self.head_dim, self.q_numel, stream)?;
-            rope(&self.rope_launch(position), stream)?;
+            rope(&self.rope_launch(), stream)?;
             quant_cache_paged(&self.quant_launch(), stream)?;
             kernels.launch(
                 &gpu.stream,
@@ -462,12 +568,15 @@ impl AttnLayer {
         Ok(())
     }
 
-    fn rope_launch(&self, position: u32) -> RopeLaunch {
+    fn rope_launch(&self) -> RopeLaunch {
         let q = ptr(&self.q);
         let k = ptr(&self.qkv[1].out);
-        // Scalar position. `get_pos` (`rope.cu`) uses `positions[batch]` when
-        // that pointer is set; the generator stores `cache_seqlens` there,
-        // the same integer for one new token. Null selects the scalar.
+        // Scalar `position` stays 0. `get_pos` (`rope.cu`) uses
+        // `positions[batch]` whenever that pointer is set and ignores the
+        // scalar. The fork's graph path passes the staged tensor
+        // (`GP_rope_positions`, arg 14 in `rope.cu`) and still records the
+        // scalar (`GP_rope_position`, arg 13) for the null-pointer mode.
+        // Keeping the scalar at 0 means a captured launch does not depend on it.
         RopeLaunch {
             q: q.cast_const(),
             out_q: q,
@@ -482,8 +591,8 @@ impl AttnLayer {
             q_head_stride: self.head_dim,
             k_head_stride: self.head_dim,
             partial_head_dim: self.partial_head_dim,
-            position,
-            positions: std::ptr::null(),
+            position: 0,
+            positions: self.positions_ptr(),
             position_ids: std::ptr::null(),
             rope_mode: ROPE_NEOX,
             attn_factor: 1.0,
@@ -509,7 +618,7 @@ impl AttnLayer {
             v_in: ptr(&self.qkv[2].out).cast_const(),
             v_out: ptr(&self.v_pages),
             v_scales: ptr(&self.v_scales),
-            cache_seqlens: ptr(&self.seqlens).cast_const(),
+            cache_seqlens: self.seqlens_ptr(),
             block_table: ptr(&self.block_table).cast_const(),
             bsz: 1,
             seq_len: 1,
@@ -530,7 +639,7 @@ impl AttnLayer {
             k_cache: self.k_pages.ptr().as_u64(),
             v_cache: self.v_pages.ptr().as_u64(),
             block_table: self.block_table.ptr().as_u64(),
-            cache_seqlens: self.seqlens.ptr().as_u64(),
+            cache_seqlens: self.seqlens_addr(),
             out: self.attn_out.ptr().as_u64(),
             partial_o: self.partial_o.ptr().as_u64(),
             partial_ml: self.partial_ml.ptr().as_u64(),
@@ -539,6 +648,19 @@ impl AttnLayer {
             h32: self.h32.ptr().as_u64(),
             sinks: q,
         }
+    }
+
+    fn seqlens_addr(&self) -> u64 {
+        self.bound_seqlens.unwrap_or(self.seqlens.ptr().as_u64())
+    }
+
+    fn seqlens_ptr(&self) -> *const std::ffi::c_void {
+        self.seqlens_addr() as *const std::ffi::c_void
+    }
+
+    fn positions_ptr(&self) -> *const std::ffi::c_void {
+        self.bound_positions
+            .unwrap_or(self.positions.ptr().as_u64()) as *const std::ffi::c_void
     }
 }
 

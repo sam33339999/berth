@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use cuda_core::simt::launch_kernel_on_stream;
-use cuda_core::{CudaFunction, CudaModule};
+use cuda_core::{CudaFunction, CudaModule, IntoResult};
 
 use crate::context::Context;
 use crate::error::{Error, Result};
@@ -147,6 +147,28 @@ impl Function {
                 params,
             )
         }
+        .map_err(Error::driver)
+    }
+
+    /// Opts this function into `bytes` of dynamic shared memory.
+    ///
+    /// `cuFuncSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES)`.
+    /// Ampere's default cap is 48 KiB. A launch that asks for more fails
+    /// until this is set. The fork's `TritonKernel` does it at load time
+    /// when `shared_bytes > 48 * 1024` (`triton_kernel.cpp`). `bytes` must
+    /// not exceed the device's opt-in maximum, and it must fit in the
+    /// driver's `int` attribute.
+    pub fn set_max_dynamic_shared_bytes(&self, bytes: u32) -> Result<()> {
+        self.ctx.bind()?;
+        let value = i32::try_from(bytes).map_err(|_| Error::SharedMemory { bytes })?;
+        unsafe {
+            cuda_core::sys::cuFuncSetAttribute(
+                self.raw_function(),
+                cuda_core::sys::CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                value,
+            )
+        }
+        .result()
         .map_err(Error::driver)
     }
 

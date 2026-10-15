@@ -49,6 +49,7 @@ dependencies = [
  "berth-kernels",
  "berth-plan",
  "berth-repetition",
+ "blake2",
  "serde_json",
  "thiserror",
 ]

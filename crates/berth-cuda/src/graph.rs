@@ -28,11 +28,38 @@
 //!   `cudaDeviceSynchronize` first because other torch work may be in flight,
 //!   and it allocates a private stream. This crate only synchronizes the stream
 //!   being captured, and launches are recorded on the stream the caller passes.
-//! * Launches here go through the driver API, so node parameters are read and
-//!   written with the driver v2 entry points (`cuGraphKernelNodeGetParams_v2`,
-//!   `cuGraphExecKernelNodeSetParams_v2`). The fork also tries the runtime API
-//!   and falls back to the driver for `cuLaunchKernel` nodes. Nothing captured
-//!   through this crate needs the runtime fallback.
+//! * Launches this crate makes go through the driver API. Node parameters are
+//!   read and written with the driver v2 entry points
+//!   (`cuGraphKernelNodeGetParams_v2`, `cuGraphExecKernelNodeSetParams_v2`).
+//!   In the CUDA 13 headers those names are what `cuGraphKernelNodeGetParams`
+//!   and `cuGraphExecKernelNodeSetParams` expand to, which is the ABI the
+//!   fork's `CudaDrv` resolves (`cuda_drv.h`). The fork tries the runtime API
+//!   first and falls back to the driver because a `cuLaunchKernel` node
+//!   answers the runtime query with "invalid device function" (`graph.cu`).
+//!   Reading every node with the driver entry point covers both: driver
+//!   launches, and `<<<>>>` / `cudaLaunchKernel` from the nvcc static library
+//!   on the capturing stream.
+//! * [`Graph::kernel_nodes`] lists those kernel nodes in capture order, with
+//!   the name from `cuFuncGetName` and, when the driver exports it, the
+//!   parameter sizes from `cuFuncGetParamInfo`. [`Graph::set_node_param`]
+//!   writes one slot of that node's `kernelParams` and pushes it with
+//!   `cuGraphExecKernelNodeSetParams_v2`, the same update `graph.cu` does
+//!   before `cudaGraphLaunch`.
+//! * `cuGraphGetNodes` does not promise an order. Capture order is the
+//!   dependency order of this single-stream capture. `cuGraphGetEdges_v2`
+//!   returns edges where `to` depends on `from` (the upstream node runs
+//!   first). A capture on one stream is a chain: one root, and each later
+//!   node depends on the node enqueued before it. The topological order of
+//!   that chain is unique and is the enqueue order. Kernel nodes keep their
+//!   relative place in that order; memcpy and event nodes are dropped.
+//!   `cuFuncGetName` was added in CUDA 12.3 (driver entry version 12030,
+//!   `PFN_cuFuncGetName_v12030`). `cuFuncGetParamInfo` was added in CUDA 12.4
+//!   (version 12040, `PFN_cuFuncGetParamInfo_v12040`). cuda-bindings loads
+//!   `libcuda` with `dlsym` and resolves each symbol on first use. A missing
+//!   symbol comes back as `CUDA_ERROR_NOT_FOUND`. This machine's driver is
+//!   595.x, which is CUDA 13, so both entry points are present. The name may
+//!   be mangled when the kernel has C++ linkage; `extern "C"` kernels return
+//!   the C name.
 //! * A new value is a byte slice of the recorded size. The fork stuffs the
 //!   value into a `void *` and copies `size` bytes of that pointer. Pass the
 //!   native-endian bytes of the argument (`i32::to_ne_bytes` for a 4-byte
@@ -47,6 +74,8 @@
 //! cuda-core wraps only begin/end capture. Instantiation, node queries,
 //! parameter updates, and launch go through `cuda_core::sys`.
 
+use std::collections::{BTreeSet, HashMap};
+use std::ffi::{c_char, CStr};
 use std::mem::MaybeUninit;
 use std::sync::Arc;
 
@@ -149,6 +178,32 @@ impl<'a> ParamUpdate<'a> {
     }
 }
 
+/// One kernel node, in capture order.
+///
+/// `index` is the argument [`Graph::set_node_param`] takes. It is the node's
+/// place among kernel nodes, not its place in `cuGraphGetNodes`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelNodeInfo {
+    /// Ordinal of this kernel node in capture order, starting at 0.
+    pub index: usize,
+    /// Name from `cuFuncGetName` (CUDA 12.3). Mangled if the kernel has no
+    /// C linkage.
+    pub name: String,
+    /// Byte size of each `kernelParams` slot, from `cuFuncGetParamInfo`
+    /// (CUDA 12.4). The length is the parameter count.
+    ///
+    /// `None` when the loaded driver does not export `cuFuncGetParamInfo`.
+    pub param_sizes: Option<Vec<usize>>,
+}
+
+impl KernelNodeInfo {
+    /// Parameter count, when [`Self::param_sizes`] is present.
+    #[inline]
+    pub fn param_count(&self) -> Option<usize> {
+        self.param_sizes.as_ref().map(Vec::len)
+    }
+}
+
 /// In-progress recording passed to the closure of [`Stream::capture`].
 #[derive(Debug)]
 pub struct Capture {
@@ -230,8 +285,11 @@ impl Stream {
     /// The stream is synchronized first, then capture begins in thread-local
     /// mode (`CU_STREAM_CAPTURE_MODE_THREAD_LOCAL`). This is not a device-wide
     /// synchronize: other streams are left alone. `body` must launch on
-    /// `self`, must call [`Capture::record`] once before each of those
-    /// launches, and must not synchronize `self`.
+    /// `self` and must not synchronize `self`. Call [`Capture::record`] once
+    /// before each [`Function`] launch that [`Graph::set_params`] or
+    /// [`Graph::set_launch_param`] should address. A kernel launched some
+    /// other way on `self` (the nvcc library's `cudaLaunchKernel`) is still
+    /// a node; [`Graph::kernel_nodes`] finds it after capture.
     ///
     /// On success the graph is instantiated and its kernel nodes are paired
     /// with the recordings. On failure, and if `body` panics, capture is ended
@@ -285,7 +343,7 @@ impl Stream {
             ctx: self.ctx.clone(),
             graph: graph_handle,
             exec: std::ptr::null_mut(),
-            nodes: Vec::new(),
+            kernels: Vec::new(),
             sites: Vec::new(),
         };
         graph.finish(capture.recordings)?;
@@ -305,16 +363,21 @@ pub struct Graph {
     ctx: Context,
     graph: cuda_core::sys::CUgraph,
     exec: cuda_core::sys::CUgraphExec,
-    nodes: Vec<KernelNode>,
+    /// Every kernel node, in capture order.
+    kernels: Vec<CapturedKernel>,
     sites: Vec<Site>,
 }
 
-struct KernelNode {
+struct CapturedKernel {
     node: cuda_core::sys::CUgraphNode,
     params: cuda_core::sys::CUDA_KERNEL_NODE_PARAMS,
     dirty: bool,
-    /// Keeps the module loaded. `params.func` is invalid after it unloads.
-    _function: Function,
+    name: String,
+    param_sizes: Option<Vec<usize>>,
+    /// Set when this node was matched to a [`Capture::record`]. Keeps that
+    /// module loaded. A runtime launch has none: its module belongs to the
+    /// CUDA runtime, which stays loaded with the capturing process.
+    function: Option<Function>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -337,7 +400,8 @@ unsafe impl Sync for Graph {}
 impl std::fmt::Debug for Graph {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Graph")
-            .field("launches", &self.nodes.len())
+            .field("launches", &self.launch_count())
+            .field("kernels", &self.kernels.len())
             .field("sites", &self.sites.len())
             .finish_non_exhaustive()
     }
@@ -353,7 +417,71 @@ impl Graph {
     /// Recorded launches that were matched to kernel nodes.
     #[inline]
     pub fn launch_count(&self) -> usize {
-        self.nodes.len()
+        self.kernels
+            .iter()
+            .filter(|kernel| kernel.function.is_some())
+            .count()
+    }
+
+    /// Kernel nodes in capture order.
+    ///
+    /// The order is the dependency order of the single-stream capture, not
+    /// the order `cuGraphGetNodes` happens to return. See the module docs.
+    /// Each [`KernelNodeInfo::name`] is `cuFuncGetName` (CUDA 12.3, resolved
+    /// by `dlsym` on the loaded driver). [`KernelNodeInfo::param_sizes`] is
+    /// `cuFuncGetParamInfo` (CUDA 12.4) when that symbol is present.
+    pub fn kernel_nodes(&self) -> Vec<KernelNodeInfo> {
+        self.kernels
+            .iter()
+            .enumerate()
+            .map(|(index, kernel)| KernelNodeInfo {
+                index,
+                name: kernel.name.clone(),
+                param_sizes: kernel.param_sizes.clone(),
+            })
+            .collect()
+    }
+
+    /// Writes one `kernelParams` slot and pushes the node.
+    ///
+    /// `node` is [`KernelNodeInfo::index`]. `param_index` selects
+    /// `kernelParams[param_index]`. `bytes` replaces that argument. The copy
+    /// is `bytes.len()` bytes into the driver-owned slot, which is what
+    /// `graph.cu` does (`memcpy` of `param_size`, then
+    /// `cuGraphExecKernelNodeSetParams`). Bytes that already match the slot
+    /// are left alone and the node is not pushed.
+    ///
+    /// The size check uses `cuFuncGetParamInfo`. A driver without that entry
+    /// point returns [`Error::ParamInfoUnavailable`].
+    pub fn set_node_param(&mut self, node: usize, param_index: usize, bytes: &[u8]) -> Result<()> {
+        let kernel = self
+            .kernels
+            .get(node)
+            .ok_or(Error::NoSuchKernelNode { index: node })?;
+        let sizes = kernel
+            .param_sizes
+            .as_ref()
+            .ok_or(Error::ParamInfoUnavailable)?;
+        let Some(&expected) = sizes.get(param_index) else {
+            return Err(Error::NoSuchKernelParam {
+                node,
+                index: param_index,
+            });
+        };
+        if bytes.len() != expected {
+            return Err(Error::NodeParamBytes {
+                node,
+                index: param_index,
+                expected,
+                got: bytes.len(),
+            });
+        }
+        write_param(&mut self.kernels[node], param_index, bytes)?;
+        if self.kernels[node].dirty {
+            self.ctx.bind()?;
+            push_kernel_node(self.exec, &mut self.kernels[node])?;
+        }
+        Ok(())
     }
 
     /// Patches kernel arguments, then launches the executable on `stream`.
@@ -387,7 +515,7 @@ impl Graph {
         for (site_index, update_index) in writes {
             let site = self.sites[site_index];
             write_param(
-                &mut self.nodes[site.node],
+                &mut self.kernels[site.node],
                 site.index,
                 updates[update_index].bytes,
             )?;
@@ -408,7 +536,7 @@ impl Graph {
                 got: bytes.len(),
             });
         }
-        write_param(&mut self.nodes[site.node], site.index, bytes)
+        write_param(&mut self.kernels[site.node], site.index, bytes)
     }
 
     fn finish(&mut self, recordings: Vec<Recording>) -> Result<()> {
@@ -422,21 +550,33 @@ impl Graph {
         };
         self.exec = exec;
 
-        let raw_nodes = graph_nodes(self.graph)?;
-        let mut rec = 0;
-        for node in raw_nodes {
-            if rec == recordings.len() {
-                break;
-            }
+        for node in ordered_nodes(self.graph)? {
             if !is_kernel_node(node)? {
                 continue;
             }
             let params = read_kernel_params(node)?;
+            let func = kernel_function(&params)?;
+            let name = function_name(func)?;
+            let param_sizes = function_param_sizes(func)?;
+            self.kernels.push(CapturedKernel {
+                node,
+                params,
+                dirty: false,
+                name,
+                param_sizes,
+                function: None,
+            });
+        }
+
+        let mut rec = 0;
+        for node_index in 0..self.kernels.len() {
+            if rec == recordings.len() {
+                break;
+            }
             let want = recordings[rec].function.raw_function();
-            if params.func != want {
+            if self.kernels[node_index].params.func != want {
                 continue;
             }
-            let node_index = self.nodes.len();
             for slot in &recordings[rec].slots {
                 self.sites.push(Site {
                     node: node_index,
@@ -446,12 +586,7 @@ impl Graph {
                     size: slot.size,
                 });
             }
-            self.nodes.push(KernelNode {
-                node,
-                params,
-                dirty: false,
-                _function: recordings[rec].function.clone(),
-            });
+            self.kernels[node_index].function = Some(recordings[rec].function.clone());
             rec += 1;
         }
         if rec != recordings.len() {
@@ -464,20 +599,11 @@ impl Graph {
 
     fn publish_dirty(&mut self) -> Result<()> {
         self.ctx.bind()?;
-        for i in 0..self.nodes.len() {
-            if !self.nodes[i].dirty {
+        for kernel in &mut self.kernels {
+            if !kernel.dirty {
                 continue;
             }
-            unsafe {
-                cuda_core::sys::cuGraphExecKernelNodeSetParams_v2(
-                    self.exec,
-                    self.nodes[i].node,
-                    &self.nodes[i].params,
-                )
-            }
-            .result()
-            .map_err(Error::driver)?;
-            self.nodes[i].dirty = false;
+            push_kernel_node(self.exec, kernel)?;
         }
         Ok(())
     }
@@ -529,17 +655,20 @@ fn read_kernel_params(
     Ok(unsafe { params.assume_init() })
 }
 
-/// Copies `bytes` into the node-owned slot. Returns nothing; sets `dirty`
-/// when the bytes differ. `index` came from a [`Capture::record`] whose caller
-/// promised it was in range, and `bytes.len()` is the recorded size.
-fn write_param(node: &mut KernelNode, index: usize, bytes: &[u8]) -> Result<()> {
+/// Copies `bytes` into the node-owned slot and sets `dirty` when they differ.
+///
+/// `index` is in range: either a [`Capture::record`] promised it, or
+/// `cuFuncGetParamInfo` reported it. `bytes.len()` is that argument's size.
+/// The driver allocated `kernelParams` with one entry per argument and owns
+/// the slot for the life of the graph. `graph.cu` writes the same bytes in
+/// place and only then calls `cuGraphExecKernelNodeSetParams`.
+fn write_param(node: &mut CapturedKernel, index: usize, bytes: &[u8]) -> Result<()> {
     let storage = node.params.kernelParams;
     if storage.is_null() {
         return Err(Error::MissingParamStorage);
     }
-    // SAFETY: `index` is a recorded kernel parameter. The driver allocated
-    // `kernelParams` with one entry per argument and owns the slot. The graph
-    // that owns the node is alive for as long as `node` is.
+    // SAFETY: `index` is a real parameter of this kernel node. The slot
+    // pointer is owned by the graph, which outlives `node`.
     let slot = unsafe { *storage.add(index) };
     if slot.is_null() {
         return Err(Error::MissingParamStorage);
@@ -551,6 +680,206 @@ fn write_param(node: &mut KernelNode, index: usize, bytes: &[u8]) -> Result<()> 
         node.dirty = true;
     }
     Ok(())
+}
+
+/// Pushes one dirty node. Clears `dirty` only after the driver accepts it.
+fn push_kernel_node(exec: cuda_core::sys::CUgraphExec, kernel: &mut CapturedKernel) -> Result<()> {
+    unsafe { cuda_core::sys::cuGraphExecKernelNodeSetParams_v2(exec, kernel.node, &kernel.params) }
+        .result()
+        .map_err(Error::driver)?;
+    kernel.dirty = false;
+    Ok(())
+}
+
+/// Nodes in dependency order. See the module docs for why this is the
+/// capture order of a single-stream capture.
+fn ordered_nodes(graph: cuda_core::sys::CUgraph) -> Result<Vec<cuda_core::sys::CUgraphNode>> {
+    let nodes = graph_nodes(graph)?;
+    let edges = graph_edges(graph)?;
+    let mut position = HashMap::with_capacity(nodes.len());
+    for (index, node) in nodes.iter().copied().enumerate() {
+        position.insert(node as usize, index);
+    }
+    let mut indexed = Vec::with_capacity(edges.len());
+    for (from, to) in edges {
+        let from = position
+            .get(&(from as usize))
+            .copied()
+            .ok_or(Error::GraphOrder)?;
+        let to = position
+            .get(&(to as usize))
+            .copied()
+            .ok_or(Error::GraphOrder)?;
+        indexed.push((from, to));
+    }
+    let order = capture_order(nodes.len(), &indexed)?;
+    Ok(order.into_iter().map(|index| nodes[index]).collect())
+}
+
+fn graph_edges(
+    graph: cuda_core::sys::CUgraph,
+) -> Result<Vec<(cuda_core::sys::CUgraphNode, cuda_core::sys::CUgraphNode)>> {
+    let mut count = 0usize;
+    // Count only. `from` and `to` may be null. `edgeData` null is legal when
+    // every edge is the default zeroed annotation, which a stream capture is.
+    unsafe {
+        cuda_core::sys::cuGraphGetEdges_v2(
+            graph,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut count,
+        )
+    }
+    .result()
+    .map_err(Error::driver)?;
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut from = vec![std::ptr::null_mut(); count];
+    let mut to = vec![std::ptr::null_mut(); count];
+    let mut data = vec![MaybeUninit::<cuda_core::sys::CUgraphEdgeData>::zeroed(); count];
+    unsafe {
+        cuda_core::sys::cuGraphGetEdges_v2(
+            graph,
+            from.as_mut_ptr(),
+            to.as_mut_ptr(),
+            data.as_mut_ptr().cast(),
+            &mut count,
+        )
+    }
+    .result()
+    .map_err(Error::driver)?;
+    from.truncate(count);
+    to.truncate(count);
+    Ok(from.into_iter().zip(to).collect())
+}
+
+/// Topological order of a capture.
+///
+/// `edges` are `(from, to)` pairs: `to` depends on `from`, so `from` is
+/// earlier in the capture. Duplicate edges are ignored. A cycle, or an
+/// endpoint past `count`, is [`Error::GraphOrder`].
+///
+/// When several nodes are ready, the smaller original index is emitted
+/// first. A single-stream capture is a chain, so that tie-break is not
+/// consulted: there is one root and each node has one successor. The
+/// tie-break only makes a non-chain graph deterministic.
+fn capture_order(count: usize, edges: &[(usize, usize)]) -> Result<Vec<usize>> {
+    let mut indegree = vec![0usize; count];
+    let mut succ = vec![Vec::new(); count];
+    let mut seen = BTreeSet::new();
+    for &(from, to) in edges {
+        if from >= count || to >= count {
+            return Err(Error::GraphOrder);
+        }
+        if !seen.insert((from, to)) {
+            continue;
+        }
+        succ[from].push(to);
+        indegree[to] += 1;
+    }
+    let mut ready: BTreeSet<usize> = indegree
+        .iter()
+        .enumerate()
+        .filter(|(_, degree)| **degree == 0)
+        .map(|(index, _)| index)
+        .collect();
+    let mut order = Vec::with_capacity(count);
+    while let Some(node) = ready.pop_first() {
+        order.push(node);
+        for &next in &succ[node] {
+            indegree[next] -= 1;
+            if indegree[next] == 0 {
+                ready.insert(next);
+            }
+        }
+    }
+    if order.len() != count {
+        return Err(Error::GraphOrder);
+    }
+    Ok(order)
+}
+
+fn is_missing_symbol(status: cuda_core::sys::CUresult) -> bool {
+    status == cuda_core::sys::cudaError_enum_CUDA_ERROR_NOT_FOUND
+}
+
+fn is_invalid_value(status: cuda_core::sys::CUresult) -> bool {
+    status == cuda_core::sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE
+}
+
+/// `CUfunction` for a kernel node.
+///
+/// Driver launches store it in `func`. A node that only filled `kern`
+/// (CUDA 12 kernel-handle launches) is resolved with `cuKernelGetFunction`.
+fn kernel_function(
+    params: &cuda_core::sys::CUDA_KERNEL_NODE_PARAMS,
+) -> Result<cuda_core::sys::CUfunction> {
+    if !params.func.is_null() {
+        return Ok(params.func);
+    }
+    if params.kern.is_null() {
+        return Err(Error::MissingKernelFunction);
+    }
+    let mut func = std::ptr::null_mut();
+    unsafe { cuda_core::sys::cuKernelGetFunction(&mut func, params.kern) }
+        .result()
+        .map_err(Error::driver)?;
+    if func.is_null() {
+        return Err(Error::MissingKernelFunction);
+    }
+    Ok(func)
+}
+
+/// `cuFuncGetName`, copied out of the driver-owned string.
+///
+/// The symbol is resolved at runtime by cuda-bindings (`dlsym` of
+/// `cuFuncGetName`). CUDA 12.3 added the entry point. A driver that does
+/// not export it returns [`Error::FunctionNameUnavailable`].
+fn function_name(func: cuda_core::sys::CUfunction) -> Result<String> {
+    let mut name: *const c_char = std::ptr::null();
+    let status = unsafe { cuda_core::sys::cuFuncGetName(&mut name, func) };
+    if is_missing_symbol(status) {
+        return Err(Error::FunctionNameUnavailable);
+    }
+    status.result().map_err(Error::driver)?;
+    if name.is_null() {
+        return Err(Error::FunctionNameUnavailable);
+    }
+    // SAFETY: on success the driver returns a null-terminated name that
+    // stays valid while `func` is valid. The copy does not keep the pointer.
+    let text = unsafe { CStr::from_ptr(name) };
+    Ok(text.to_string_lossy().into_owned())
+}
+
+/// Sizes from `cuFuncGetParamInfo`, one per parameter, in order.
+///
+/// `None` means the driver has no `cuFuncGetParamInfo` (added in CUDA 12.4).
+/// The probe stops at `CUDA_ERROR_INVALID_VALUE`, which the entry point
+/// returns once `paramIndex` is past the last parameter.
+fn function_param_sizes(func: cuda_core::sys::CUfunction) -> Result<Option<Vec<usize>>> {
+    let mut sizes = Vec::new();
+    loop {
+        if sizes.len() > MAX_PARAM_INDEX {
+            return Err(Error::TooManyParams {
+                max: MAX_PARAM_INDEX,
+            });
+        }
+        let mut offset = 0usize;
+        let mut size = 0usize;
+        let status = unsafe {
+            cuda_core::sys::cuFuncGetParamInfo(func, sizes.len(), &mut offset, &mut size)
+        };
+        if sizes.is_empty() && is_missing_symbol(status) {
+            return Ok(None);
+        }
+        if is_invalid_value(status) {
+            return Ok(Some(sizes));
+        }
+        status.result().map_err(Error::driver)?;
+        sizes.push(size);
+    }
 }
 
 fn validate_slot(slot: ParamSlot) -> Result<()> {
@@ -743,5 +1072,54 @@ mod tests {
         ));
         let err = lookup_launch_param(&sites, 3, 0).unwrap_err();
         assert!(matches!(err, Error::NoSuchParam { launch: 3, .. }));
+    }
+
+    #[test]
+    fn capture_order_follows_dependency_edges_not_node_index() {
+        // Node 2 was enqueued first, then 0, then 1. `cuGraphGetNodes` may
+        // list them as 0, 1, 2. The edges are the capture.
+        let order = capture_order(3, &[(2, 0), (0, 1)]).unwrap();
+        assert_eq!(order, vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn capture_order_ignores_a_duplicate_edge() {
+        let order = capture_order(2, &[(0, 1), (0, 1)]).unwrap();
+        assert_eq!(order, vec![0, 1]);
+    }
+
+    #[test]
+    fn capture_order_of_a_single_node_is_that_node() {
+        assert_eq!(capture_order(1, &[]).unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn capture_order_breaks_ties_by_the_smaller_index() {
+        // Two roots. A single-stream chain never looks like this. The
+        // tie-break is the index from `cuGraphGetNodes`.
+        let order = capture_order(3, &[(0, 2)]).unwrap();
+        assert_eq!(order, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn capture_order_rejects_a_cycle() {
+        let err = capture_order(2, &[(0, 1), (1, 0)]).unwrap_err();
+        assert!(matches!(err, Error::GraphOrder));
+    }
+
+    #[test]
+    fn param_count_is_the_size_list() {
+        let info = KernelNodeInfo {
+            index: 1,
+            name: "fill_i32".to_string(),
+            param_sizes: Some(vec![8, 4]),
+        };
+        assert_eq!(info.param_count(), Some(2));
+        let unnamed = KernelNodeInfo {
+            index: 0,
+            name: String::new(),
+            param_sizes: None,
+        };
+        assert_eq!(unnamed.param_count(), None);
     }
 }

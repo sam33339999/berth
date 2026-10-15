@@ -123,6 +123,66 @@ pub enum Error {
     /// A stream, buffer, and graph were mixed across two CUDA contexts.
     #[error("CUDA objects are not on the same context")]
     ContextMismatch,
+
+    /// Dependency edges from the capture did not produce one total order.
+    #[error("captured graph dependencies are not a single order")]
+    GraphOrder,
+
+    /// [`super::Graph::set_node_param`] named a kernel ordinal this graph
+    /// does not have.
+    #[error("graph has no kernel node {index}")]
+    NoSuchKernelNode {
+        /// Index from [`super::KernelNodeInfo::index`].
+        index: usize,
+    },
+
+    /// The parameter index is outside the list `cuFuncGetParamInfo` reported.
+    #[error("kernel node {node} has no parameter at index {index}")]
+    NoSuchKernelParam {
+        /// Kernel-node ordinal.
+        node: usize,
+        /// Rejected `kernelParams` index.
+        index: usize,
+    },
+
+    /// The byte slice is not the size `cuFuncGetParamInfo` reported.
+    #[error("kernel node {node} parameter {index} is {expected} bytes, got {got}")]
+    NodeParamBytes {
+        /// Kernel-node ordinal.
+        node: usize,
+        /// `kernelParams` index.
+        index: usize,
+        /// Size reported by the driver.
+        expected: usize,
+        /// Length of the slice passed to `set_node_param`.
+        got: usize,
+    },
+
+    /// The loaded driver does not export `cuFuncGetParamInfo` (CUDA 12.4).
+    #[error("driver does not export cuFuncGetParamInfo (CUDA 12.4)")]
+    ParamInfoUnavailable,
+
+    /// The loaded driver does not export `cuFuncGetName` (CUDA 12.3).
+    #[error("driver does not export cuFuncGetName (CUDA 12.3)")]
+    FunctionNameUnavailable,
+
+    /// A kernel node had neither a `CUfunction` nor a resolvable `CUkernel`.
+    #[error("captured kernel node has no function handle")]
+    MissingKernelFunction,
+
+    /// `cuFuncGetParamInfo` did not end within [`super::MAX_PARAM_INDEX`].
+    #[error("kernel parameter list is longer than {max}")]
+    TooManyParams {
+        /// [`super::MAX_PARAM_INDEX`].
+        max: usize,
+    },
+
+    /// Dynamic shared-memory opt-in did not fit in the driver's `int` attribute.
+    #[error("dynamic shared memory of {bytes} bytes does not fit in a driver attribute")]
+    SharedMemory {
+        /// Requested byte count.
+        bytes: u32,
+    },
 }
 
 impl Error {

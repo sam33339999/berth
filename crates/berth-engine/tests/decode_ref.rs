@@ -12,8 +12,6 @@
 
 mod common;
 
-use std::process::Command;
-
 use berth_engine::model::Model;
 use berth_engine::Gpu;
 use berth_exl3::Checkpoint;
@@ -28,9 +26,10 @@ fn decode_step_matches_decode_ref() {
         Ok(dir) => dir,
         Err(why) => return eprintln!("skipping: {why}"),
     };
-    if serve_listening() {
-        return eprintln!("skipping: port 8889 is in use");
-    }
+    let _slot = match common::full_model_slot() {
+        Ok(slot) => slot,
+        Err(why) => return eprintln!("skipping: {why}"),
+    };
 
     let ckpt = Checkpoint::open(&dir).unwrap();
     let shape = model_shape(&ckpt.config).unwrap();
@@ -63,15 +62,4 @@ fn decode_step_matches_decode_ref() {
     let n = want_logits.len() / 2;
     eprintln!("logits: {diff} of {n} elements differ");
     assert_eq!(diff, 0, "logits");
-}
-
-fn serve_listening() -> bool {
-    let output = match Command::new("ss").args(["-ltn"]).output() {
-        Ok(output) => output,
-        Err(_) => return true,
-    };
-    if !output.status.success() {
-        return true;
-    }
-    String::from_utf8_lossy(&output.stdout).contains(":8889 ")
 }

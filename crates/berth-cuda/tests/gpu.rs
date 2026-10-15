@@ -1,8 +1,8 @@
 //! GPU tests. Each one returns immediately unless `BERTH_GPU_TESTS=1`.
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use berth_cuda::{
     ComputeCapability, Context, Cubin, DeviceBuffer, Dim3, Function, ParamSlot, ParamUpdate,
@@ -56,6 +56,30 @@ fn graph_param_update_changes_one_launch() {
         return;
     };
     graph_param_update_inner().unwrap();
+}
+
+#[test]
+fn graph_runtime_launch_is_found_and_patched() {
+    let Some(_gpu) = lock_gpu() else {
+        return;
+    };
+    graph_runtime_launch_inner().unwrap();
+}
+
+#[test]
+fn graph_mixed_function_and_runtime_stay_patchable() {
+    let Some(_gpu) = lock_gpu() else {
+        return;
+    };
+    graph_mixed_inner().unwrap();
+}
+
+#[test]
+fn dynamic_shared_opt_in_allows_64kib() {
+    let Some(_gpu) = lock_gpu() else {
+        return;
+    };
+    dynamic_shared_opt_in_inner().unwrap();
 }
 
 fn device_reports_the_3090_inner() -> berth_cuda::Result<()> {
@@ -218,13 +242,206 @@ fn launch_fill(
     unsafe { function.launch(stream, Dim3::one(1), Dim3::one(1), 0, &mut params) }
 }
 
-fn compile_fill_cubin() -> PathBuf {
+fn graph_runtime_launch_inner() -> berth_cuda::Result<()> {
+    let ctx = Context::new()?;
+    let stream = ctx.stream()?;
+    let launch = runtime_launch();
+    let out = DeviceBuffer::<i32>::zeroed(&stream, 1)?;
+    let ptr = out.ptr().as_u64();
+    // Load the fatbin before capture. The first runtime launch can allocate.
+    unsafe { launch(ptr, 1, stream.handle().as_ptr()) };
+    stream.synchronize()?;
+
+    let mut graph = stream.capture(|_capture| {
+        unsafe { launch(ptr, 11, stream.handle().as_ptr()) };
+        Ok(())
+    })?;
+    assert_eq!(graph.launch_count(), 0);
+    let nodes = graph.kernel_nodes();
+    let node = nodes
+        .iter()
+        .find(|node| node.name == "berth_fill_runtime")
+        .unwrap_or_else(|| panic!("runtime kernel missing from {nodes:?}"));
+    assert_eq!(node.param_count(), Some(2), "{node:?}");
+    assert_eq!(node.param_sizes.as_deref(), Some(&[8, 4][..]), "{node:?}");
+
+    graph.launch(&stream)?;
+    let mut host = [0i32];
+    out.copy_to_host(&stream, &mut host)?;
+    assert_eq!(host, [11]);
+
+    graph.set_node_param(node.index, 1, &99i32.to_ne_bytes())?;
+    graph.launch(&stream)?;
+    out.copy_to_host(&stream, &mut host)?;
+    assert_eq!(host, [99]);
+    Ok(())
+}
+
+fn graph_mixed_inner() -> berth_cuda::Result<()> {
+    let ctx = Context::new()?;
+    let stream = ctx.stream()?;
+    let function = load_fill(&ctx)?;
+    let launch = runtime_launch();
+    let driver_out = DeviceBuffer::<i32>::zeroed(&stream, 1)?;
+    let runtime_out = DeviceBuffer::<i32>::zeroed(&stream, 1)?;
+    let driver_ptr = driver_out.ptr().as_u64();
+    let runtime_ptr = runtime_out.ptr().as_u64();
+    unsafe { launch(runtime_ptr, 0, stream.handle().as_ptr()) };
+    stream.synchronize()?;
+
+    let mut graph = stream.capture(|capture| {
+        let slots = [
+            ParamSlot::pointer(1, 0),
+            ParamSlot::u32_value(2, 1),
+            ParamSlot::end(),
+        ];
+        unsafe { capture.record(&function, &slots)? };
+        launch_fill(&function, &stream, driver_ptr, 11)?;
+        unsafe { launch(runtime_ptr, 22, stream.handle().as_ptr()) };
+        Ok(())
+    })?;
+    assert_eq!(graph.launch_count(), 1);
+    let nodes = graph.kernel_nodes();
+    assert_eq!(nodes.len(), 2, "{nodes:?}");
+    assert_eq!(nodes[0].name, "fill_i32", "{nodes:?}");
+    assert_eq!(nodes[1].name, "berth_fill_runtime", "{nodes:?}");
+    assert_eq!(nodes[0].index, 0);
+    assert_eq!(nodes[1].index, 1);
+    assert_eq!(nodes[0].param_sizes.as_deref(), Some(&[8, 4][..]));
+    assert_eq!(nodes[1].param_sizes.as_deref(), Some(&[8, 4][..]));
+
+    graph.launch(&stream)?;
+    let mut driver_host = [0i32];
+    let mut runtime_host = [0i32];
+    driver_out.copy_to_host(&stream, &mut driver_host)?;
+    runtime_out.copy_to_host(&stream, &mut runtime_host)?;
+    assert_eq!(driver_host, [11]);
+    assert_eq!(runtime_host, [22]);
+
+    graph.set_node_param(0, 1, &77i32.to_ne_bytes())?;
+    graph.set_node_param(1, 1, &88i32.to_ne_bytes())?;
+    graph.launch(&stream)?;
+    driver_out.copy_to_host(&stream, &mut driver_host)?;
+    runtime_out.copy_to_host(&stream, &mut runtime_host)?;
+    assert_eq!(driver_host, [77]);
+    assert_eq!(runtime_host, [88]);
+
+    // The Function launch is still addressable through the recorded path.
+    graph.set_launch_param(0, 1, &5i32.to_ne_bytes())?;
+    graph.launch(&stream)?;
+    driver_out.copy_to_host(&stream, &mut driver_host)?;
+    runtime_out.copy_to_host(&stream, &mut runtime_host)?;
+    assert_eq!(driver_host, [5]);
+    assert_eq!(runtime_host, [88]);
+    Ok(())
+}
+
+fn dynamic_shared_opt_in_inner() -> berth_cuda::Result<()> {
+    let ctx = Context::new()?;
+    let stream = ctx.stream()?;
+    let function = load_touch_smem(&ctx)?;
+    let out = DeviceBuffer::<i32>::zeroed(&stream, 1)?;
+    let mut ptr = out.ptr().as_u64();
+    let mut params = [(&raw mut ptr).cast::<c_void>()];
+    let rejected =
+        unsafe { function.launch(&stream, Dim3::one(1), Dim3::one(1), 64 * 1024, &mut params) };
+    assert!(
+        rejected.is_err(),
+        "64 KiB dynamic shared memory launched without the opt-in"
+    );
+    function.set_max_dynamic_shared_bytes(64 * 1024)?;
+    unsafe { function.launch(&stream, Dim3::one(1), Dim3::one(1), 64 * 1024, &mut params) }?;
+    let mut host = [0i32];
+    out.copy_to_host(&stream, &mut host)?;
+    assert_eq!(host, [3]);
+    Ok(())
+}
+
+type RuntimeLaunch = unsafe extern "C" fn(u64, i32, *mut c_void);
+
+fn runtime_launch() -> RuntimeLaunch {
+    static LIB: OnceLock<usize> = OnceLock::new();
+    let handle = *LIB.get_or_init(|| {
+        let path = compile_runtime_library();
+        let c_path = CString::new(path.to_str().expect("utf-8 so path")).expect("no interior nul");
+        let handle = unsafe { dlopen(c_path.as_ptr(), RTLD_NOW) };
+        assert!(
+            !handle.is_null(),
+            "dlopen {}: {}",
+            path.display(),
+            dl_error()
+        );
+        handle as usize
+    });
+    let symbol = c"berth_launch_fill_runtime";
+    let sym = unsafe { dlsym(handle as *mut c_void, symbol.as_ptr()) };
+    assert!(
+        !sym.is_null(),
+        "dlsym berth_launch_fill_runtime: {}",
+        dl_error()
+    );
+    unsafe { std::mem::transmute::<*mut c_void, RuntimeLaunch>(sym) }
+}
+
+fn dl_error() -> String {
+    let ptr = unsafe { dlerror() };
+    if ptr.is_null() {
+        return "unknown".to_string();
+    }
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn compile_runtime_library() -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
     std::fs::create_dir_all(&dir).expect("create scratch dir");
-    let out = dir.join("fill_i32.cubin");
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fill_i32.cu");
-    let nvcc =
-        std::env::var("BERTH_NVCC").unwrap_or_else(|_| "/usr/local/cuda-13.3/bin/nvcc".to_string());
+    let out = dir.join("fill_runtime.so");
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fill_runtime.cu");
+    let nvcc = nvcc_path();
+    let output = std::process::Command::new(&nvcc)
+        .args([
+            "-shared",
+            "-Xcompiler",
+            "-fPIC",
+            "-arch=sm_86",
+            "-Xlinker",
+            "-rpath",
+            "-Xlinker",
+            "/usr/local/cuda-13.3/lib64",
+            "-L/usr/local/cuda-13.3/lib64",
+            "-o",
+        ])
+        .arg(&out)
+        .arg(&src)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {nvcc}: {err}"));
+    assert!(
+        output.status.success(),
+        "nvcc failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    out
+}
+
+fn load_touch_smem(ctx: &Context) -> berth_cuda::Result<Function> {
+    let path = compile_cubin("touch_dyn_smem.cu", "touch_dyn_smem.cubin");
+    let cubin = Cubin::load_file(ctx, &path)?;
+    cubin.function("touch_dyn_smem")
+}
+
+fn compile_fill_cubin() -> PathBuf {
+    compile_cubin("fill_i32.cu", "fill_i32.cubin")
+}
+
+fn compile_cubin(src_name: &str, out_name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    std::fs::create_dir_all(&dir).expect("create scratch dir");
+    let out = dir.join(out_name);
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join(src_name);
+    let nvcc = nvcc_path();
     let output = std::process::Command::new(&nvcc)
         .args(["-arch=sm_86", "-cubin", "-o"])
         .arg(&out)
@@ -237,4 +454,16 @@ fn compile_fill_cubin() -> PathBuf {
         String::from_utf8_lossy(&output.stderr)
     );
     out
+}
+
+fn nvcc_path() -> String {
+    std::env::var("BERTH_NVCC").unwrap_or_else(|_| "/usr/local/cuda-13.3/bin/nvcc".to_string())
+}
+
+const RTLD_NOW: i32 = 2;
+
+unsafe extern "C" {
+    fn dlopen(filename: *const c_char, flags: i32) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    fn dlerror() -> *const c_char;
 }

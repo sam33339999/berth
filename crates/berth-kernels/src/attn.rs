@@ -28,8 +28,10 @@
 //!
 //! Pointers are device addresses. `stream` on the CUDA launches is a
 //! `cudaStream_t` (`null` is the default stream). The Triton pair is loaded
-//! with [`berth_cuda::Cubin`] and launched with that module's parameter
-//! order.
+//! with [`berth_cuda::Cubin`] and launched with [`berth_cuda::Function`].
+//! Above Ampere's 48 KiB default, the function opts in with
+//! [`berth_cuda::Function::set_max_dynamic_shared_bytes`], which is what
+//! `TritonKernel` does in `triton_kernel.cpp`.
 
 use std::ffi::{c_void, CStr};
 use std::path::Path;
@@ -43,8 +45,9 @@ const KV_HEADS: i32 = 4;
 const HEAD_DIM: i32 = 256;
 const PAGE_SIZE: i32 = 256;
 const Q_LEN: i32 = 1;
-/// Ampere's default dynamic shared-memory cap. Above this, a launch has to
-/// opt in with `cuFuncSetAttribute`. `berth_cuda::Function::launch` does not.
+/// Ampere's default dynamic shared-memory cap. Above this, the function opts
+/// in with `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)`, matching
+/// `TritonKernel` (`triton_kernel.cpp`).
 const DEFAULT_DYNAMIC_SMEM: u32 = 48 * 1024;
 
 /// Command that writes `target/triton-cubins/` when the cubins are missing.
@@ -127,21 +130,6 @@ mod ffi {
             page_size: i32,
             compand_a: f32,
             in_contiguous: i32,
-            stream: *mut c_void,
-        ) -> i32;
-
-        pub fn berth_attn_cubin_launch(
-            image: *const c_void,
-            image_bytes: usize,
-            name: *const c_char,
-            grid_x: u32,
-            grid_y: u32,
-            grid_z: u32,
-            block_x: u32,
-            block_y: u32,
-            block_z: u32,
-            shared_bytes: u32,
-            kernel_params: *mut *mut c_void,
             stream: *mut c_void,
         ) -> i32;
     }
@@ -624,10 +612,8 @@ pub struct PagedDecodeArgs {
 }
 
 struct KernelImage {
-    bytes: Vec<u8>,
     function: Function,
     name: String,
-    name_c: std::ffi::CString,
     shared: u32,
     num_warps: u32,
     params: Vec<Param>,
@@ -670,11 +656,10 @@ struct Tile {
 /// combine always runs, including when the live split count is 1. Splits
 /// at or above the live count exit without storing.
 ///
-/// Dynamic shared memory at or below 48 KiB is launched with
-/// [`berth_cuda::Function::launch`]. Above that, the same cubin image is
-/// launched through the driver after
-/// `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)`, which is what
-/// `TritonKernel::launch` does and what `Function::launch` does not.
+/// Both kernels are launched with [`berth_cuda::Function::launch`]. When
+/// the cubin asks for more than 48 KiB of dynamic shared memory, load calls
+/// [`berth_cuda::Function::set_max_dynamic_shared_bytes`] first, which is
+/// what `TritonKernel` does. The 27B decode cubins are under that cap.
 pub struct PagedDecode {
     split: KernelImage,
     combine: KernelImage,
@@ -921,31 +906,12 @@ fn launch_image(image: &KernelImage, stream: &Stream, runtime: &Runtime, grid: D
         })
         .collect();
     let block = Dim3::new(32 * image.num_warps, 1, 1);
-    if image.shared > DEFAULT_DYNAMIC_SMEM {
-        let rc = unsafe {
-            ffi::berth_attn_cubin_launch(
-                image.bytes.as_ptr().cast(),
-                image.bytes.len(),
-                image.name_c.as_ptr(),
-                grid.x,
-                grid.y,
-                grid.z,
-                block.x,
-                block.y,
-                block.z,
-                image.shared,
-                params.as_mut_ptr(),
-                stream.handle().as_ptr(),
-            )
-        };
-        return fail(rc, &image.name);
-    }
     unsafe {
         image
             .function
             .launch(stream, grid, block, image.shared, &mut params)
     }
-    .map_err(cuda_err)
+    .map_err(|err| Error::Launch(format!("{}: {err}", image.name)))
 }
 
 struct Slot {
@@ -1046,13 +1012,14 @@ fn load_kernel(
     let bytes = read_cubin(&path)?;
     let cubin = Cubin::load_bytes(ctx, &bytes).map_err(cuda_err)?;
     let function = cubin.function(symbol).map_err(cuda_err)?;
-    let name_c = std::ffi::CString::new(symbol)
-        .map_err(|_| Error::Launch(format!("{key}: symbol contains an interior nul")))?;
+    if shared > DEFAULT_DYNAMIC_SMEM {
+        function
+            .set_max_dynamic_shared_bytes(shared)
+            .map_err(cuda_err)?;
+    }
     Ok(KernelImage {
-        bytes,
         function,
         name: symbol.to_string(),
-        name_c,
         shared,
         num_warps,
         params,

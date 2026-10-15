@@ -93,6 +93,10 @@ impl TextNorm {
     }
 }
 
+// Attention carries the paged cache and the one-slot sequence staging
+// buffers, so it is wider than a GDN layer. Both arms stay unboxed: the
+// slot is moved only at load, and decode matches it by reference.
+#[allow(clippy::large_enum_variant)]
 enum MixerSlot {
     Gdn(GdnLayer),
     FullAttn(AttnLayer),
@@ -118,8 +122,8 @@ pub struct Model {
     lm_head: Exl3Linear,
     /// Triton split/combine pair, one copy for every attention layer.
     paged: PagedDecode,
-    /// One `i32` token id.
-    token_ids: ByteBuf,
+    /// Token id and the shared position word, staged before each step.
+    staged: StagedInputs,
     /// fp32 `[hidden]` residual stream.
     residual: ByteBuf,
     /// fp16 `[hidden]`. Mixer input, then the final norm output.
@@ -138,11 +142,91 @@ pub struct Model {
     /// the residual in place, so the next block would overwrite a device
     /// snapshot that aliased it. Each block instead queues a device-to-host
     /// copy into pinned memory on the same stream, before the next kernel
-    /// writes the residual. [`Self::decode_step`] synchronizes before it
-    /// returns, which finishes those copies.
+    /// writes the residual. The copy is asynchronous. [`Self::synchronize`]
+    /// (or any sync of `gpu.stream`) finishes it before [`Self::block_residual`]
+    /// is read.
     block_residuals: Vec<PinnedBuf<u8>>,
-    /// Set when the pinned copies above belong to a finished `decode_step`.
+    /// Set when a `decode_step` has queued its snapshot copies.
+    ///
+    /// The bytes are not ready to read until the stream is synchronized.
     captured: bool,
+}
+
+/// How many decode steps may be queued before [`Model::synchronize`].
+///
+/// Each step takes its own pinned slot so the host can write the next token
+/// while an earlier async copy is still in flight. 128 covers the 64-step
+/// bench with the warm-up step included, without a host sync inside
+/// `decode_step`.
+const STAGED_STEPS: usize = 128;
+
+/// Device words the kernels read, plus the pinned slots that fill them.
+///
+/// `token` is one i32, the embedding id. `seq` is one i32 that every
+/// attention layer uses as `cache_seqlens` and as the rope `positions`
+/// pointer. Qwen3.5 text decode has no MRoPE offset, so the position id
+/// and the cache length before the token are the same integer. The fork
+/// assigns `positions = cache_seqlens` in that case (`modules/attn.py`).
+struct StagedInputs {
+    token: ByteBuf,
+    seq: ByteBuf,
+    token_host: Vec<PinnedBuf<u8>>,
+    seq_host: Vec<PinnedBuf<u8>>,
+    used: usize,
+}
+
+impl StagedInputs {
+    fn new(gpu: &Gpu) -> Result<StagedInputs> {
+        let mut token_host = Vec::with_capacity(STAGED_STEPS);
+        let mut seq_host = Vec::with_capacity(STAGED_STEPS);
+        for _ in 0..STAGED_STEPS {
+            token_host.push(PinnedBuf::zeroed(&gpu.ctx, 4)?);
+            seq_host.push(PinnedBuf::zeroed(&gpu.ctx, 4)?);
+        }
+        Ok(Self {
+            token: gpu.zeroed(4)?,
+            seq: gpu.zeroed(4)?,
+            token_host,
+            seq_host,
+            used: 0,
+        })
+    }
+
+    fn enqueue(&mut self, gpu: &Gpu, token: [u8; 4], seq: [u8; 4]) -> Result<()> {
+        if self.used >= STAGED_STEPS {
+            return Err(Error::Input(format!(
+                "staged {STAGED_STEPS} decode steps without Model::synchronize"
+            )));
+        }
+        let index = self.used;
+        self.token_host[index]
+            .as_mut_slice()
+            .copy_from_slice(&token);
+        self.seq_host[index].as_mut_slice().copy_from_slice(&seq);
+        let StagedInputs {
+            token: token_dev,
+            seq: seq_dev,
+            token_host,
+            seq_host,
+            used,
+        } = self;
+        // SAFETY: slot `index` is not written again until `reset`, and
+        // `reset` runs only after `gpu.stream` has been synchronized. Both
+        // device words outlive the copies. Copies already queued for earlier
+        // slots use other pages. This copy is ordered after the previous
+        // step's kernels on `gpu.stream`, so those kernels still read the
+        // previous word.
+        unsafe {
+            token_dev.copy_from_pinned_async(&gpu.stream, &token_host[index])?;
+            seq_dev.copy_from_pinned_async(&gpu.stream, &seq_host[index])?;
+        }
+        *used += 1;
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.used = 0;
+    }
 }
 
 impl Model {
@@ -233,6 +317,15 @@ impl Model {
         for _ in 0..blocks.len() {
             block_residuals.push(PinnedBuf::zeroed(&gpu.ctx, hidden_f32)?);
         }
+        let staged = StagedInputs::new(gpu)?;
+        // One device word for every attention layer. The address is the
+        // allocation's, so moving `staged` later does not change it.
+        let seq_addr = staged.seq.ptr().as_u64();
+        for block in &mut blocks {
+            if let MixerSlot::FullAttn(layer) = &mut block.mixer {
+                layer.bind_sequence(seq_addr, seq_addr);
+            }
+        }
         Ok(Self {
             hidden,
             vocab,
@@ -243,7 +336,7 @@ impl Model {
             final_norm,
             lm_head,
             paged,
-            token_ids: gpu.zeroed(4)?,
+            staged,
             residual: gpu.zeroed(hidden_f32)?,
             norm_out: gpu.zeroed(hidden_f16)?,
             mixer_out: gpu.zeroed(hidden_f32)?,
@@ -260,20 +353,82 @@ impl Model {
     ///
     /// `position` is 0-based. The attention cache already holds `position`
     /// tokens and must have room for this one (`position < max_tokens`).
-    /// After this returns, [`Self::block_residual`] is the fp32 stream at
-    /// the end of each layer.
+    ///
+    /// The token id, rope positions, and `cache_seqlens` are written first,
+    /// by async host-to-device copies from pinned slots on `gpu.stream`.
+    /// The kernels that follow only read those device words. This function
+    /// does not allocate, does not synchronize the host, and does not make
+    /// a synchronous copy.
+    ///
+    /// # Warm-up
+    ///
+    /// The first step after process start can still synchronize, inside
+    /// berth-kernels rather than here. Sliced `exl3_mgemm` (GDN qkv+z and
+    /// attention qkv) and the cooperative `lm_head` GEMM autotune on a
+    /// memory-cache miss (`csrc/autotune.cu`, `tune` calls
+    /// `cudaStreamSynchronize` / `cudaEventSynchronize`). A hit in
+    /// `g_launch_cache` launches and returns. The int8 GEMV workspace and
+    /// the GEMM lock buffer are `cudaMalloc`'d on first use (`int8_sq.cu`
+    /// `workspace`, `linear.cu` `berth_device_locks`), with a synchronous
+    /// `cudaMemset`. One full step touches every decode key, including a
+    /// disk hit that only fills the memory cache. Call [`Self::decode_step`]
+    /// once, then [`Self::synchronize`], before treating a later step as
+    /// free of host syncs and device allocations. Do not warm up on a cache
+    /// you still need empty: the warm-up token is written into the K/V pages
+    /// and the GDN state.
+    ///
+    /// # What still varies as a kernel argument
+    ///
+    /// With the block table fixed at load (`max_tokens / 256` pages) none of
+    /// these change from token to token. The fork patches them on every
+    /// replay anyway, because a growing table changes the width without
+    /// recapturing. The next round writes those graph nodes:
+    ///
+    /// * Triton split, computed in `PagedDecode::launch` from `split_config`
+    ///   of the `num_pages` and `splits_cap` this step passes through
+    ///   [`AttnLayer`]: `split_len` (argument 11), `num_pages_per_seq`
+    ///   (argument 12), `num_splits` (argument 13). Fork:
+    ///   `BC_Attention::run_gr` records `GP_attn_split_len`,
+    ///   `GP_attn_num_pages`, and `GP_attn_num_splits`
+    ///   (`libtorch/attention.cpp`).
+    /// * Triton combine: `num_splits` (argument 4). Fork: `GP_attn_num_splits`
+    ///   on the combine kernel.
+    /// * `quant_cache_paged`: `blocks_per_seq` (argument 8), set in
+    ///   `AttnLayer::quant_launch` to `num_pages`. Fork:
+    ///   `GP_qcache_blocks_per_seq` (`cache/q_cache.cu`).
+    /// * Rope's scalar `position` (argument 13) is constant 0. The live
+    ///   position is `positions[batch]` (`rope.cu` `get_pos`). The fork
+    ///   still records `GP_rope_position` (`rope.cu`) for the mode where
+    ///   the positions pointer is null.
+    ///
+    /// `cache_seqlens` and rope `positions` are device pointers, not
+    /// scalars. The fork records the pointers (`GP_qcache_seqlens`,
+    /// `GP_attn_seqlens`, `GP_rope_positions`) because the tensor storage
+    /// can change between replays. Here the allocation lives as long as
+    /// the model; only the int32 in it changes, via the copy below.
+    ///
+    /// [`Self::block_residual`], [`Self::final_norm`], and the logits are
+    /// readable after [`Self::synchronize`]. [`Self::block_residual`] is the
+    /// fp32 stream at the end of each layer.
     pub fn decode_step(&mut self, gpu: &Gpu, token: u32, position: u32) -> Result<&ByteBuf> {
         self.captured = false;
         self.check_step(token, position)?;
-        self.embed_step(gpu, token)?;
-        let layers = self.blocks.len();
-        for index in 0..layers {
-            self.forward_block(gpu, index, position)?;
-        }
-        self.project(gpu)?;
-        gpu.stream.synchronize()?;
+        self.stage_inputs(gpu, token, position)?;
+        self.run_kernels(gpu)?;
         self.captured = true;
         Ok(&self.logits)
+    }
+
+    /// Wait until every copy and kernel queued by [`Self::decode_step`] has
+    /// finished, then reuse the pinned staging slots.
+    ///
+    /// `gpu.stream` must be the stream the steps were launched on. After
+    /// this returns, [`Self::block_residual`] and [`Self::final_norm`] are
+    /// safe to read. `decode_step` does not call this.
+    pub fn synchronize(&mut self, gpu: &Gpu) -> Result<()> {
+        gpu.stream.synchronize()?;
+        self.staged.reset();
+        Ok(())
     }
 
     /// Number of decoder layers loaded.
@@ -281,11 +436,34 @@ impl Model {
         self.blocks.len()
     }
 
+    /// fp16 `[vocab]` logits of the last [`Self::decode_step`].
+    ///
+    /// The device buffer. Synchronize `gpu.stream` before copying it out.
+    pub fn logits(&self) -> Result<&ByteBuf> {
+        if !self.captured {
+            return Err(Error::Input("decode_step has not completed".to_string()));
+        }
+        Ok(&self.logits)
+    }
+
+    /// fp16 `[hidden]` final norm of the last [`Self::decode_step`].
+    ///
+    /// This is the buffer `lm_head` reads. Synchronize `gpu.stream` before
+    /// copying it out.
+    pub fn final_norm(&self) -> Result<&ByteBuf> {
+        if !self.captured {
+            return Err(Error::Input("decode_step has not completed".to_string()));
+        }
+        Ok(&self.norm_out)
+    }
+
     /// fp32 `[hidden]` residual after layer `index` of the last
     /// [`Self::decode_step`].
     ///
     /// The slice is pinned host memory. It stays valid until the next
-    /// `decode_step` or until `self` is dropped.
+    /// `decode_step` or until `self` is dropped. Synchronize `gpu.stream`
+    /// (see [`Self::synchronize`]) before reading it: the device-to-host
+    /// copy is asynchronous.
     pub fn block_residual(&self, index: u32) -> Result<&[u8]> {
         if !self.captured {
             return Err(Error::Input("decode_step has not completed".to_string()));
@@ -455,21 +633,44 @@ impl Model {
         Ok(())
     }
 
-    fn embed_step(&mut self, gpu: &Gpu, token: u32) -> Result<()> {
+    fn stage_inputs(&mut self, gpu: &Gpu, token: u32, position: u32) -> Result<()> {
         let id = i32::try_from(token).expect("token was checked against vocab");
-        self.token_ids
-            .copy_from_host(&gpu.stream, &id.to_le_bytes())?;
+        let seq = i32::try_from(position)
+            .map_err(|_| Error::Input(format!("position {position} does not fit in i32")))?;
+        // Same four bytes: rope reads them as uint32 (`positions[batch]`),
+        // the cache kernels read them as int32 (`cache_seqlens[batch]`).
+        self.staged
+            .enqueue(gpu, id.to_le_bytes(), seq.to_le_bytes())
+    }
+
+    /// Kernel launches only. Capture this, not [`Self::stage_inputs`].
+    ///
+    /// The async copies of the token id and the position word are already
+    /// queued on `gpu.stream`. No allocation, no host copy, no sync.
+    /// The per-block residual snapshots are async device-to-host copies
+    /// into pinned buffers allocated at load; they are how
+    /// [`Self::block_residual`] observes the stream.
+    fn run_kernels(&mut self, gpu: &Gpu) -> Result<()> {
+        self.embed_step(gpu)?;
+        let layers = self.blocks.len();
+        for index in 0..layers {
+            self.forward_block(gpu, index)?;
+        }
+        self.project(gpu)
+    }
+
+    fn embed_step(&mut self, gpu: &Gpu) -> Result<()> {
         let hidden = self.hidden;
         let Model {
             embed,
-            token_ids,
+            staged,
             residual,
             ..
         } = self;
-        embed_ids(gpu, embed, token_ids, hidden, 1, residual)
+        embed_ids(gpu, embed, &staged.token, hidden, 1, residual)
     }
 
-    fn forward_block(&mut self, gpu: &Gpu, index: usize, position: u32) -> Result<()> {
+    fn forward_block(&mut self, gpu: &Gpu, index: usize) -> Result<()> {
         let hidden = self.hidden;
         let norm = self.norm;
         let Model {
@@ -494,9 +695,7 @@ impl Model {
         )?;
         match &mut blocks[index].mixer {
             MixerSlot::Gdn(layer) => layer.forward(gpu, norm_out, mixer_out)?,
-            MixerSlot::FullAttn(layer) => {
-                layer.forward(gpu, paged, norm_out, mixer_out, position)?
-            }
+            MixerSlot::FullAttn(layer) => layer.forward_bound(gpu, paged, norm_out, mixer_out)?,
         }
         Self::norm_residual(
             gpu,
@@ -510,9 +709,9 @@ impl Model {
         blocks[index].mlp.forward(gpu, mlp_in, mlp_out)?;
         Self::add_residual_in_place(gpu, residual, mlp_out, hidden)?;
         // SAFETY: the copy is queued on `gpu.stream` before any later kernel
-        // on that stream writes `residual`. `decode_step` synchronizes
-        // before `block_residual` reads the pinned pages, and the pages live
-        // on `self` until then.
+        // on that stream writes `residual`. The caller synchronizes that
+        // stream before `block_residual` reads the pinned pages, and the
+        // pages live on `self` until then.
         unsafe {
             residual.copy_to_pinned_async(&gpu.stream, &mut block_residuals[index])?;
         }
