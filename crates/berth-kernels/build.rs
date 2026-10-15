@@ -108,7 +108,85 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", cuda_lib.display());
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=stdc++");
+
+    // Prefill LIN. hgemm.cu's cublasGemmEx must be torch's libcublas, the
+    // copy the serve loads (nvidia/cu13/lib/libcublas.so.13 via
+    // reuse-torch.pth). The CUDA 13.3 toolkit also ships libcublas.so.13, and
+    // a RUNPATH that lists that directory first binds the toolkit copy.
+    // OUT_DIR/cublas-torch holds symlinks of only the two torch sonames
+    // (libcublas.so.13 and libcublasLt.so.13). It is the first RUNPATH entry,
+    // so those resolve to torch. libcudart.so.13 is not in that directory, so
+    // it still comes from the toolkit entry that follows. libcublas's own
+    // RUNPATH is $ORIGIN; the Lt symlink sits beside the cublas symlink.
+    let cublas = torch_cublas();
+    let cublas_dir = cublas.parent().unwrap_or_else(|| {
+        panic!("berth-kernels: {} has no parent", cublas.display());
+    });
+    let cublas_lt = cublas_dir.join("libcublasLt.so.13");
+    if !cublas_lt.is_file() {
+        panic!(
+            "berth-kernels: {} is missing; torch libcublas needs the sibling libcublasLt.so.13",
+            cublas_lt.display()
+        );
+    }
+    let pin = out_dir.join("cublas-torch");
+    std::fs::create_dir_all(&pin)
+        .unwrap_or_else(|err| panic!("berth-kernels: cannot create {}: {err}", pin.display()));
+    for (name, target) in [
+        ("libcublas.so.13", &cublas),
+        ("libcublasLt.so.13", &cublas_lt),
+    ] {
+        let link = pin.join(name);
+        if link.symlink_metadata().is_ok() {
+            std::fs::remove_file(&link).unwrap_or_else(|err| {
+                panic!("berth-kernels: cannot replace {}: {err}", link.display())
+            });
+        }
+        std::os::unix::fs::symlink(target, &link).unwrap_or_else(|err| {
+            panic!("berth-kernels: cannot symlink {}: {err}", link.display())
+        });
+    }
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", pin.display());
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", cuda_lib.display());
+    println!("cargo:rustc-link-arg={}", cublas.display());
+}
+
+/// `libcublas.so.13` from the torch the serve imports.
+///
+/// `/home/sam/qwen38-exl3-dflash2/env` points at that torch with
+/// `reuse-torch.pth` (torch 2.13, `nvidia/cu13/lib`). An older wheel layout
+/// (`nvidia/cublas/lib`) is accepted if the pth target has it.
+fn torch_cublas() -> PathBuf {
+    let pth = PathBuf::from(
+        "/home/sam/qwen38-exl3-dflash2/env/lib/python3.13/site-packages/reuse-torch.pth",
+    );
+    println!("cargo:rerun-if-changed={}", pth.display());
+    let mut site = PathBuf::from("/home/sam/qwen38-exl3-dflash2/env/lib/python3.13/site-packages");
+    if let Ok(text) = std::fs::read_to_string(&pth) {
+        if let Some(line) = text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            site = PathBuf::from(line);
+        }
+    }
+    let candidates = [
+        site.join("nvidia/cu13/lib/libcublas.so.13"),
+        site.join("nvidia/cublas/lib/libcublas.so.13"),
+        site.join("nvidia/cublas/lib/libcublas.so"),
+    ];
+    for candidate in &candidates {
+        if candidate.is_file() {
+            println!("cargo:rerun-if-changed={}", candidate.display());
+            return candidate.clone();
+        }
+    }
+    panic!(
+        "berth-kernels: torch libcublas not found under {} (tried nvidia/cu13/lib and nvidia/cublas/lib).\n\
+         Prefill hgemm has to link the same cuBLAS the fork's hgemm.cu calls through torch.",
+        site.display()
+    );
 }
 
 /// One fork source range: file under `exllamav3_ext/`, first and last line
@@ -246,6 +324,63 @@ const FORK_EXTRACTS: &[Extract] = &[
             last: 768,
             contains: "fs_partial_argmax_kernel",
         }],
+    },
+    // Prefill LIN: rows > 1 EXL3 linear. Device code only; the host side of
+    // these .cu files includes ATen. csrc/prefill_lin launches the templates.
+    Extract {
+        name: "prefill_reconstruct.cuh",
+        parts: &[
+            Part {
+                file: "quant/reconstruct.cu",
+                first: 11,
+                last: 97,
+                contains: "reconstruct_kernel",
+            },
+            Part {
+                file: "quant/reconstruct.cu",
+                first: 200,
+                last: 369,
+                contains: "reconstruct_had_kernel",
+            },
+        ],
+    },
+    Extract {
+        name: "prefill_hadamard.cuh",
+        parts: &[Part {
+            file: "quant/hadamard.cu",
+            first: 9,
+            last: 37,
+            contains: "had_hf_r_128_kernel",
+        }],
+    },
+    Extract {
+        name: "prefill_f16acc.cuh",
+        parts: &[Part {
+            file: "hgemm_f16acc.cu",
+            first: 25,
+            last: 332,
+            contains: "gemm_kernel",
+        }],
+    },
+    // GDNP: Gated DeltaNet prefill. fused_op_2 plus a private copy of the
+    // device helpers it calls (FUSED_OP_2_THREADS, _sigmoid_fast_exp, softplus,
+    // trunc_bf16, as_float). The prefill TU must not include gdn_kernels.cuh.
+    Extract {
+        name: "gdn_prefill_kernels.cuh",
+        parts: &[
+            Part {
+                file: "gdn.cu",
+                first: 19,
+                last: 51,
+                contains: "FUSED_OP_2_THREADS",
+            },
+            Part {
+                file: "gdn.cu",
+                first: 237,
+                last: 270,
+                contains: "gated_delta_net_fused_op_2_kernel",
+            },
+        ],
     },
 ];
 

@@ -164,3 +164,30 @@ kernel 本體（`.cuh`）大多吃裸指標。外層 launcher 吃 `at::Tensor`�
 - DFlash2 草稿加驗證的那一步，還沒錄 profile
 - 這份只涵蓋 27B。另外三個目標要加的 kernel（MoE、QSA、PLE、視覺塔）見 [models.md](models.md)，還沒有清單
 - `berth-plan` 的每 token 搬運量把整張 embedding（2.54 GB）算進去，實際只讀一列。估算要扣掉
+
+## Prefill 實測
+
+2026-10-15，服務停著時跑的。`scripts/profile_27b_prefill.py`：只載 target，cq3，暖機一個 job 之後，錄第二個 job 從 prefill 開始到抽出第一個 token。
+
+| prompt | GPU 時間 | 每 token |
+|---|---|---|
+| 1500 token | 1478 ms | 約 0.99 ms |
+| 100 token | 169 ms | 約 1.7 ms |
+
+decode 是每 token 25.8 ms，所以 prefill 一個 token 大約快 26 倍。
+
+fork 的 generator 只 prefill `ids[:-1]`，最後一個 token 走 decode 路徑（100 token 那次看得到 int8 GEMV、decode attention 和抽樣 kernel）。
+
+1500 token 的時間大頭：
+
+| kernel | 佔比 | 是誰 |
+|---|---|---|
+| `f16acc::gemm_kernel`（兩種） | 58.8% | fork 自己的 fp16 累加 GEMM，`EXL3_HGEMM_F16ACC=auto` |
+| `reconstruct_had_kernel`、`reconstruct_kernel`、`had_hf_r_128`、`had_ff_r_128` | 約 14% | m > 144 時先把 EXL3 權重還原成 fp16 |
+| cutlass / `ampere_*gemm`（cuBLAS） | 約 13% | 部分 GEMM 走 cuBLAS |
+| `_paged_attn_prefill_kernel` | 2.0% | Triton attention prefill |
+| `chunk_gated_delta_rule_fwd_kernel_h_blockdim64`、`chunk_fwd_kernel_o`、`recompute_w_u_fwd_kernel`、`chunk_gated_delta_rule_fwd_kkt_solve_kernel`、`l2norm_fwd_kernel`、`chunk_local_cumsum_scalar_kernel` | 約 2% | vendored fla 的 Triton chunk kernel，GDN 在 seqlen ≥ 48 時走這條 |
+| `_causal_conv1d_update_slotted*` | 0.5% | Triton conv1d |
+| ATen `elementwise_kernel` | 約 2% | 轉型、複製、殘差相加 |
+
+100 token 時 Linear 走協作式 `exl3_gemm_kernel`（m ≤ 144，`AUTO_RECONSTRUCT_THRESHOLD`），不還原權重，cuBLAS 只剩 `cutlass 64x64` 和 `splitKreduce`。

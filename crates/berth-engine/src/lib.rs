@@ -29,6 +29,7 @@ pub mod gdn;
 pub mod generate;
 pub mod mlp;
 pub mod model;
+pub mod prefill;
 pub mod sampler;
 
 pub use device::{upload_tensor, Exl3Linear, Gpu};

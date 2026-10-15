@@ -1,0 +1,13 @@
+{
+  "seed": 20261015,
+  "layer": 3,
+  "q_norm": "model.language_model.layers.3.self_attn.q_norm.weight",
+  "k_norm": "model.language_model.layers.3.self_attn.k_norm.weight",
+  "note": "Reference tensors are regenerated from this seed into /tmp/berth-attn-prefill. They are larger than 4 MB, so they are not stored here.",
+  "cases": [
+    {"name": "q47", "q_len": 47, "past_len": 0, "pages": 1},
+    {"name": "q300", "q_len": 300, "past_len": 0, "pages": 2},
+    {"name": "q1499", "q_len": 1499, "past_len": 0, "pages": 6},
+    {"name": "q300_at_1499", "q_len": 300, "past_len": 1499, "pages": 8, "cache_in": true}
+  ]
+}

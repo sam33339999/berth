@@ -31,10 +31,13 @@
 //! outputs match the kernel output.
 
 pub mod attn;
+pub mod attn_prefill;
 mod error;
 mod ffi;
 pub mod gdn;
+pub mod gdn_prefill;
 pub mod ops;
+pub mod prefill_lin;
 pub mod sample;
 
 pub use error::{Error, Result};

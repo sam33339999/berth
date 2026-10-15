@@ -1,0 +1,22 @@
+{
+  "lcg": "u32 x = x * 1664525 + 1013904223; bits = (x & 0x7fffff) | 0x3f000000; if x & 0x100 { bits |= 0x80000000 }. f32 is those bits. conv state bf16 keeps the high 16 bits (truncation, not round-to-nearest).",
+  "seeds": {
+    "qkv": 1835938119,
+    "z": 1835938138,
+    "b": 1835938114,
+    "a": 1835938113,
+    "conv": 1835938115,
+    "rec": 1835938130
+  },
+  "beta_scale": 1.0,
+  "prefix_bytes": 32,
+  "cases": [
+    {"seqlen": 47, "zero_state": true, "slot": 0, "num_slots": 1, "history_stride": 1},
+    {"seqlen": 47, "zero_state": false, "slot": 0, "num_slots": 1, "history_stride": 1},
+    {"seqlen": 300, "zero_state": true, "slot": 0, "num_slots": 1, "history_stride": 1},
+    {"seqlen": 300, "zero_state": false, "slot": 0, "num_slots": 1, "history_stride": 1},
+    {"seqlen": 1499, "zero_state": true, "slot": 0, "num_slots": 1, "history_stride": 1},
+    {"seqlen": 1499, "zero_state": false, "slot": 0, "num_slots": 1, "history_stride": 1},
+    {"seqlen": 47, "zero_state": false, "slot": 1, "num_slots": 2, "history_stride": 2}
+  ]
+}
