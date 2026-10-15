@@ -7,3 +7,5 @@ publish.workspace = true
 description = "CUDA driver layer for the berth runtime"
 
 [dependencies]
+cuda-core = "=0.4.0"
+thiserror.workspace = true

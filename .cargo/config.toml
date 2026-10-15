@@ -1,0 +1,6 @@
+# libclang1-21 is installed without the clang resource headers
+# (`stddef.h` and the rest of the builtin include dir). bindgen, via
+# cuda-bindings, then fails to parse `cuda.h`. Point it at gcc's builtin
+# headers, which provide those files on this machine.
+[env]
+BINDGEN_EXTRA_CLANG_ARGS = "-I/usr/lib/gcc/x86_64-linux-gnu/15/include"

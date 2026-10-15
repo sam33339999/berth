@@ -7,4 +7,4 @@ publish.workspace = true
 description = "exllamav3 kernel bindings for the berth runtime"
 
 [dependencies]
-berth-cuda = { path = "../berth-cuda" }
+thiserror.workspace = true
