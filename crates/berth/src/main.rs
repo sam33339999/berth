@@ -106,6 +106,11 @@ struct Args {
         default_value_t = DEFAULT_PRESENCE_PENALTY
     )]
     presence_penalty: f32,
+
+    /// MTP draft tokens. 0 leaves the current decode path.
+    /// 1..=15 loads the MTP head and widens GDN history.
+    #[arg(long, env = "BERTH_MTP_STEPS", default_value_t = 0)]
+    mtp_steps: u32,
 }
 
 fn main() {
@@ -136,7 +141,12 @@ fn main() {
         args.port,
     );
 
-    let engine = match berth_engine::Engine::load(&args.model, &args.cubins, args.cache_tokens) {
+    let engine = match berth_engine::Engine::load(
+        &args.model,
+        &args.cubins,
+        args.cache_tokens,
+        args.mtp_steps,
+    ) {
         Ok(engine) => engine,
         Err(err) => {
             eprintln!("berth: {err}");
@@ -195,6 +205,9 @@ fn check_config(args: &Args) -> Result<(), String> {
             args.max_model_len, args.cache_tokens
         ));
     }
+    if args.mtp_steps > 15 {
+        return Err(format!("mtp-steps must be 0..=15 (got {})", args.mtp_steps));
+    }
     Ok(())
 }
 
@@ -247,6 +260,7 @@ mod tests {
         "FREQ_PENALTY",
         "FREQ_RANGE",
         "PRESENCE_PENALTY",
+        "BERTH_MTP_STEPS",
     ];
 
     struct RestoreEnv {
@@ -310,6 +324,7 @@ mod tests {
             assert_eq!(args.freq_penalty, DEFAULT_FREQ_PENALTY);
             assert_eq!(args.freq_range, DEFAULT_FREQ_RANGE);
             assert_eq!(args.presence_penalty, DEFAULT_PRESENCE_PENALTY);
+            assert_eq!(args.mtp_steps, 0);
             assert!(check_config(&args).is_ok());
         });
     }
@@ -456,6 +471,8 @@ mod tests {
             "FREQ_RANGE",
             "--presence-penalty",
             "PRESENCE_PENALTY",
+            "--mtp-steps",
+            "BERTH_MTP_STEPS",
             "[env:",
             "[default:",
         ];
@@ -466,5 +483,35 @@ mod tests {
             !help.contains("--max-tokens"),
             "hidden alias leaked into help:\n{help}"
         );
+    }
+
+    #[test]
+    fn mtp_steps_parses_0_4_and_15() {
+        with_env(&[], || {
+            let zero = parse(&["berth", "--mtp-steps", "0"]);
+            let four = parse(&["berth", "--mtp-steps", "4"]);
+            let fifteen = parse(&["berth", "--mtp-steps", "15"]);
+            assert_eq!(zero.mtp_steps, 0);
+            assert_eq!(four.mtp_steps, 4);
+            assert_eq!(fifteen.mtp_steps, 15);
+            assert!(check_config(&zero).is_ok());
+            assert!(check_config(&four).is_ok());
+            assert!(check_config(&fifteen).is_ok());
+        });
+        with_env(&[("BERTH_MTP_STEPS", "4")], || {
+            let args = parse(&["berth"]);
+            assert_eq!(args.mtp_steps, 4);
+            assert!(check_config(&args).is_ok());
+        });
+    }
+
+    #[test]
+    fn mtp_steps_rejects_16() {
+        with_env(&[], || {
+            let args = parse(&["berth", "--mtp-steps", "16"]);
+            let err = check_config(&args).unwrap_err();
+            assert!(err.contains("0..=15"), "{err}");
+            assert!(err.contains("16"), "{err}");
+        });
     }
 }

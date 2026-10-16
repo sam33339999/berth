@@ -266,4 +266,80 @@ impl Exl3Linear {
         }
         Ok(())
     }
+
+    /// `c = a @ W` for `rows` rows, without a vocab-sized [`RowScratch`].
+    ///
+    /// `rows == 1` calls [`Self::forward`] and ignores `a_had` (the linear's
+    /// own one-row image). `rows` 2..=144 calls
+    /// [`berth_kernels::prefill_lin::exl3_linear`] with `a_had` and a null
+    /// reconstruct pointer: verify's `lm_head` is K = 6, so this is the
+    /// cooperative GEMM, never QTIP. `rows == 0` or `rows > 144` is an error.
+    ///
+    /// # Errors
+    ///
+    /// `rows` is outside 1..=144, or `a`, `c`, or `a_had` is shorter than
+    /// `rows` times the corresponding width.
+    pub fn forward_n(
+        &mut self,
+        gpu: &Gpu,
+        a_had: &ByteBuf,
+        a: &ByteBuf,
+        c: &mut ByteBuf,
+        rows: u32,
+        out: OutDtype,
+    ) -> Result<()> {
+        if rows == 1 {
+            return self.forward(gpu, a, c, out);
+        }
+        if rows == 0 || rows > 144 {
+            return Err(Error::Input(format!(
+                "{}: forward_n rows {rows} are outside 1..=144",
+                self.prefix
+            )));
+        }
+        let out_bytes = match out {
+            OutDtype::F16 => 2,
+            OutDtype::F32 => 4,
+        };
+        let rows_u = rows as usize;
+        let k = self.size_k as usize;
+        let n = self.size_n as usize;
+        let had_bytes = rows_u
+            .checked_mul(k)
+            .and_then(|elems| elems.checked_mul(2))
+            .ok_or_else(|| Error::Input(format!("{}: a_had size overflows", self.prefix)))?;
+        let in_bytes = rows_u
+            .checked_mul(k)
+            .and_then(|elems| elems.checked_mul(2))
+            .ok_or_else(|| Error::Input(format!("{}: input size overflows", self.prefix)))?;
+        let out_need = rows_u
+            .checked_mul(n)
+            .and_then(|elems| elems.checked_mul(out_bytes))
+            .ok_or_else(|| Error::Input(format!("{}: output size overflows", self.prefix)))?;
+        if a_had.num_bytes() < had_bytes || a.num_bytes() < in_bytes || c.num_bytes() < out_need {
+            return Err(Error::Input(format!("{}: buffer too small", self.prefix)));
+        }
+        // SAFETY: every buffer is a live device allocation sized for this
+        // shape (checked above), all on `gpu.stream`. `rows <= 144` does not
+        // reconstruct, so the weight pointer stays null.
+        unsafe {
+            berth_kernels::prefill_lin::exl3_linear(
+                ptr(a),
+                ptr(&self.trellis),
+                ptr(c),
+                ptr(&self.suh),
+                ptr(a_had),
+                ptr(&self.svh),
+                std::ptr::null_mut(),
+                rows as i32,
+                self.size_k,
+                self.size_n,
+                self.k_bits,
+                self.codebook,
+                out,
+                gpu.raw_stream(),
+            )?;
+        }
+        Ok(())
+    }
 }

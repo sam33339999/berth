@@ -10,14 +10,23 @@
 //! back at the next position. Generation stops on a stop token, on
 //! `max_new_tokens`, on [`Flow::Cancel`], or when the next token would not
 //! fit in the cache. The stop token is reported.
+//!
+//! `mtp_steps == 0` keeps that loop. `mtp_steps > 0` drafts, verifies, and
+//! rewinds (`docs/mtp.md` section 8). The zero path does not load the MTP head.
 
 use std::path::Path;
 
 use berth_exl3::Checkpoint;
+use berth_kernels::ops;
 use berth_plan::build_plan;
 use berth_plan::from_exl3::model_shape;
 
+use crate::device::ptr;
 use crate::model::Model;
+use crate::mtp::{
+    accept_row, draft_block_pages, nodraft_block_pages, verify_block_pages, AcceptStep, MtpHead,
+    RowSample,
+};
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::{Error, Gpu, Result};
 
@@ -72,6 +81,14 @@ pub struct Engine {
     max_tokens: u32,
     /// Stop ids the serve would put on a job. See [`Self::default_stop_tokens`].
     stop_tokens: Vec<u32>,
+    /// Draft tokens per round. 0 leaves the one-token loop.
+    mtp_steps: u32,
+    /// MTP head and draft cache. Absent when `mtp_steps` is 0.
+    head: Option<MtpHead>,
+    /// fp16 `[hidden]`. Last target final-norm row the next draft reads.
+    mtp_hidden: Option<berth_cuda::ByteBuf>,
+    /// fp16 `[16, hidden]`. Export prefix copied before refresh.
+    mtp_refresh: Option<berth_cuda::ByteBuf>,
 }
 
 /// `Engine` moves to the server thread. A non-`Send` field fails this build
@@ -83,14 +100,44 @@ fn assert_engine_send<T: Send>(_: &T) {}
 impl Engine {
     /// Open the checkpoint at `model_dir` and load it with a `max_tokens` cache.
     /// `cubin_dir` holds the Triton attention cubins (`target/triton-cubins`).
-    pub fn load(model_dir: &Path, cubin_dir: &Path, max_tokens: u32) -> Result<Self> {
+    ///
+    /// `mtp_steps == 0` is the current load: no MTP head, no widened GDN
+    /// history, no draft cache. `1..=15` loads the head and calls
+    /// [`Model::set_max_history`] then [`Model::prepare_verify`].
+    ///
+    /// # Errors
+    ///
+    /// `mtp_steps` is above 15, or the checkpoint or the device load fails.
+    pub fn load(
+        model_dir: &Path,
+        cubin_dir: &Path,
+        max_tokens: u32,
+        mtp_steps: u32,
+    ) -> Result<Self> {
+        if mtp_steps > 15 {
+            return Err(Error::Input(format!(
+                "mtp-steps must be 0..=15 (got {mtp_steps})"
+            )));
+        }
         let stop_tokens = read_default_stop_tokens(model_dir)?;
         let ckpt = Checkpoint::open(model_dir)?;
         let shape = model_shape(&ckpt.config).map_err(|err| Error::Weights(err.to_string()))?;
         let plan = build_plan(&shape).map_err(|err| Error::Weights(err.to_string()))?;
         let gpu = Gpu::new()?;
-        let model = Model::load_with_cubins(&gpu, &ckpt, &plan, max_tokens, cubin_dir)?;
+        let mut model = Model::load_with_cubins(&gpu, &ckpt, &plan, max_tokens, cubin_dir)?;
         let sampler = Sampler::new(&gpu, plan.vocab_size, max_tokens)?;
+        let (head, mtp_hidden, mtp_refresh) = if mtp_steps == 0 {
+            (None, None, None)
+        } else {
+            model.set_max_history(&gpu, mtp_steps)?;
+            model.prepare_verify(&gpu)?;
+            let head = MtpHead::load(&gpu, &ckpt, &shape, max_tokens, cubin_dir)?;
+            let row = hidden_row_bytes(model.hidden_size())?;
+            let wide = row
+                .checked_mul(16)
+                .ok_or_else(|| Error::Input("mtp refresh buffer overflows".into()))?;
+            (Some(head), Some(gpu.zeroed(row)?), Some(gpu.zeroed(wide)?))
+        };
         Ok(Self {
             gpu,
             model,
@@ -98,6 +145,10 @@ impl Engine {
             vocab: plan.vocab_size,
             max_tokens,
             stop_tokens,
+            mtp_steps,
+            head,
+            mtp_hidden,
+            mtp_refresh,
         })
     }
 
@@ -140,6 +191,11 @@ impl Engine {
     ) -> Result<(Finish, Usage)> {
         let prompt_len = self.check_request(request)?;
         self.model.reset_sequence(&self.gpu)?;
+        if self.mtp_steps > 0 {
+            self.sampler
+                .reset(&self.gpu, &request.sampler, &request.prompt)?;
+            return self.generate_mtp(request, on_token, prompt_len);
+        }
         // The fork sizes the decode block table from the job's whole length
         // (`Job.get_max_seq_len`: prompt plus max_new_tokens).
         self.model
@@ -218,6 +274,439 @@ impl Engine {
         }
         Ok(prompt_len)
     }
+
+    fn generate_mtp(
+        &mut self,
+        request: &GenerateRequest,
+        on_token: &mut dyn FnMut(u32) -> Flow,
+        prompt_len: u32,
+    ) -> Result<(Finish, Usage)> {
+        let mut completion = 0u32;
+        match self.prime_prompt(request, on_token, prompt_len, &mut completion)? {
+            Prime::Done(finish) => Ok((finish, usage(prompt_len, completion))),
+            Prime::Live(cursor) => {
+                self.speculate(request, on_token, prompt_len, cursor, &mut completion)
+            }
+        }
+    }
+
+    fn prime_prompt(
+        &mut self,
+        request: &GenerateRequest,
+        on_token: &mut dyn FnMut(u32) -> Flow,
+        prompt_len: u32,
+        completion: &mut u32,
+    ) -> Result<Prime> {
+        if prompt_len == 1 {
+            return self.prime_one_token(request, on_token, completion);
+        }
+        let pages = crate::prefill::prefill_block_pages_mtp(
+            prompt_len,
+            request.max_new_tokens,
+            self.mtp_steps,
+        );
+        let prefix =
+            &request.prompt[..usize::try_from(prompt_len).expect("prompt len fits usize") - 1];
+        let carry = {
+            let Engine {
+                gpu, model, head, ..
+            } = self;
+            let head = head
+                .as_mut()
+                .ok_or_else(|| Error::Input("mtp head is not loaded".into()))?;
+            model
+                .prefill_mtp(gpu, prefix, head, pages)?
+                .ok_or_else(|| Error::Input("mtp prefill returned no carry".into()))?
+        };
+        self.mtp_hidden = Some(carry);
+        let last = usize::try_from(prompt_len).expect("prompt len fits usize") - 1;
+        Ok(Prime::Live(LiveCursor {
+            pending: request.prompt[last],
+            kv: prompt_len - 1,
+        }))
+    }
+
+    fn prime_one_token(
+        &mut self,
+        request: &GenerateRequest,
+        on_token: &mut dyn FnMut(u32) -> Flow,
+        completion: &mut u32,
+    ) -> Result<Prime> {
+        let pages = nodraft_block_pages(1, self.mtp_steps)?;
+        // quant_cache on the existing 1-token path keeps blocks_per_seq at
+        // num_pages while the split reads decode_width. This step calls
+        // decode_step, so it inherits that. forward_qlen passes one width.
+        self.model.set_decode_pages(pages)?;
+        self.model.decode_step(&self.gpu, request.prompt[0], 0)?;
+        self.model.synchronize(&self.gpu)?;
+        self.copy_final_norm()?;
+        let token = {
+            let Engine {
+                gpu,
+                model,
+                sampler,
+                ..
+            } = self;
+            sampler.sample(gpu, model.logits_mut()?)?
+        };
+        *completion += 1;
+        if on_token(token) == Flow::Cancel {
+            return Ok(Prime::Done(Finish::Cancelled));
+        }
+        if request.stop_tokens.contains(&token) {
+            return Ok(Prime::Done(Finish::Stop));
+        }
+        if *completion >= request.max_new_tokens {
+            return Ok(Prime::Done(Finish::Length));
+        }
+        Ok(Prime::Live(LiveCursor {
+            pending: token,
+            kv: 1,
+        }))
+    }
+
+    fn speculate(
+        &mut self,
+        request: &GenerateRequest,
+        on_token: &mut dyn FnMut(u32) -> Flow,
+        prompt_len: u32,
+        mut cursor: LiveCursor,
+        completion: &mut u32,
+    ) -> Result<(Finish, Usage)> {
+        let k = self.mtp_steps;
+        let n = k + 1;
+        let max_tokens = self.max_tokens;
+        loop {
+            // K+1 tokens have to fit. A cache sized to prompt + max_new can
+            // end the request before max_new_tokens. No 1-token fallback.
+            if cursor
+                .kv
+                .checked_add(n)
+                .map(|end| end > max_tokens)
+                .unwrap_or(true)
+            {
+                return Ok((Finish::ContextFull, usage(prompt_len, *completion)));
+            }
+            let drafts = self.draft_k(cursor.pending, cursor.kv, k)?;
+            let cur_len = cursor.kv.checked_add(1).expect("kv + n fit in u32");
+            let pages = verify_block_pages(cur_len, k, k)?;
+            self.model.set_decode_pages(pages)?;
+            let mut ids = Vec::with_capacity(drafts.len() + 1);
+            ids.push(cursor.pending);
+            ids.extend_from_slice(&drafts);
+            self.model.verify_step(&self.gpu, &ids, cursor.kv, pages)?;
+            let round = VerifyRound {
+                request,
+                drafts: &drafts,
+                kv: cursor.kv,
+                n,
+                pages,
+            };
+            match self.walk_verify(&round, on_token, completion)? {
+                Walk::Done(finish) => return Ok((finish, usage(prompt_len, *completion))),
+                Walk::Next(next) => cursor = next,
+            }
+        }
+    }
+
+    fn draft_k(&mut self, pending: u32, kv: u32, k: u32) -> Result<Vec<u32>> {
+        let cur_len = kv
+            .checked_add(1)
+            .ok_or_else(|| Error::Input("draft cur_len overflows".into()))?;
+        let pages = draft_block_pages(cur_len, k)?;
+        let mut drafts = Vec::with_capacity(usize::try_from(k).unwrap_or(0));
+        let mut id = pending;
+        for idx in 0..k {
+            let position = kv
+                .checked_add(idx)
+                .ok_or_else(|| Error::Input("draft position overflows".into()))?;
+            let token = self.one_draft(id, position, pages)?;
+            drafts.push(token);
+            self.copy_draft_norm()?;
+            id = token;
+        }
+        Ok(drafts)
+    }
+
+    fn one_draft(&mut self, id: u32, position: u32, pages: u32) -> Result<u32> {
+        let Engine {
+            gpu,
+            model,
+            head,
+            mtp_hidden,
+            ..
+        } = self;
+        let head = head
+            .as_mut()
+            .ok_or_else(|| Error::Input("mtp head is not loaded".into()))?;
+        let hidden = mtp_hidden
+            .as_ref()
+            .ok_or_else(|| Error::Input("mtp hidden is not allocated".into()))?;
+        head.draft_step(gpu, model, id, hidden, position, pages)
+    }
+
+    fn copy_draft_norm(&mut self) -> Result<()> {
+        let Engine {
+            gpu,
+            head,
+            mtp_hidden,
+            ..
+        } = self;
+        let src = head
+            .as_ref()
+            .ok_or_else(|| Error::Input("mtp head is not loaded".into()))?
+            .draft_norm();
+        let dst = mtp_hidden
+            .as_mut()
+            .ok_or_else(|| Error::Input("mtp hidden is not allocated".into()))?;
+        copy_row(gpu, src, dst, "mtp draft norm")
+    }
+
+    fn copy_final_norm(&mut self) -> Result<()> {
+        let row = hidden_row_bytes(self.model.hidden_size())?;
+        let Engine {
+            gpu,
+            model,
+            mtp_hidden,
+            ..
+        } = self;
+        let src = model.final_norm()?;
+        let dst = mtp_hidden
+            .as_mut()
+            .ok_or_else(|| Error::Input("mtp hidden is not allocated".into()))?;
+        if src.num_bytes() < row || dst.num_bytes() < row {
+            return Err(Error::Input(
+                "mtp hidden row is shorter than the final norm".into(),
+            ));
+        }
+        let n = u64::try_from(row)
+            .map_err(|_| Error::Input("mtp hidden row does not fit in u64".into()))?;
+        // SAFETY: the two buffers are distinct device rows. The copy is
+        // ordered before the sampler reads logits on this stream.
+        unsafe {
+            ops::memcpy_d2d(ptr(dst), ptr(src), n, gpu.raw_stream())?;
+        }
+        Ok(())
+    }
+
+    fn sample_verify_row(&mut self, index: u32) -> Result<u32> {
+        self.model.copy_verify_logit_row(&self.gpu, index)?;
+        let Engine {
+            gpu,
+            model,
+            sampler,
+            ..
+        } = self;
+        sampler.sample(gpu, model.verify_logit_row_mut()?)
+    }
+
+    fn walk_verify(
+        &mut self,
+        round: &VerifyRound<'_>,
+        on_token: &mut dyn FnMut(u32) -> Flow,
+        completion: &mut u32,
+    ) -> Result<Walk> {
+        for i in 0..round.n {
+            let token = self.sample_verify_row(i)?;
+            let step = classify_row(round, token, i, *completion)?;
+            *completion += 1;
+            if on_token(token) == Flow::Cancel {
+                return Ok(Walk::Done(Finish::Cancelled));
+            }
+            let rejected = match step {
+                AcceptStep::Continue => None,
+                AcceptStep::Halt => {
+                    // Halt does not rewind. The request ends; the next generate resets state.
+                    return Ok(Walk::Done(finish_halt(round.request, token)));
+                }
+                AcceptStep::Reject { num_rejected } => Some(num_rejected),
+                AcceptStep::AcceptAll => Some(0),
+            };
+            if let Some(num_rejected) = rejected {
+                let next = self.finish_accept(num_rejected, token, round)?;
+                return Ok(Walk::Next(next));
+            }
+        }
+        Err(Error::Input(
+            "verify window ended without a decision".into(),
+        ))
+    }
+
+    fn finish_accept(
+        &mut self,
+        num_rejected: u32,
+        token: u32,
+        round: &VerifyRound<'_>,
+    ) -> Result<LiveCursor> {
+        self.model.rewind_mtp(&self.gpu, num_rejected)?;
+        let accepted = round.n.checked_sub(num_rejected).ok_or_else(|| {
+            Error::Input("rewind rejected more tokens than the verify window".into())
+        })?;
+        if accepted == 0 {
+            return Err(Error::Input(
+                "rewind rejected the whole verify window".into(),
+            ));
+        }
+        if accepted > 1 {
+            self.refresh_draft(round.drafts, accepted, round.kv, round.pages)?;
+        }
+        self.store_export_row(accepted - 1)?;
+        let kv = round
+            .kv
+            .checked_add(accepted)
+            .ok_or_else(|| Error::Input("verify cache length overflows".into()))?;
+        Ok(LiveCursor { pending: token, kv })
+    }
+
+    fn refresh_draft(&mut self, drafts: &[u32], accepted: u32, kv: u32, pages: u32) -> Result<()> {
+        let rows = accepted - 1;
+        let ids = drafts
+            .get(..usize::try_from(rows).unwrap_or(usize::MAX))
+            .ok_or_else(|| {
+                Error::Input("refresh ids are shorter than the accepted drafts".into())
+            })?;
+        {
+            let Engine {
+                gpu,
+                model,
+                mtp_refresh,
+                ..
+            } = self;
+            let dst = mtp_refresh
+                .as_mut()
+                .ok_or_else(|| Error::Input("mtp refresh buffer is not allocated".into()))?;
+            model.copy_verify_export_prefix(gpu, dst, rows)?;
+        }
+        let start = kv
+            .checked_add(1)
+            .ok_or_else(|| Error::Input("refresh start overflows".into()))?;
+        let Engine {
+            gpu,
+            model,
+            head,
+            mtp_refresh,
+            ..
+        } = self;
+        let head = head
+            .as_mut()
+            .ok_or_else(|| Error::Input("mtp head is not loaded".into()))?;
+        let hidden = mtp_refresh
+            .as_ref()
+            .ok_or_else(|| Error::Input("mtp refresh buffer is not allocated".into()))?;
+        head.refresh(gpu, model, ids, hidden, start, pages)
+    }
+
+    fn store_export_row(&mut self, index: u32) -> Result<()> {
+        let Engine {
+            gpu,
+            model,
+            mtp_hidden,
+            ..
+        } = self;
+        let dst = mtp_hidden
+            .as_mut()
+            .ok_or_else(|| Error::Input("mtp hidden is not allocated".into()))?;
+        model.copy_verify_export_row(gpu, dst, index)
+    }
+}
+
+/// Where the MTP loop is after the prompt is in the cache.
+enum Prime {
+    Done(Finish),
+    Live(LiveCursor),
+}
+
+/// Token not yet in the cache, and the cache length it will be written at.
+struct LiveCursor {
+    pending: u32,
+    kv: u32,
+}
+
+/// One verify window, either finished or ready for another round.
+enum Walk {
+    Done(Finish),
+    Next(LiveCursor),
+}
+
+/// Borrowed inputs of one verify accept loop.
+struct VerifyRound<'a> {
+    request: &'a GenerateRequest,
+    drafts: &'a [u32],
+    kv: u32,
+    n: u32,
+    pages: u32,
+}
+
+fn usage(prompt_len: u32, completion: u32) -> Usage {
+    Usage {
+        prompt_tokens: prompt_len,
+        completion_tokens: completion,
+    }
+}
+
+fn finish_halt(request: &GenerateRequest, token: u32) -> Finish {
+    if request.stop_tokens.contains(&token) {
+        Finish::Stop
+    } else {
+        Finish::Length
+    }
+}
+
+fn classify_row(
+    round: &VerifyRound<'_>,
+    token: u32,
+    i: u32,
+    completion: u32,
+) -> Result<AcceptStep> {
+    let seq_pos = round
+        .kv
+        .checked_add(i)
+        .and_then(|pos| pos.checked_add(1))
+        .ok_or_else(|| Error::Input("verify seq_pos overflows".into()))?;
+    let hits_length = completion
+        .checked_add(1)
+        .map(|next| next >= round.request.max_new_tokens)
+        .unwrap_or(true);
+    let row = RowSample {
+        token,
+        is_stop: round.request.stop_tokens.contains(&token),
+        hits_length,
+        seq_pos,
+    };
+    let draft = if i + 1 < round.n {
+        Some(round.drafts[usize::try_from(i).expect("row index fits usize")])
+    } else {
+        None
+    };
+    accept_row(i, round.n, draft, &row)
+}
+
+fn hidden_row_bytes(hidden: i32) -> Result<usize> {
+    let width = usize::try_from(hidden).unwrap_or(0);
+    width
+        .checked_mul(2)
+        .ok_or_else(|| Error::Input("mtp hidden row overflows".into()))
+}
+
+fn copy_row(
+    gpu: &Gpu,
+    src: &berth_cuda::ByteBuf,
+    dst: &mut berth_cuda::ByteBuf,
+    what: &str,
+) -> Result<()> {
+    let row = src.num_bytes();
+    if row == 0 || dst.num_bytes() < row {
+        return Err(Error::Input(format!(
+            "{what} does not fit the hidden buffer"
+        )));
+    }
+    let n = u64::try_from(row).map_err(|_| Error::Input(format!("{what} does not fit in u64")))?;
+    // SAFETY: the buffers do not overlap. `row` is the source length and
+    // fits in the destination. Both stay allocated until `gpu.stream` finishes.
+    unsafe {
+        ops::memcpy_d2d(ptr(dst), ptr(src), n, gpu.raw_stream())?;
+    }
+    Ok(())
 }
 
 /// Prompt tokens at positions `0..prompt.len()`.

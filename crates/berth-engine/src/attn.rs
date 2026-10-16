@@ -21,8 +21,8 @@ use std::path::Path;
 use berth_cuda::{ByteBuf, DeviceBuffer, PinnedBuf};
 use berth_exl3::{Bitrate, Checkpoint, DType, HadamardScale};
 use berth_kernels::attn::{
-    deinterleave_qg, mul_sigmoid, quant_cache_paged, rope, splits_cap, PagedDecode,
-    PagedDecodeArgs, QuantCacheLaunch, RopeLaunch,
+    deinterleave_qg, mul_sigmoid, qlen_partial_bytes, quant_cache_paged, rope, splits_cap,
+    PagedDecode, PagedDecodeArgs, QuantCacheLaunch, RopeLaunch,
 };
 use berth_kernels::attn_prefill::{
     needs_staging, partial_bytes, staging_pages, PagedPrefill, PrefillChunk, NORM_EPS, ROTARY_DIM,
@@ -2323,6 +2323,430 @@ fn download_i32(gpu: &Gpu, buf: &ByteBuf) -> Result<Vec<i32>> {
         .chunks_exact(4)
         .map(|word| i32::from_le_bytes([word[0], word[1], word[2], word[3]]))
         .collect())
+}
+
+/// n-row decode scratch for [`AttnLayer::forward_qlen`].
+///
+/// Separate from the one-token buffers on the layer. `mtp_steps == 0` never
+/// allocates this. One scratch is shared by every attention layer; they run
+/// one at a time. Partials cover the largest `q_len` in `1..=max_rows`, which
+/// is not the layer's q_len-1 pair.
+pub struct AttnQlenScratch {
+    max_rows: u32,
+    hidden: i32,
+    width: i32,
+    slices: i32,
+    sm_count: i32,
+    /// fp16 `[max_rows, q_heads * head_dim * 2]`. Interleaved q and gate.
+    qg: ByteBuf,
+    /// fp16 `[max_rows, q_heads * head_dim]`.
+    q: ByteBuf,
+    /// fp16 `[max_rows, q_heads * head_dim]`.
+    g: ByteBuf,
+    /// fp16 `[max_rows, kv_heads * head_dim]`.
+    k: ByteBuf,
+    /// fp16 `[max_rows, kv_heads * head_dim]`.
+    v: ByteBuf,
+    /// fp16 `[max_rows, q_heads * head_dim]`. Attention output, before `o_proj`.
+    attn_out: ByteBuf,
+    /// fp16 `[3, max_rows, hidden]`. The kernel packs with stride `rows`.
+    a_had: ByteBuf,
+    /// fp16 `[slices, max_rows, width]`. Carries the dtype; `c_ptrs` is set.
+    carrier: ByteBuf,
+    /// Device pointers into `qg`, `k`, and `v`. Element size is 2.
+    c_ptrs: ByteBuf,
+    /// fp32 partials from [`qlen_partial_bytes`], sized for the widest tile.
+    partial_o: ByteBuf,
+    partial_ml: ByteBuf,
+}
+
+impl AttnLayer {
+    /// Allocate [`AttnQlenScratch`] for `1..=max_rows` query rows.
+    ///
+    /// `max_rows` is 1..=16. `sm_count` is this GPU's SM count; the partial
+    /// buffers follow [`qlen_partial_bytes`] for every length up to `max_rows`.
+    ///
+    /// # Errors
+    ///
+    /// `max_rows` is outside 1..=16, or `sm_count` is not positive.
+    pub fn qlen_scratch(&self, gpu: &Gpu, max_rows: u32, sm_count: i32) -> Result<AttnQlenScratch> {
+        if !(1..=16).contains(&max_rows) {
+            return Err(Error::Input(format!(
+                "q_len scratch max_rows {max_rows} is outside 1..=16"
+            )));
+        }
+        if sm_count < 1 {
+            return Err(Error::Input(
+                "q_len scratch sm_count must be positive".into(),
+            ));
+        }
+        let rows_i = i32::try_from(max_rows).expect("max_rows is at most 16");
+        let (mut partial_o, mut partial_ml) = (0usize, 0usize);
+        for q_len in 1..=rows_i {
+            let (o_bytes, ml_bytes) = qlen_partial_bytes(q_len, 1, sm_count)?;
+            partial_o = partial_o.max(o_bytes);
+            partial_ml = partial_ml.max(ml_bytes);
+        }
+        let q_cols = Q_HEADS * HEAD_DIM;
+        let kv_cols = KV_HEADS * HEAD_DIM;
+        let qg = gpu.zeroed(fp16_bytes(max_rows, q_cols * 2)?)?;
+        let k = gpu.zeroed(fp16_bytes(max_rows, kv_cols)?)?;
+        let v = gpu.zeroed(fp16_bytes(max_rows, kv_cols)?)?;
+        let ptrs = slice_out_ptrs(
+            qg.ptr().as_u64(),
+            k.ptr().as_u64(),
+            v.ptr().as_u64(),
+            q_cols * 2,
+            kv_cols,
+            self.width,
+        )?;
+        let had = fp16_bytes(max_rows, self.hidden)?
+            .checked_mul(3)
+            .ok_or_else(|| Error::Input("q_len hadamard scratch overflows".into()))?;
+        let carrier = usize::try_from(self.slices)
+            .ok()
+            .and_then(|n| n.checked_mul(usize::try_from(max_rows).unwrap_or(0)))
+            .and_then(|n| n.checked_mul(usize::try_from(self.width).unwrap_or(0)))
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| Error::Input("q_len carrier overflows".into()))?;
+        Ok(AttnQlenScratch {
+            max_rows,
+            hidden: self.hidden,
+            width: self.width,
+            slices: self.slices,
+            sm_count,
+            qg,
+            q: gpu.zeroed(fp16_bytes(max_rows, q_cols)?)?,
+            g: gpu.zeroed(fp16_bytes(max_rows, q_cols)?)?,
+            k,
+            v,
+            attn_out: gpu.zeroed(fp16_bytes(max_rows, q_cols)?)?,
+            a_had: gpu.zeroed(had)?,
+            carrier: gpu.zeroed(carrier)?,
+            c_ptrs: upload_u64(gpu, &ptrs)?,
+            partial_o: gpu.zeroed(partial_o)?,
+            partial_ml: gpu.zeroed(partial_ml)?,
+        })
+    }
+
+    /// Attention for `rows` tokens at `start..start+rows`, fp16 in, fp32 out.
+    ///
+    /// `rows` is 1..=16. Order is `docs/mtp.md` section 4: sliced `exl3_mgemm`
+    /// (`R = rows`), `deinterleave_qg`, fused q/k norm + RoPE, then
+    /// [`PagedDecode::launch_qlen`] (that launch quantizes `rows` K/V rows
+    /// itself), `mul_sigmoid`, and `o_proj`. `bt_width` is the caller's
+    /// block-table width in pages. It does not have to be a multiple of 16.
+    ///
+    /// The cache-length word is left at `start`. A bound layer reads the
+    /// shared word the caller staged; an unbound layer gets `start` via
+    /// [`Self::stage_local`]. The caller writes `start + rows` after every
+    /// layer has read `start`. `rows == 1` uses this linear's own `a_had`;
+    /// `rows > 1` uses `rows_scratch`.
+    ///
+    /// # Errors
+    ///
+    /// `rows` is outside 1..=16, the scratch was built for another shape or
+    /// SM count, `bt_width` is past the padded cache, or the span does not
+    /// fit `max_tokens`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_qlen(
+        &mut self,
+        gpu: &Gpu,
+        kernels: &PagedDecode,
+        scratch: &AttnQlenScratch,
+        rows_scratch: &mut crate::device::RowScratch,
+        input: &ByteBuf,
+        output: &mut ByteBuf,
+        start: u32,
+        rows: u32,
+        bt_width: u32,
+    ) -> Result<()> {
+        if gpu.sm_count != scratch.sm_count {
+            return Err(Error::Input(format!(
+                "q_len scratch was built for {} SMs; this GPU has {}",
+                scratch.sm_count, gpu.sm_count
+            )));
+        }
+        let (rows_i, bt_i) = self.check_qlen(scratch, input, output, start, rows, bt_width)?;
+        if self.bound_seqlens.is_none() {
+            self.stage_local(gpu, start)?;
+        }
+        self.project_qlen(gpu, scratch, input, rows_i)?;
+        self.attend_qlen(gpu, kernels, scratch, rows_i, bt_i)?;
+        self.project_o_qlen(gpu, rows_scratch, scratch, output, rows)
+    }
+
+    fn check_qlen(
+        &self,
+        scratch: &AttnQlenScratch,
+        input: &ByteBuf,
+        output: &ByteBuf,
+        start: u32,
+        rows: u32,
+        bt_width: u32,
+    ) -> Result<(i32, i32)> {
+        if !(1..=16).contains(&rows) || rows > scratch.max_rows {
+            return Err(Error::Input(format!(
+                "q_len {rows} is outside 1..={} (scratch holds {})",
+                16, scratch.max_rows
+            )));
+        }
+        if scratch.hidden != self.hidden
+            || scratch.width != self.width
+            || scratch.slices != self.slices
+        {
+            return Err(Error::Input(
+                "q_len scratch was built for a different attention shape".into(),
+            ));
+        }
+        if scratch.sm_count < 1 {
+            return Err(Error::Input(
+                "q_len scratch sm_count must be positive".into(),
+            ));
+        }
+        let rows_i = i32::try_from(rows).expect("rows is at most 16");
+        let limit = u32::try_from(self.num_pages).unwrap_or(0).div_ceil(16) * 16;
+        if bt_width < 1 || bt_width > limit {
+            return Err(Error::Input(format!(
+                "q_len block table is {bt_width} pages; this layer's padded cache is {limit}"
+            )));
+        }
+        let bt_i = i32::try_from(bt_width)
+            .map_err(|_| Error::Input("q_len block table does not fit in i32".into()))?;
+        let end = start
+            .checked_add(rows)
+            .ok_or_else(|| Error::Input("q_len end overflows".into()))?;
+        if end > self.max_tokens {
+            return Err(Error::Input(format!(
+                "q_len [{start}, {end}) does not fit the {}-token cache",
+                self.max_tokens
+            )));
+        }
+        if i32::try_from(start).is_err() {
+            return Err(Error::Input(format!(
+                "q_len start {start} does not fit in i32"
+            )));
+        }
+        let hidden = usize::try_from(self.hidden).unwrap_or(0);
+        let rows_u = usize::try_from(rows).unwrap_or(0);
+        let in_bytes = rows_u
+            .checked_mul(hidden)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| Error::Input("q_len input size overflows".into()))?;
+        let out_bytes = rows_u
+            .checked_mul(hidden)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or_else(|| Error::Input("q_len output size overflows".into()))?;
+        need_bytes(input, in_bytes, "q_len input")?;
+        need_bytes(output, out_bytes, "q_len output")?;
+        let (need_o, need_ml) = qlen_partial_bytes(rows_i, 1, scratch.sm_count)?;
+        need_bytes(&scratch.partial_o, need_o, "q_len partial_o")?;
+        need_bytes(&scratch.partial_ml, need_ml, "q_len partial_ml")?;
+        Ok((rows_i, bt_i))
+    }
+
+    fn project_qlen(
+        &self,
+        gpu: &Gpu,
+        scratch: &AttnQlenScratch,
+        input: &ByteBuf,
+        rows: i32,
+    ) -> Result<()> {
+        let stream = gpu.raw_stream();
+        let q_elems = i64::from(rows)
+            .checked_mul(self.q_numel)
+            .ok_or_else(|| Error::Input("q_len element count overflows".into()))?;
+        // SAFETY: slice lists alias this layer's q/k/v trellis. `c_ptrs`
+        // address `scratch`'s qg/k/v. `a_had` is packed with stride `rows`.
+        // The carrier is not written when `c_ptrs` is set. q, g, and qg do
+        // not overlap. All of them outlive `gpu.stream`.
+        unsafe {
+            let _shape = berth_kernels::prefill_lin::exl3_mgemm(
+                ptr(input).cast_const(),
+                ptr(&self.b_list).cast_const(),
+                ptr(&scratch.carrier),
+                ptr(&self.suh_list).cast_const(),
+                ptr(&scratch.a_had),
+                ptr(&self.svh_list).cast_const(),
+                rows,
+                self.size_k,
+                self.width,
+                self.k_bits,
+                self.codebook,
+                OutDtype::F16,
+                1,
+                self.slices,
+                ptr(&self.size_n_list) as *const i32,
+                ptr(&scratch.c_ptrs).cast_const(),
+                ptr(&self.n_stride_list) as *const i32,
+                ptr(&self.had_src_list) as *const i32,
+                3,
+                stream,
+            )?;
+            deinterleave_qg(
+                ptr(&scratch.qg).cast_const(),
+                ptr(&scratch.q),
+                ptr(&scratch.g),
+                self.head_dim,
+                q_elems,
+                stream,
+            )?;
+            rope(&self.qlen_rope(scratch, rows), stream)?;
+        }
+        Ok(())
+    }
+
+    fn qlen_rope(&self, scratch: &AttnQlenScratch, rows: i32) -> RopeLaunch {
+        let q = ptr(&scratch.q);
+        let k = ptr(&scratch.k);
+        // Scalar `position` stays 0. `positions[batch]` is `start`, staged by
+        // the caller (bound) or by `stage_local` (unbound). `get_pos` adds
+        // the token offset inside the tile, so the n rows are `start..start+n`.
+        RopeLaunch {
+            q: q.cast_const(),
+            out_q: q,
+            k: k.cast_const(),
+            out_k: k,
+            inv_freq: ptr(&self.inv_freq).cast_const(),
+            bsz: 1,
+            seq_len: rows,
+            num_heads_q: self.q_heads,
+            num_heads_k: self.kv_heads,
+            head_dim: self.head_dim,
+            q_head_stride: self.head_dim,
+            k_head_stride: self.head_dim,
+            partial_head_dim: self.partial_head_dim,
+            position: 0,
+            positions: self.positions_ptr(),
+            position_ids: std::ptr::null(),
+            rope_mode: ROPE_NEOX,
+            attn_factor: 1.0,
+            q_norm: ptr(&self.q_norm).cast_const(),
+            k_norm: ptr(&self.k_norm).cast_const(),
+            norm_eps: self.norm_eps,
+            norm_constant_bias: 1.0,
+            inv_freq_table: false,
+            inv_freq_stride: 0,
+            llama_4_scaling_beta: 0.0,
+            llama_4_scaling_original: 0,
+            position_ids_stride: 1,
+            rotate_dims: 1,
+            rotate_offset: 0,
+        }
+    }
+
+    fn attend_qlen(
+        &self,
+        gpu: &Gpu,
+        kernels: &PagedDecode,
+        scratch: &AttnQlenScratch,
+        rows: i32,
+        bt_width: i32,
+    ) -> Result<()> {
+        let quant = QuantCacheLaunch {
+            k_in: ptr(&scratch.k).cast_const(),
+            k_out: ptr(&self.k_pages),
+            k_scales: ptr(&self.k_scales),
+            v_in: ptr(&scratch.v).cast_const(),
+            v_out: ptr(&self.v_pages),
+            v_scales: ptr(&self.v_scales),
+            cache_seqlens: self.seqlens_ptr(),
+            block_table: ptr(&self.block_table).cast_const(),
+            bsz: 1,
+            seq_len: rows,
+            blocks_per_seq: bt_width,
+            token_dim: self.token_dim,
+            k_bits: i32::try_from(CACHE_BITS).unwrap_or(3),
+            v_bits: i32::try_from(CACHE_BITS).unwrap_or(3),
+            page_size: i32::try_from(PAGE).unwrap_or(256),
+            compand_a: 0.0,
+            in_contiguous: true,
+        };
+        let q = scratch.q.ptr().as_u64();
+        let args = PagedDecodeArgs {
+            q,
+            k_cache: self.k_pages.ptr().as_u64(),
+            v_cache: self.v_pages.ptr().as_u64(),
+            block_table: self.block_table.ptr().as_u64(),
+            cache_seqlens: self.seqlens_addr(),
+            out: scratch.attn_out.ptr().as_u64(),
+            partial_o: scratch.partial_o.ptr().as_u64(),
+            partial_ml: scratch.partial_ml.ptr().as_u64(),
+            k_scales: self.k_scales.ptr().as_u64(),
+            v_scales: self.v_scales.ptr().as_u64(),
+            h32: self.h32.ptr().as_u64(),
+            sinks: q,
+        };
+        let q_elems = i64::from(rows)
+            .checked_mul(self.q_numel)
+            .ok_or_else(|| Error::Input("q_len gate count overflows".into()))?;
+        // SAFETY: `launch_qlen` quantizes, then splits and combines. Partials
+        // are this scratch's q_len buffers, not the layer's one-token pair.
+        // The cache write is ordered before the paged read. `mul_sigmoid`
+        // updates `attn_out` in place and does not overlap `g`.
+        unsafe {
+            kernels.launch_qlen(
+                &gpu.stream,
+                &quant,
+                &args,
+                rows,
+                1,
+                bt_width,
+                scratch.sm_count,
+            )?;
+            mul_sigmoid(
+                ptr(&scratch.attn_out),
+                ptr(&scratch.g).cast_const(),
+                q_elems,
+                gpu.raw_stream(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn project_o_qlen(
+        &mut self,
+        gpu: &Gpu,
+        rows_scratch: &mut crate::device::RowScratch,
+        scratch: &AttnQlenScratch,
+        output: &mut ByteBuf,
+        rows: u32,
+    ) -> Result<()> {
+        if rows == 1 {
+            self.o_proj
+                .forward(gpu, &scratch.attn_out, output, OutDtype::F32)
+        } else {
+            self.o_proj.forward_rows(
+                gpu,
+                rows_scratch,
+                &scratch.attn_out,
+                output,
+                rows,
+                OutDtype::F32,
+            )
+        }
+    }
+
+    /// `pages` fits this layer's padded cache. Does not store it.
+    ///
+    /// Same limits as [`Self::set_decode_pages`]. Verify checks every layer
+    /// before any history launch.
+    pub(crate) fn check_qlen_pages(&self, pages: u32) -> Result<()> {
+        if pages < 1 {
+            return Err(Error::Input(
+                "q_len block table needs at least one page".into(),
+            ));
+        }
+        let limit = u32::try_from(self.num_pages).unwrap_or(0).div_ceil(16) * 16;
+        if pages > limit {
+            return Err(Error::Input(format!(
+                "q_len block table is {pages} pages; this layer's padded cache is {limit}"
+            )));
+        }
+        i32::try_from(pages)
+            .map_err(|_| Error::Input("q_len block table does not fit in i32".into()))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

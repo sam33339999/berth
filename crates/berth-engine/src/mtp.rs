@@ -12,12 +12,13 @@
 //! [`MtpHead::draft_step`] calls [`AttnLayer::forward`], which writes
 //! `position` into the layer's private `seqlens` and `positions` words.
 //! That position is the draft index (`kv_position + idx` in the fork), not
-//! the target's cache length. [`MtpHead::prefill_chunk`] calls
-//! [`AttnLayer::prefill`], which stages the chunk start and `start + rows`
-//! into those same private words. The kernels read `seqlens_addr()`, and
-//! that address prefers a bound word, so binding this layer would make the
-//! draft write at the target length. Both entry points error if the layer
-//! is bound.
+//! the target's cache length. [`MtpHead::prefill_chunk`] of more than 16
+//! rows calls [`AttnLayer::prefill`]. A chunk of 1..=16 rows, including
+//! [`MtpHead::refresh`], calls [`AttnLayer::forward_qlen`]. Both stage the
+//! chunk start into the private seqlens and positions words. The kernels
+//! read `seqlens_addr()`, and that address prefers a bound word, so binding
+//! this layer would make the draft write at the target length. Every entry
+//! point errors if the layer is bound.
 
 use std::ffi::c_void;
 use std::path::Path;
@@ -28,7 +29,7 @@ use berth_kernels::attn::PagedDecode;
 use berth_kernels::{ops, sample, OutDtype};
 use berth_plan::ModelShape;
 
-use crate::attn::{AttnLayer, AttnPrefillScratch};
+use crate::attn::{AttnLayer, AttnPrefillScratch, AttnQlenScratch};
 use crate::device::{find_linear, ptr, Exl3Linear, RowScratch};
 use crate::mlp::MlpLayer;
 use crate::model::{self, Model, TextNorm};
@@ -105,6 +106,9 @@ pub struct MtpHead {
     fc: Exl3Linear,
     attn: AttnLayer,
     mlp: MlpLayer,
+    /// `q_len` 1..=16 partials for refresh and a short prefill chunk.
+    /// Not the layer's one-token pair, and not [`Self::attn_scratch`].
+    qlen: AttnQlenScratch,
     /// Decode split/combine for [`MtpHead::draft_step`]. Not the target's.
     paged: PagedDecode,
     attn_scratch: AttnPrefillScratch,
@@ -187,6 +191,9 @@ impl MtpHead {
         let scratch = alloc_scratch(
             gpu, shape, hidden, vocab, max_k, max_n, max_tokens, cubin_dir,
         )?;
+        let qlen = weights
+            .attn
+            .qlen_scratch(gpu, REFRESH_MAX_ROWS, gpu.sm_count)?;
         Ok(Self {
             hidden,
             vocab,
@@ -201,6 +208,7 @@ impl MtpHead {
             fc: weights.fc,
             attn: weights.attn,
             mlp: weights.mlp,
+            qlen,
             paged: scratch.paged,
             attn_scratch: scratch.attn_scratch,
             row_scratch: scratch.row_scratch,
@@ -230,13 +238,14 @@ impl MtpHead {
     /// `hidden` is fp16 `[rows, H]`, the shifted target export.
     /// `block_pages` is this job's block-table width.
     ///
-    /// `rows > 16` uses [`AttnLayer::prefill`]. `rows <= 16` is the refresh
-    /// path and returns before any launch.
+    /// `rows > 16` uses [`AttnLayer::prefill`]. `rows` of 1..=16, including
+    /// [`Self::refresh`], uses [`AttnLayer::forward_qlen`] with the
+    /// `block_pages` the caller passed.
     ///
     /// # Errors
     ///
-    /// The layer is bound, the chunk is empty, `rows <= 16`, a token is
-    /// past the vocabulary, or the chunk does not fit the cache.
+    /// The layer is bound, the chunk is empty, a token is past the
+    /// vocabulary, or the chunk does not fit the cache.
     pub fn prefill_chunk(
         &mut self,
         gpu: &Gpu,
@@ -249,9 +258,7 @@ impl MtpHead {
         self.check_unbound()?;
         let rows = chunk_rows(ids)?;
         if rows <= REFRESH_MAX_ROWS {
-            return Err(Error::Input(
-                "mtp refresh of <= 16 rows needs the q_len path (P3)".into(),
-            ));
+            return self.qlen_block(gpu, model, ids, hidden, start, block_pages);
         }
         self.check_model(model)?;
         self.check_tokens(ids)?;
@@ -288,6 +295,96 @@ impl MtpHead {
             rows,
         )?;
         // The pinned seqlens and positions slots are single-buffered.
+        gpu.stream.synchronize()?;
+        Ok(())
+    }
+
+    /// Rewrite the draft cache after a verify accept.
+    ///
+    /// `rows = ids.len()` is `A - 1` (1..=15). Input layer, input layernorm,
+    /// then [`AttnLayer::forward_qlen`] at `start` (fork: `P + 1`). No MLP
+    /// and no `mtp.norm`. `block_pages` is this round's verify width.
+    ///
+    /// # Errors
+    ///
+    /// `rows` is 0 or above 16, the layer is bound, a token is past the
+    /// vocabulary, or the span does not fit the cache.
+    pub fn refresh(
+        &mut self,
+        gpu: &Gpu,
+        model: &Model,
+        ids: &[u32],
+        hidden: &ByteBuf,
+        start: u32,
+        block_pages: u32,
+    ) -> Result<()> {
+        let rows = chunk_rows(ids)?;
+        if rows > REFRESH_MAX_ROWS {
+            return Err(Error::Input(format!(
+                "mtp refresh takes 1..={REFRESH_MAX_ROWS} rows, got {rows}"
+            )));
+        }
+        self.qlen_block(gpu, model, ids, hidden, start, block_pages)
+    }
+
+    /// Input layer plus `q_len` attention for 1..=16 rows.
+    ///
+    /// `set_decode_pages` stores `block_pages`, and [`AttnLayer::forward_qlen`]
+    /// is also passed that width. The pinned seqlens slot is single-buffered,
+    /// so this synchronizes before returning.
+    fn qlen_block(
+        &mut self,
+        gpu: &Gpu,
+        model: &Model,
+        ids: &[u32],
+        hidden: &ByteBuf,
+        start: u32,
+        block_pages: u32,
+    ) -> Result<()> {
+        self.check_unbound()?;
+        let rows = chunk_rows(ids)?;
+        if rows > REFRESH_MAX_ROWS {
+            return Err(Error::Input(format!(
+                "mtp q_len path takes 1..={REFRESH_MAX_ROWS} rows, got {rows}"
+            )));
+        }
+        self.check_model(model)?;
+        self.check_tokens(ids)?;
+        self.check_span(hidden, start, rows)?;
+        self.attn.set_decode_pages(block_pages)?;
+        self.stage_ids(gpu, ids)?;
+        self.project_input(gpu, model.embedding(), hidden, rows)?;
+        let width = self.hidden;
+        let norm = self.norm;
+        Model::norm_rows(
+            gpu,
+            &self.residual,
+            &self.input_norm,
+            &mut self.block_norm,
+            width,
+            rows,
+            norm,
+        )?;
+        let MtpHead {
+            attn,
+            qlen,
+            row_scratch,
+            block_norm,
+            mixer_out,
+            paged,
+            ..
+        } = self;
+        attn.forward_qlen(
+            gpu,
+            paged,
+            qlen,
+            row_scratch,
+            block_norm,
+            mixer_out,
+            start,
+            rows,
+            block_pages,
+        )?;
         gpu.stream.synchronize()?;
         Ok(())
     }
@@ -786,6 +883,243 @@ fn chunk_rows(ids: &[u32]) -> Result<u32> {
     u32::try_from(ids.len()).map_err(|_| Error::Input("mtp chunk is longer than u32::MAX".into()))
 }
 
+/// cq3 page, in tokens. Decode widths below pad this count up to a multiple of 16.
+const BLOCK_PAGE: u32 = 256;
+
+/// `ceil(tokens / 256)` pages, at least one, then rounded up to a multiple of 16.
+///
+/// `iterate_gen` (`generator.py` 718–721 and 965–966) does this after it has
+/// the token budget. Extra columns stay 0; the kernel stops at the cache length.
+#[must_use]
+pub fn padded_block_pages(tokens: u32) -> u32 {
+    let pages = tokens.div_ceil(BLOCK_PAGE).max(1);
+    pages.div_ceil(16) * 16
+}
+
+/// Draft block-table width for one round.
+///
+/// Token budget is `cur_len + N + 1` (`generator.py` 712–721). `cur_len` is
+/// `len(sequence_ids)`, which includes the token not yet in the cache.
+/// `n` is `num_draft_tokens`.
+///
+/// # Errors
+///
+/// The token sum overflows `u32`.
+pub fn draft_block_pages(cur_len: u32, n: u32) -> Result<u32> {
+    let tokens = cur_len
+        .checked_add(n)
+        .and_then(|sum| sum.checked_add(1))
+        .ok_or_else(|| Error::Input("draft block-table token count overflows".into()))?;
+    Ok(padded_block_pages(tokens))
+}
+
+/// Verify block-table width for one round.
+///
+/// Token budget is `cur_len + N + K` (`generator.py` 950–966). `k` is
+/// `draft_tokens.shape[-1]`. When `K == N` that is `cur_len + 2N`.
+///
+/// # Errors
+///
+/// The token sum overflows `u32`.
+pub fn verify_block_pages(cur_len: u32, n: u32, k: u32) -> Result<u32> {
+    let tokens = cur_len
+        .checked_add(n)
+        .and_then(|sum| sum.checked_add(k))
+        .ok_or_else(|| Error::Input("verify block-table token count overflows".into()))?;
+    Ok(padded_block_pages(tokens))
+}
+
+/// Block-table width of a no-draft forward (`draft_tokens is None`).
+///
+/// Token budget is `cur_len + N` (`generator.py` 950–966). The single-token
+/// prompt's first `decode_step` uses this, not `prompt + max_new_tokens`.
+///
+/// # Errors
+///
+/// The token sum overflows `u32`.
+pub fn nodraft_block_pages(cur_len: u32, n: u32) -> Result<u32> {
+    let tokens = cur_len
+        .checked_add(n)
+        .ok_or_else(|| Error::Input("decode block-table token count overflows".into()))?;
+    Ok(padded_block_pages(tokens))
+}
+
+/// `seq_pos % 2048 == 0` after the token is received.
+///
+/// Generation keeps `seq_pos == prompt_len` and `cached_pages == 0`, so
+/// `job.py`'s checkpoint test collapses to this (`docs/mtp.md` section 5).
+/// Position 0 is a boundary.
+#[must_use]
+pub fn is_checkpoint_boundary(seq_pos: u32) -> bool {
+    seq_pos.is_multiple_of(2048)
+}
+
+/// One walked verify row, already sampled.
+///
+/// The GPU loop builds this after [`crate::sampler::Sampler::sample`] and
+/// does not sample a later row once [`accept_row`] stops the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowSample {
+    /// Token drawn from this row, including a greedy draw.
+    pub token: u32,
+    /// Stop list contains `token`. Checked before [`Self::hits_length`].
+    pub is_stop: bool,
+    /// `completion` reached `max_new_tokens` on this token.
+    pub hits_length: bool,
+    /// `kv_position` after this token is appended. Checkpoint uses this.
+    pub seq_pos: u32,
+}
+
+/// What to do with verify row `i`. `n` is `K + 1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcceptStep {
+    /// Draft `i` matched and this is not a checkpoint. Walk the next row.
+    Continue,
+    /// Mismatch or checkpoint. `num_rejected = n - 1 - i`.
+    Reject { num_rejected: u32 },
+    /// Row `i == n - 1` had no draft. Call `rewind(0)`.
+    AcceptAll,
+    /// Stop token or `max_new_tokens`. Emit the token and do not rewind.
+    Halt,
+}
+
+/// How a verify window ends. [`AcceptEnd::Rewind`] is the `rewind_mtp` argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AcceptEnd {
+    /// `0` is the full-accept conv rewind.
+    Rewind(u32),
+    /// Stop token. Wins over length when both are set on the same row.
+    Stop,
+    /// `max_new_tokens` inside the window.
+    Length,
+}
+
+/// Accept rule for verify row `i` (`generator.py` 1156–1259).
+///
+/// Stop is tested before length, and both are tested before the draft
+/// compare, so a stop on a checkpoint row does not rewind. `draft` is
+/// `draft_tokens[i]` when `i < n - 1` and `None` on the last row.
+///
+/// # Errors
+///
+/// `i >= n`, or a row that still has a draft was passed `None`.
+pub fn accept_row(i: u32, n: u32, draft: Option<u32>, row: &RowSample) -> Result<AcceptStep> {
+    if n == 0 || i >= n {
+        return Err(Error::Input(format!(
+            "accept row {i} is outside a window of {n}"
+        )));
+    }
+    if row.is_stop || row.hits_length {
+        return Ok(AcceptStep::Halt);
+    }
+    if i + 1 < n {
+        let expected = draft.ok_or_else(|| {
+            Error::Input(format!("accept row {i} of {n} still has a draft token"))
+        })?;
+        if row.token != expected || is_checkpoint_boundary(row.seq_pos) {
+            return Ok(AcceptStep::Reject {
+                num_rejected: n - 1 - i,
+            });
+        }
+        return Ok(AcceptStep::Continue);
+    }
+    Ok(AcceptStep::AcceptAll)
+}
+
+/// Walk `samples` until the window stops.
+///
+/// `drafts.len() + 1` is `n`. Samples past the decision are an error, and so
+/// is running out of samples while drafts still match: the GPU loop must not
+/// sample a row it will not walk, and must not stop early on a match.
+///
+/// # Errors
+///
+/// A row index is inconsistent, the sample list does not end on the decision,
+/// or [`accept_row`] rejects the row.
+pub fn accept_window(drafts: &[u32], samples: &[RowSample]) -> Result<AcceptEnd> {
+    let n = u32::try_from(drafts.len())
+        .ok()
+        .and_then(|len| len.checked_add(1))
+        .ok_or_else(|| Error::Input("accept window length overflows".into()))?;
+    let mut used = 0usize;
+    for i in 0..n {
+        let row = samples.get(used).ok_or_else(|| {
+            Error::Input("accept window ran out of samples before the decision".into())
+        })?;
+        used += 1;
+        let draft = if i + 1 < n {
+            Some(drafts[i as usize])
+        } else {
+            None
+        };
+        let step = accept_row(i, n, draft, row)?;
+        if !matches!(step, AcceptStep::Continue) && samples.len() != used {
+            return Err(Error::Input(
+                "accept window has samples past the decision".into(),
+            ));
+        }
+        match step {
+            AcceptStep::Continue => {}
+            AcceptStep::Reject { num_rejected } => return Ok(AcceptEnd::Rewind(num_rejected)),
+            AcceptStep::AcceptAll => return Ok(AcceptEnd::Rewind(0)),
+            AcceptStep::Halt => {
+                return Ok(if row.is_stop {
+                    AcceptEnd::Stop
+                } else {
+                    AcceptEnd::Length
+                });
+            }
+        }
+    }
+    Err(Error::Input(
+        "accept window ended without a decision".into(),
+    ))
+}
+
+/// State source index and conv copy point for one rewind (`docs/mtp.md` section 6).
+///
+/// `state_index` is `None` when `num_tokens == 0` (no state job). `conv_p` is
+/// `None` when `last_history == 0` (no conv job). Otherwise
+/// `state_index = last_history + 1 - num_tokens` and `p = state_size - num_tokens`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RewindPlan {
+    /// Recurrent history index to copy onto index 0.
+    pub state_index: Option<u32>,
+    /// `p` such that conv elements `[p - conv_k, p)` are copied onto `[0, conv_k)`.
+    pub conv_p: Option<u32>,
+}
+
+/// Pure form of `GDNState.rewind`'s index arithmetic.
+///
+/// # Errors
+///
+/// `num_tokens > last_history`, or `state_size < num_tokens` when a conv job runs.
+pub fn rewind_plan(last_history: u32, num_tokens: u32, state_size: u32) -> Result<RewindPlan> {
+    if num_tokens > last_history {
+        return Err(Error::Input(
+            "rewind: num_tokens must be <= last_history".into(),
+        ));
+    }
+    let state_index = if num_tokens == 0 {
+        None
+    } else {
+        Some(last_history + 1 - num_tokens)
+    };
+    let conv_p = if last_history == 0 {
+        None
+    } else {
+        Some(
+            state_size
+                .checked_sub(num_tokens)
+                .ok_or_else(|| Error::Input("rewind: conv p underflows".into()))?,
+        )
+    };
+    Ok(RewindPlan {
+        state_index,
+        conv_p,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -960,5 +1294,128 @@ mod tests {
     fn prefill_pages_8190_grows_by_draft_tokens() {
         assert_eq!(prefill::prefill_block_pages(8190, 1), 32);
         assert_eq!(prefill::prefill_block_pages_mtp(8190, 1, 2), 33);
+    }
+
+    fn row(token: u32, seq_pos: u32) -> RowSample {
+        RowSample {
+            token,
+            is_stop: false,
+            hits_length: false,
+            seq_pos,
+        }
+    }
+
+    #[test]
+    fn accept_window_matches_draft() {
+        // First draft matches. The mismatch is the decision, so the third
+        // sample must not be present.
+        let drafts = [7, 8, 9];
+        let samples = [row(7, 5), row(0, 6)];
+        assert_eq!(
+            accept_window(&drafts, &samples).unwrap(),
+            AcceptEnd::Rewind(2)
+        );
+        let extra = [row(7, 5), row(0, 6), row(1, 7)];
+        assert!(accept_window(&drafts, &extra).is_err());
+    }
+
+    #[test]
+    fn accept_window_rejects_mismatch() {
+        let drafts = [7, 8, 9];
+        let samples = [row(1, 4)];
+        assert_eq!(
+            accept_window(&drafts, &samples).unwrap(),
+            AcceptEnd::Rewind(3)
+        );
+    }
+
+    #[test]
+    fn accept_window_accepts_all() {
+        let drafts = [7, 8];
+        let samples = [row(7, 3), row(8, 4), row(99, 5)];
+        assert_eq!(
+            accept_window(&drafts, &samples).unwrap(),
+            AcceptEnd::Rewind(0)
+        );
+        // No drafts: the single walked row is a full accept (`rewind(0)`).
+        assert_eq!(
+            accept_window(&[], &[row(4, 1)]).unwrap(),
+            AcceptEnd::Rewind(0)
+        );
+    }
+
+    #[test]
+    fn accept_window_eos_does_not_rewind() {
+        // Stop wins over length and over a checkpoint at the same row.
+        let drafts = [7, 8];
+        let samples = [
+            row(7, 10),
+            RowSample {
+                token: 99,
+                is_stop: true,
+                hits_length: true,
+                seq_pos: 2048,
+            },
+        ];
+        assert_eq!(accept_window(&drafts, &samples).unwrap(), AcceptEnd::Stop);
+    }
+
+    #[test]
+    fn accept_window_max_new_tokens_stops() {
+        let drafts = [7, 8];
+        let samples = [
+            row(7, 10),
+            RowSample {
+                token: 3,
+                is_stop: false,
+                hits_length: true,
+                seq_pos: 11,
+            },
+        ];
+        assert_eq!(accept_window(&drafts, &samples).unwrap(), AcceptEnd::Length);
+    }
+
+    #[test]
+    fn accept_window_checkpoint_rejects() {
+        // Matching draft at seq_pos 2048 is still a reject. n = 3, i = 0,
+        // num_rejected = 2. Position 0 is a boundary; 2047 is not.
+        assert!(is_checkpoint_boundary(0));
+        assert!(is_checkpoint_boundary(2048));
+        assert!(!is_checkpoint_boundary(2047));
+        let drafts = [7, 8];
+        let samples = [row(7, 2048)];
+        assert_eq!(
+            accept_window(&drafts, &samples).unwrap(),
+            AcceptEnd::Rewind(2)
+        );
+    }
+
+    #[test]
+    fn rewind_plan_matches_section6_k4() {
+        // K = 4, n = 5, last_history = 4, state_size = conv_k + K = 8.
+        // Reject at i = 0: num_tokens = 4, source index 1, p = 4.
+        let rejected = rewind_plan(4, 4, 8).unwrap();
+        assert_eq!(rejected.state_index, Some(1));
+        assert_eq!(rejected.conv_p, Some(4));
+        // Full accept: no state job, conv copies the tail (`p = state_size`).
+        let full = rewind_plan(4, 0, 8).unwrap();
+        assert_eq!(full.state_index, None);
+        assert_eq!(full.conv_p, Some(8));
+        let cleared = rewind_plan(0, 0, 8).unwrap();
+        assert_eq!(cleared.state_index, None);
+        assert_eq!(cleared.conv_p, None);
+        assert!(rewind_plan(1, 2, 8).is_err());
+    }
+
+    #[test]
+    fn draft_and_verify_pages_match_section3() {
+        // cur_len 101, N = 4: 106 and 109 tokens are both one page, padded to 16.
+        assert_eq!(draft_block_pages(101, 4).unwrap(), 16);
+        assert_eq!(verify_block_pages(101, 4, 4).unwrap(), 16);
+        // 4090 + 4 + 1 = 4095 → 16 pages. 4090 + 4 + 4 = 4098 → ceil 17 → 32.
+        assert_eq!(draft_block_pages(4090, 4).unwrap(), 16);
+        assert_eq!(verify_block_pages(4090, 4, 4).unwrap(), 32);
+        // No-draft first step of a one-token prompt: cur_len + N = 5 → 16 pages.
+        assert_eq!(nodraft_block_pages(1, 4).unwrap(), 16);
     }
 }

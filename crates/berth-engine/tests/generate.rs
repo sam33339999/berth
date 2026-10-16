@@ -55,7 +55,7 @@ fn generate_stops_for_length_cancel_and_greedy() {
     let vocab = vocab_of(&dir);
 
     eprintln!("loading engine");
-    let mut engine = Engine::load(Path::new(&dir), &cubin_dir(), MAX_TOKENS).unwrap();
+    let mut engine = Engine::load(Path::new(&dir), &cubin_dir(), MAX_TOKENS, 0).unwrap();
     assert_eq!(engine.vocab_size(), vocab);
     assert_eq!(engine.max_tokens(), MAX_TOKENS);
     assert_eq!(engine.default_stop_tokens(), &[248_044, 248_046]);

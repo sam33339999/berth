@@ -454,7 +454,7 @@ Kernel 測試，Python 參考的寫法和 `crates/berth-kernels/tests/attn_prefi
 
 **P2，MTP 頭和 target prefill export。** 檔案：新的 `crates/berth-engine/src/mtp.rs`，`model.rs` 只加 `prefill_for_mtp`，`gdn.rs` 只加寬 state 的配置函數（現有 buffer 和 launch 不動）。draft cache 用現有的 cq3 頁配置再配一份。CPU：`mtp.fc` 的形狀、`chunk_bounds` 在 `N` 底下不變、`prefill_block_pages` 加 `N` 之後的頁數（含 8190 從 32 頁變 33 頁）、carry / shift 的列數。`cargo test -p berth-engine`。不跑 GPU。
 
-**P2 已完成。** 公開入口是 `Model::prefill_mtp`（不是這段原稿的 `prefill_for_mtp`）。`max_history == 0` 時 GDN 的 `history_stride` 仍是 1、`state_size` 仍是 4，prefill 仍走 `state_size = 4` 的 cubin。`prefill_block_pages` 沒改。沒跑 GPU。`<= 16` 列的 MTP refresh 回 `Error::Input`，q_len 路徑是 P3。
+**P2 已完成。** 公開入口是 `Model::prefill_mtp`（不是這段原稿的 `prefill_for_mtp`）。`max_history == 0` 時 GDN 的 `history_stride` 仍是 1、`state_size` 仍是 4，prefill 仍走 `state_size = 4` 的 cubin。`prefill_block_pages` 沒改。沒跑 GPU。P2 當時 <= 16 列回 `Error::Input`。P3 改走 `forward_qlen`。
 
 - `gdn_state_launch`、`GdnLayer::set_max_history`、`Model::set_max_history`。
 - `AttnLayer::load_prefixed`、`AttnLayer::set_decode_pages`、`MlpLayer::load_prefixed`。
@@ -466,6 +466,20 @@ Kernel 測試，Python 參考的寫法和 `crates/berth-kernels/tests/attn_prefi
 - CPU 測試：`gdn_state_launch_matches_max_history`、`mtp_tensor_list_has_39_names`、`mtp_27b_tensors_match_the_checkpoint`、`shifted_hidden_rows`、`chunk_bounds_ignore_draft_width`、`prefill_pages_8190_grows_by_draft_tokens`。
 
 **P3，驗證、草稿、接受、rewind。** 檔案：`generate.rs` 的 MTP 分支，`model.rs` 的 `verify_step`，`gdn.rs` 的 `rewind`，`attn.rs` 只加 `q_len = n` 的呼叫（kv rewind 是長度，不是新 kernel），`sampler.rs` 不改。`crates/berth` 的 `--mtp-steps`。CPU：接受條件、EOS 不 rewind、`kv_position % 2048 == 0` 停、`rewind` 的 slot、草稿 / 驗證 block table 寬度。用假的 logits 列，不載模型。`cargo test -p berth-engine` 和 `cargo test -p berth`。
+
+**P3 已完成。** `mtp_steps == 0` 的 prefill / decode / generate、launch 參數、cubin 名稱、block table 寬度都沒改。沒跑 GPU，不宣稱和 fork 逐位元一致。`q_len` 2..=16 的 cubin 這輪沒有編。
+
+- `AttnLayer::qlen_scratch`、`AttnQlenScratch`、`AttnLayer::forward_qlen`、`AttnLayer::check_qlen_pages`。
+- `GdnLayer::history_scratch`、`GdnHistoryScratch`、`GdnLayer::forward_history`、`GdnLayer::rewind`、`GdnLayer::rewind_jobs`、`GdnLayer::clear_history_cursor`、`GdnLayer::check_history_rows`。`last_history` 在 history forward 成功寫完 conv 和 recurrent 之後設成 `rows - 1`。
+- `MlpLayer::forward_n`（`n == 1` 走 `forward`，其餘走 `prefill`）、`Exl3Linear::forward_n`（`lm_head` 的 n 列，不配 vocab 寬的 `RowScratch`）。
+- `Model::prepare_verify`、`Model::set_decode_pages`、`Model::verify_step`、`Model::rewind_mtp`。export / logit 列的拷貝是 `copy_verify_export_prefix`、`copy_verify_export_row`、`copy_verify_logit_row`。
+- `MtpHead::refresh`。`prefill_chunk` 在 1..=16 列改走 `qlen_block`（`AttnLayer::forward_qlen`）；超過 16 列仍是 `AttnLayer::prefill`。
+- 純函數：`padded_block_pages`、`draft_block_pages`、`verify_block_pages`、`nodraft_block_pages`、`is_checkpoint_boundary`、`accept_row`、`accept_window`、`rewind_plan`。GPU 迴圈逐列叫 `accept_row`，不叫 `accept_window`。
+- `Engine::load` 加 `mtp_steps`。0 不載 MTP、不配寬 state、不配 draft cache、不配 verify scratch。1..=15 才載。`generate` 在 `mtp_steps > 0` 時走草稿、驗證、接受、rewind、refresh。
+- CLI：`--mtp-steps` / `BERTH_MTP_STEPS`，預設 0，`check_config` 和 `Engine::load` 都拒絕 16 以上。
+- CPU 測試：`accept_window_matches_draft`、`accept_window_rejects_mismatch`、`accept_window_accepts_all`、`accept_window_eos_does_not_rewind`、`accept_window_max_new_tokens_stops`、`accept_window_checkpoint_rejects`、`rewind_plan_matches_section6_k4`、`draft_and_verify_pages_match_section3`、`mtp_steps_parses_0_4_and_15`、`mtp_steps_rejects_16`。
+
+還沒做：P4 的 GPU 參考和 `tests/mtp_ref.rs`。EOS / `max_new_tokens` 停在視窗中間時不 rewind、也不 refresh（fork 的 `generator.py` 1301–1333 在 deallocate 之前仍可能 refresh draft cache；發出的 token 不受影響，長度字留在 `start + n`，下一次 `generate` 的 `reset_sequence` 才清）。單 token prompt 的第一個 `decode_step` 沿用既有 1-token quant：`blocks_per_seq` 是 `num_pages`，split 用 `decode_width`。cache 剛好只有 `prompt + max_new` 時，投機窗 `K + 1` 可能在 `max_new_tokens` 之前回 `ContextFull`，不會退回 1-token decode。
 
 **P4，參考和 GPU 測試。** 檔案：`scripts/dump_27b_mtp_reference.py`、`crates/berth-engine/tests/mtp_ref.rs`、`crates/berth-kernels/tests/` 裡第 9 節的三支。CPU：新測試在沒設 `BERTH_GPU_TESTS` 時直接成功；腳本能被 Python 語法檢查（`python3 -m py_compile`，不 import torch）。不跑 dump，不跑 GPU。
 

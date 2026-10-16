@@ -303,6 +303,34 @@ impl MlpLayer {
             .forward_rows(gpu, rows_scratch, &scratch.up, output, rows, OutDtype::F32)?;
         Ok(())
     }
+
+    /// `n` rows of the unfused gate / up / `silu_mul` / down sequence.
+    ///
+    /// `n == 1` is [`Self::forward`]. `n >= 2` is [`Self::prefill`]. On the
+    /// 27B `multi_gu` is not built, so `BC_GatedMLP::run_bszN` (`n <= 8`) and
+    /// two `Linear.forward` calls (`n > 8`) launch this same sequence
+    /// (`docs/mtp.md` section 4). [`Self::prefill`] still rejects `rows < 2`.
+    pub fn forward_n(
+        &mut self,
+        gpu: &Gpu,
+        rows_scratch: &mut crate::device::RowScratch,
+        scratch: &mut MlpPrefillScratch,
+        input: &ByteBuf,
+        output: &mut ByteBuf,
+        rows: u32,
+    ) -> Result<()> {
+        if rows == 0 {
+            return Err(Error::Input(format!(
+                "{}: MLP rows must be positive",
+                self.gate.prefix
+            )));
+        }
+        if rows == 1 {
+            self.forward(gpu, input, output)
+        } else {
+            self.prefill(gpu, rows_scratch, scratch, input, output, rows)
+        }
+    }
 }
 
 fn matrix_bytes(rows: u32, cols: u32, elem: usize) -> Result<usize> {
