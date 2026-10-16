@@ -64,13 +64,18 @@ pub struct GdnLayer {
     /// bf16 `[v_head_dim]`, shared by every V head (`w_groups = 1`).
     norm_weight: ByteBuf,
     out_proj: Exl3Linear,
-    /// bf16 `[1, fdim, conv_k]`. `GDNLayerState.conv_state` with one slot and
-    /// `max_history = 0`, which is the reference cache. History off, so the
-    /// kernel uses this whole prefix (`state_size = conv_k`).
+    /// bf16 `[1, fdim, conv_k + max_history]`. `GDNLayerState.conv_state`
+    /// (`gated_delta_net.py`). Load uses `max_history = 0`, so this is
+    /// `[1, fdim, conv_k]` and the kernel's `state_size` is `conv_k`.
     conv_state: ByteBuf,
-    /// f32 `[1, 1, num_v_heads, k_head_dim, v_head_dim]`. History index 0 only,
-    /// so `history_stride = 1`. K-major inside a head.
+    /// f32 `[1, max_history + 1, num_v_heads, k_head_dim, v_head_dim]`.
+    /// Load uses `max_history = 0`, so the leading history axis is 1 and
+    /// `history_stride` is 1. K-major inside a head. History-off launches
+    /// read and write index 0 only; the pointer stays the base of this buffer.
     recurrent_state: ByteBuf,
+    /// Extra conv taps and recurrent history slots past the live state.
+    /// Zero at load. [`Self::set_max_history`] reallocates both buffers.
+    max_history: u32,
     scratch: Scratch,
 }
 
@@ -256,6 +261,7 @@ impl GdnLayer {
             out_proj,
             conv_state: gpu.zeroed(nbytes(conv_elems, 2)?)?,
             recurrent_state: gpu.zeroed(nbytes(recurrent_elems, 4)?)?,
+            max_history: 0,
             scratch,
         })
     }
@@ -287,6 +293,9 @@ impl GdnLayer {
         let d = &self.dims;
         let s = &self.scratch;
         let q = &self.qkvz;
+        // `max_history == 0` is `(1, conv_k)`, the literals this launch used
+        // before the field existed.
+        let (history_stride, state_size) = gdn_state_launch(d.conv_k, self.max_history)?;
         // SAFETY: every pointer is a device allocation owned by this layer or
         // by the caller, sized for the 27B decode shapes checked at load, and
         // live until `stream` finishes. `input` is fp16 `[hidden]`. Optional
@@ -356,7 +365,7 @@ impl GdnLayer {
                 1,
                 d.fdim,
                 1,
-                d.conv_k,
+                state_size,
                 d.conv_k,
                 stream,
             )?;
@@ -373,7 +382,7 @@ impl GdnLayer {
                 d.num_v_heads,
                 d.k_head_dim,
                 d.v_head_dim,
-                1,
+                history_stride,
                 stream,
             )?;
             berth_kernels::gdn::gated_rms_norm(
@@ -394,18 +403,71 @@ impl GdnLayer {
         Ok(())
     }
 
-    /// Zero conv and recurrent state in the allocations from [`Self::load`].
+    /// Zero conv and recurrent state in the current allocations.
     ///
     /// `GDNLayerState.clear` (`gated_delta_net.py`) does `zero_()` on the
     /// slot. `Cache.get_new_state` asks for that when a job has no stashed
     /// checkpoint. Nothing is reallocated. `berth-cuda` has no memset on an
-    /// existing buffer, so the zeros are copied into the same device memory.
-    /// The caller synchronizes `gpu.stream` first if a forward is still queued.
+    /// existing buffer, so the zeros are copied into the same device memory,
+    /// including the history tail after [`Self::set_max_history`]. The caller
+    /// synchronizes `gpu.stream` first if a forward is still queued.
     pub fn reset_state(&mut self, gpu: &Gpu) -> Result<()> {
         zero_in_place(gpu, &mut self.conv_state)?;
         zero_in_place(gpu, &mut self.recurrent_state)?;
         Ok(())
     }
+
+    /// Reallocate conv and recurrent state for `n` history tokens, and zero them.
+    ///
+    /// Shapes are `GDNLayerState` (`gated_delta_net.py`): conv bf16
+    /// `[1, fdim, conv_k + n]`, recurrent fp32
+    /// `[1, n + 1, num_v_heads, k_head_dim, v_head_dim]`. `n == 0` restores
+    /// the load-time sizes. The old allocation is dropped; synchronize
+    /// `gpu.stream` first if a forward is still queued. A `state_size` past
+    /// 19 is stored here and rejected when prefill launches.
+    pub fn set_max_history(&mut self, gpu: &Gpu, n: u32) -> Result<()> {
+        let (slots, state_size) = gdn_state_launch(self.dims.conv_k, n)?;
+        let conv_elems = mul_i32(self.dims.fdim, state_size, "conv state")?;
+        let per_slot = mul_i32(
+            mul_i32(
+                self.dims.num_v_heads,
+                self.dims.k_head_dim,
+                "recurrent state",
+            )?,
+            self.dims.v_head_dim,
+            "recurrent state",
+        )?;
+        let recurrent_elems = mul_i32(slots, per_slot, "recurrent state")?;
+        self.conv_state = gpu.zeroed(nbytes(conv_elems, 2)?)?;
+        self.recurrent_state = gpu.zeroed(nbytes(recurrent_elems, 4)?)?;
+        self.max_history = n;
+        Ok(())
+    }
+}
+
+/// `(history_stride, state_size)` for a GDN launch.
+///
+/// `history_stride = max_history + 1` and `state_size = conv_k + max_history`,
+/// the axes of `GDNLayerState`. `max_history == 0` returns `(1, conv_k)`,
+/// which is what decode and prefill passed before this field existed (`conv_k`
+/// is 4 on the 27B).
+pub fn gdn_state_launch(conv_k: i32, max_history: u32) -> Result<(i32, i32)> {
+    if conv_k < 1 {
+        return Err(Error::Input(format!(
+            "gdn conv kernel {conv_k} must be positive"
+        )));
+    }
+    let stride_u = max_history
+        .checked_add(1)
+        .ok_or_else(|| Error::Input("gdn max_history + 1 overflows".into()))?;
+    let history_stride = i32::try_from(stride_u)
+        .map_err(|_| Error::Input("gdn history_stride does not fit in i32".into()))?;
+    let extra = i32::try_from(max_history)
+        .map_err(|_| Error::Input("gdn max_history does not fit in i32".into()))?;
+    let state_size = conv_k
+        .checked_add(extra)
+        .ok_or_else(|| Error::Input("gdn state_size overflows".into()))?;
+    Ok((history_stride, state_size))
 }
 
 fn zero_in_place(gpu: &Gpu, buf: &mut ByteBuf) -> Result<()> {
@@ -1146,6 +1208,7 @@ impl GdnLayer {
 
     /// Fused op 2, conv, delta rule, gated norm. Writes this layer's state.
     fn run_gdn_prefill(&self, gpu: &Gpu, scratch: &GdnPrefillScratch, rows: i32) -> Result<()> {
+        let (history_stride, state_size) = gdn_state_launch(self.dims.conv_k, self.max_history)?;
         let args = berth_kernels::gdn_prefill::GdnPrefillArgs {
             qkv: scratch.qkv.ptr().as_u64(),
             z: scratch.z.ptr().as_u64(),
@@ -1163,14 +1226,35 @@ impl GdnLayer {
             seqlen: rows,
             slot: 0,
             num_slots: 1,
-            history_stride: 1,
+            history_stride,
             beta_scale: BETA_SCALE,
         };
+        // FLA (`gated_delta_rule.py`) reads `recurrent_state[slot, 0]` and
+        // copies the new state back into that view. `GdnPrefill::launch_chunk`
+        // adds `slot * history_stride * state_bytes` before the pointer. Slot
+        // 0 keeps offset 0 for any stride, so the live state stays the first
+        // `[num_v_heads, k_head_dim, v_head_dim]` block. The recurrent kernel
+        // (`seqlen < 48`) indexes history 0 the same way and uses
+        // `history_stride` only as the slot stride. History-off launches do
+        // not read the tail. `max_history == 0` passes stride 1 and
+        // `state_size == conv_k` (4 on the 27B), and that case calls `run`,
+        // which is the state_size-4 cubin. A wider conv uses
+        // `run_with_state_size`.
+        //
         // SAFETY: every address is a device allocation sized for this chunk
-        // (the scratch holds `max_rows >= rows`; state is the one-slot layer
-        // buffer). `conv_state` and `recurrent_state` are read and written.
-        // `gpu.stream` is the stream `GdnPrefill::load` was given a context for.
-        unsafe { scratch.kernels.run(&gpu.stream, &args)? };
+        // (the scratch holds `max_rows >= rows`; state is this layer's buffer,
+        // wide enough for `state_size` and `history_stride`). `conv_state`
+        // and `recurrent_state` are read and written. `gpu.stream` is the
+        // stream `GdnPrefill::load` was given a context for.
+        if state_size == 4 {
+            unsafe { scratch.kernels.run(&gpu.stream, &args)? };
+        } else {
+            unsafe {
+                scratch
+                    .kernels
+                    .run_with_state_size(&gpu.stream, &args, state_size)?
+            };
+        }
         Ok(())
     }
 }
@@ -1254,7 +1338,9 @@ fn hgemm_ba(
     Ok(())
 }
 
-/// Host copy of the one live GDN slot (`max_batch` 1, `max_history` 0).
+/// Host copy of the one live GDN slot (`max_batch` 1).
+///
+/// `max_history` is 0 unless [`GdnLayer::set_max_history`] widened the buffers.
 pub(crate) struct GdnStateBytes {
     pub conv: Vec<u8>,
     pub recurrent: Vec<u8>,
@@ -1263,14 +1349,17 @@ pub(crate) struct GdnStateBytes {
     pub num_v_heads: u32,
     pub k_head_dim: u32,
     pub v_head_dim: u32,
+    pub max_history: u32,
 }
 
 impl GdnLayer {
-    /// Copy conv and recurrent state. Both buffers are that one slot.
+    /// Copy conv and recurrent state. Both buffers are that one slot, including
+    /// a history tail when [`Self::set_max_history`] widened them.
     ///
-    /// Conv is bf16 `[fdim, conv_k]`. Recurrent is fp32
-    /// `[num_v_heads, k_head_dim, v_head_dim]` (the reference shape has a
-    /// leading 1, which adds no elements). Decode does not call this.
+    /// Conv is bf16 `[fdim, conv_k + max_history]`. Recurrent is fp32
+    /// `[max_history + 1, num_v_heads, k_head_dim, v_head_dim]`. With
+    /// `max_history == 0` those are `[fdim, conv_k]` and
+    /// `[1, num_v_heads, k_head_dim, v_head_dim]`. Decode does not call this.
     pub(crate) fn copy_state(&self, gpu: &Gpu) -> Result<GdnStateBytes> {
         let mut conv = vec![0u8; self.conv_state.num_bytes()];
         self.conv_state.copy_to_host(&gpu.stream, &mut conv)?;
@@ -1285,6 +1374,7 @@ impl GdnLayer {
             num_v_heads: u32::try_from(self.dims.num_v_heads).unwrap_or(0),
             k_head_dim: u32::try_from(self.dims.k_head_dim).unwrap_or(0),
             v_head_dim: u32::try_from(self.dims.v_head_dim).unwrap_or(0),
+            max_history: self.max_history,
         })
     }
 }
@@ -1302,5 +1392,13 @@ mod tests {
             .map(|elem| u16::from_le_bytes([elem[0], elem[1]]))
             .collect();
         assert_eq!(got, vec![1, 4, 2, 5, 3, 6]);
+    }
+
+    #[test]
+    fn gdn_state_launch_matches_max_history() {
+        // conv_k 4 is the 27B kernel. max_history 0 is today's launch.
+        assert_eq!(super::gdn_state_launch(4, 0).unwrap(), (1, 4));
+        assert_eq!(super::gdn_state_launch(4, 2).unwrap(), (3, 6));
+        assert_eq!(super::gdn_state_launch(4, 4).unwrap(), (5, 8));
     }
 }

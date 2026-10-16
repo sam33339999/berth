@@ -12,6 +12,10 @@
 // is min(1024, round_up(dim/4, 32)), and dim must be a multiple of 4.
 // w_groups is 1 and span_heads is false on these norms, so the weight is one
 // row of `dim` elements.
+//
+// MTP pre-fc norms are a separate instance, half in and half out
+// (norm.cu dispatch: rms_norm_kernel<RES_NONE, half, half, bfloat16, half>).
+// The float-in launchers above are unchanged.
 
 #include "check.cuh"
 #include "ops/ops_state.h"
@@ -73,6 +77,39 @@ void launch_rms(
         + " grid=" + std::to_string(rows));
 }
 
+// MTP `pre_fc_norm_*`: fp16 activation, bf16 weight, fp16 out, no residual.
+// Fork instance at exllamav3_ext/norm.cu (the kHalf / kBFloat16 / kHalf /
+// RES_NONE arm). Residual is null. w_groups is 1.
+void launch_rms_f16(
+    const void* x,
+    const void* w,
+    void* y,
+    int rows,
+    int dim,
+    float epsilon,
+    float constant_bias,
+    float constant_scale,
+    cudaStream_t stream)
+{
+    int threads = MIN(NUM_THREADS, CEIL_DIVIDE(dim / 4, 32) * 32);
+    rms_norm_kernel<0, half, half, __nv_bfloat16, half><<<rows, threads, 0, stream>>>(
+        (const half*) x,
+        (const __nv_bfloat16*) w,
+        (half*) y,
+        (half*) nullptr,
+        epsilon,
+        rows,
+        dim,
+        constant_bias,
+        constant_scale,
+        1);
+    berth_cuda_ok(cudaGetLastError(), "rms_norm_f16 launch");
+    berth_ops_set_launch(
+        std::string("rms_norm_kernel<0,half,half,bfloat16,half>")
+        + " block=" + std::to_string(threads)
+        + " grid=" + std::to_string(rows));
+}
+
 void check_rms(const void* x, const void* w, void* y, void* r, int rows, int dim, int res_mode, int weight_bf16)
 {
     if (!x || !w || !y)
@@ -113,6 +150,34 @@ extern "C" int berth_ops_rms_norm(
             launch_rms<0, half>(
                 x, weight, y, nullptr, rows, dim, epsilon, constant_bias, constant_scale, 0,
                 (cudaStream_t) stream);
+        return 0;
+    }
+    catch (const std::exception& err)
+    {
+        berth_ops_set_error(err.what());
+        cudaGetLastError();
+        return -1;
+    }
+}
+
+extern "C" int berth_ops_rms_norm_f16(
+    const void* x,
+    const void* weight,
+    void* y,
+    int rows,
+    int dim,
+    float epsilon,
+    float constant_bias,
+    float constant_scale,
+    void* stream)
+{
+    try
+    {
+        berth_ops_clear();
+        check_rms(x, weight, y, nullptr, rows, dim, 0, 1);
+        launch_rms_f16(
+            x, weight, y, rows, dim, epsilon, constant_bias, constant_scale,
+            (cudaStream_t) stream);
         return 0;
     }
     catch (const std::exception& err)

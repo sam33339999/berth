@@ -29,6 +29,7 @@ pub mod gdn;
 pub mod generate;
 pub mod mlp;
 pub mod model;
+pub mod mtp;
 pub mod prefill;
 pub mod sampler;
 

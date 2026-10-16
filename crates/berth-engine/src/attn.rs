@@ -214,6 +214,35 @@ impl AttnLayer {
                 "layer {layer} is {kind}, not full attention"
             )));
         }
+        Self::load_prefixed(
+            gpu,
+            ckpt,
+            shape,
+            &format!("model.language_model.layers.{layer}.self_attn"),
+            max_tokens,
+        )
+    }
+
+    /// Load `prefix.*` and an empty cq3 cache for `max_tokens`.
+    ///
+    /// [`Self::load`] checks `shape.layer_kinds` and then calls this with
+    /// `model.language_model.layers.{layer}.self_attn`. The MTP head passes
+    /// `mtp.layers.0.self_attn` and has no target layer kind; the caller
+    /// checks that. Rope, the q/k norms, and the interleaved gate still come
+    /// from the target config: `qwen3_5_mtp.py` builds this attention with
+    /// the target `Qwen3_5Config`.
+    pub fn load_prefixed(
+        gpu: &Gpu,
+        ckpt: &Checkpoint,
+        shape: &ModelShape,
+        prefix: &str,
+        max_tokens: u32,
+    ) -> Result<Self> {
+        if max_tokens == 0 || !max_tokens.is_multiple_of(PAGE) {
+            return Err(Error::Input(format!(
+                "max_tokens {max_tokens} is not a positive multiple of {PAGE}"
+            )));
+        }
         if shape.num_q_heads != u32::try_from(Q_HEADS).unwrap_or(0)
             || shape.num_kv_heads != u32::try_from(KV_HEADS).unwrap_or(0)
             || shape.head_dim != u32::try_from(HEAD_DIM).unwrap_or(0)
@@ -240,20 +269,25 @@ impl AttnLayer {
             )));
         }
 
-        let base = format!("model.language_model.layers.{layer}.self_attn");
         let q_features = Q_HEADS * HEAD_DIM;
-        let q = load_source(gpu, ckpt, &format!("{base}.q_proj"), q_features * 2, hidden)?;
+        let q = load_source(
+            gpu,
+            ckpt,
+            &format!("{prefix}.q_proj"),
+            q_features * 2,
+            hidden,
+        )?;
         let k = load_source(
             gpu,
             ckpt,
-            &format!("{base}.k_proj"),
+            &format!("{prefix}.k_proj"),
             KV_HEADS * HEAD_DIM,
             hidden,
         )?;
         let v = load_source(
             gpu,
             ckpt,
-            &format!("{base}.v_proj"),
+            &format!("{prefix}.v_proj"),
             KV_HEADS * HEAD_DIM,
             hidden,
         )?;
@@ -263,25 +297,25 @@ impl AttnLayer {
             || v.codebook != q.codebook
         {
             return Err(Error::Weights(format!(
-                "{base}: q/k/v bitrate or codebook disagree"
+                "{prefix}: q/k/v bitrate or codebook disagree"
             )));
         }
         let width = gcd(gcd(q.n, k.n), v.n);
         if width < 256 || width % 128 != 0 {
             return Err(Error::Weights(format!(
-                "{base}: slice width {width} is not a multiple of 128 of at least 256"
+                "{prefix}: slice width {width} is not a multiple of 128 of at least 256"
             )));
         }
         let lists = slice_lists([&q, &k, &v], width, q.k_bits);
         let slices = i32::try_from(lists.had.len())
-            .map_err(|_| Error::Weights(format!("{base}: too many slices")))?;
+            .map_err(|_| Error::Weights(format!("{prefix}: too many slices")))?;
         if slices < 1 {
-            return Err(Error::Weights(format!("{base}: sliced bundle is empty")));
+            return Err(Error::Weights(format!("{prefix}: sliced bundle is empty")));
         }
 
-        let q_norm = load_norm(gpu, ckpt, &format!("{base}.q_norm.weight"), HEAD_DIM)?;
-        let k_norm = load_norm(gpu, ckpt, &format!("{base}.k_norm.weight"), HEAD_DIM)?;
-        let o_prefix = format!("{base}.o_proj");
+        let q_norm = load_norm(gpu, ckpt, &format!("{prefix}.q_norm.weight"), HEAD_DIM)?;
+        let k_norm = load_norm(gpu, ckpt, &format!("{prefix}.k_norm.weight"), HEAD_DIM)?;
+        let o_prefix = format!("{prefix}.o_proj");
         let o_linear = find_linear(ckpt, &o_prefix)?;
         if o_linear.bias.is_some() {
             return Err(Error::Weights(format!("{o_prefix}: bias is not applied")));
@@ -304,11 +338,16 @@ impl AttnLayer {
                 o_proj.size_k, o_proj.size_n
             )));
         }
-        let q_linear =
-            load_rows_linear(gpu, ckpt, &format!("{base}.q_proj"), hidden, q_features * 2)?;
+        let q_linear = load_rows_linear(
+            gpu,
+            ckpt,
+            &format!("{prefix}.q_proj"),
+            hidden,
+            q_features * 2,
+        )?;
         let kv_n = KV_HEADS * HEAD_DIM;
-        let k_linear = load_rows_linear(gpu, ckpt, &format!("{base}.k_proj"), hidden, kv_n)?;
-        let v_linear = load_rows_linear(gpu, ckpt, &format!("{base}.v_proj"), hidden, kv_n)?;
+        let k_linear = load_rows_linear(gpu, ckpt, &format!("{prefix}.k_proj"), hidden, kv_n)?;
+        let v_linear = load_rows_linear(gpu, ckpt, &format!("{prefix}.v_proj"), hidden, kv_n)?;
 
         let num_pages_u = max_tokens / PAGE;
         let num_pages = i32::try_from(num_pages_u)
@@ -419,6 +458,15 @@ impl AttnLayer {
         self.bound_positions = Some(positions);
     }
 
+    /// Whether [`Self::bind_sequence`] is in effect.
+    ///
+    /// The MTP attention layer must stay unbound. Its draft step writes
+    /// `kv_position + idx`, which is not the target's cache length, so it
+    /// stages its own `seqlens` and `positions` words.
+    pub(crate) fn sequence_is_bound(&self) -> bool {
+        self.bound_seqlens.is_some() || self.bound_positions.is_some()
+    }
+
     /// Set this layer's cache length to 0.
     ///
     /// A fresh job starts at `kv_position = 0` (`generator/pagetable.py`,
@@ -438,6 +486,34 @@ impl AttnLayer {
         let padded = pages.div_ceil(16) * 16;
         let limit = u32::try_from(self.num_pages).unwrap_or(0).div_ceil(16) * 16;
         self.decode_width = i32::try_from(padded.min(limit)).unwrap_or(self.num_pages);
+    }
+
+    /// Set the decode block-table width to `pages`, already padded by the caller.
+    ///
+    /// [`Self::set_decode_width`] derives pages from a token count and rounds
+    /// up to a multiple of 16. MTP passes the width from section 3 of
+    /// `docs/mtp.md` (`ceil((get_max_seq_len + N + 1) / 256)` pages, then
+    /// padded to 16) and this stores that count as-is. `pages` must be at
+    /// least 1 and at most this layer's cache rounded up to a multiple of 16.
+    ///
+    /// # Errors
+    ///
+    /// `pages` is 0, does not fit in `i32`, or is past the padded cache.
+    pub fn set_decode_pages(&mut self, pages: u32) -> Result<()> {
+        if pages < 1 {
+            return Err(Error::Input(
+                "decode block table needs at least one page".into(),
+            ));
+        }
+        let limit = u32::try_from(self.num_pages).unwrap_or(0).div_ceil(16) * 16;
+        if pages > limit {
+            return Err(Error::Input(format!(
+                "decode block table is {pages} pages; this layer's padded cache is {limit}"
+            )));
+        }
+        self.decode_width = i32::try_from(pages)
+            .map_err(|_| Error::Input("decode page count does not fit in i32".into()))?;
+        Ok(())
     }
 
     /// Set the prefill block-table width for this job.

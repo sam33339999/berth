@@ -105,6 +105,43 @@ mod ffi {
             stream: *mut c_void,
         ) -> c_int;
 
+        pub fn berth_ops_rms_norm_f16(
+            x: *const c_void,
+            weight: *const c_void,
+            y: *mut c_void,
+            rows: c_int,
+            dim: c_int,
+            epsilon: f32,
+            constant_bias: f32,
+            constant_scale: f32,
+            stream: *mut c_void,
+        ) -> c_int;
+
+        pub fn berth_ops_embed_tokens_f16(
+            weight: *const c_void,
+            ids: *const c_int,
+            out: *mut c_void,
+            hidden: c_int,
+            n: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+
+        pub fn berth_ops_memcpy_d2d(
+            dst: *mut c_void,
+            src: *const c_void,
+            bytes: u64,
+            stream: *mut c_void,
+        ) -> c_int;
+
+        pub fn berth_ops_cat_f16_last(
+            embedding: *const c_void,
+            hidden: *const c_void,
+            out: *mut c_void,
+            rows: c_int,
+            hidden_size: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+
         pub fn berth_ops_last_error() -> *const c_char;
         pub fn berth_ops_last_launch() -> *const c_char;
     }
@@ -546,6 +583,147 @@ pub unsafe fn embed_tokens(
     stream: *mut c_void,
 ) -> Result<()> {
     let rc = unsafe { ffi::berth_ops_embed_tokens(weight, ids, out, hidden, n, stream) };
+    if rc == 0 {
+        return Ok(());
+    }
+    Err(Error::Launch(error_message(rc)))
+}
+
+/// RMSNorm, fp16 in and fp16 out, bf16 weight, no residual.
+///
+/// Fork: `rms_norm_kernel<0, half, half, bfloat16, half>` (`RES_NONE`), the
+/// arm `exllamav3_ext/norm.cu` takes when `x` and `y` are fp16 and the weight
+/// is bf16. MTP `pre_fc_norm_hidden` and `pre_fc_norm_embedding` are
+/// constructed with `out_dtype=torch.half` and `constant_bias=1`
+/// (`modules/arch_specific/qwen3_5_mtp.py`). The activation they see is
+/// already fp16 (the target post-norm export, and the embedding cast).
+/// `w_groups` is 1. This does not change [`rms_norm`], which stays float in.
+///
+/// # Errors
+///
+/// A null pointer, non-positive `rows` or `dim`, or `dim` not a multiple of
+/// 4 returns [`Error::Launch`] before CUDA.
+///
+/// # Safety
+///
+/// `x` and `y` are fp16, `rows` by `dim`. `weight` is bf16, one row of
+/// `dim`. They stay alive until `stream` completes.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn rms_norm_f16(
+    x: *const c_void,
+    weight: *const c_void,
+    y: *mut c_void,
+    rows: i32,
+    dim: i32,
+    epsilon: f32,
+    constant_bias: f32,
+    constant_scale: f32,
+    stream: *mut c_void,
+) -> Result<()> {
+    let rc = unsafe {
+        ffi::berth_ops_rms_norm_f16(
+            x,
+            weight,
+            y,
+            rows,
+            dim,
+            epsilon,
+            constant_bias,
+            constant_scale,
+            stream,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    Err(Error::Launch(error_message(rc)))
+}
+
+/// Gather embedding rows and round BF16 to fp16.
+///
+/// MTP calls the target embedding with `out_dtype=torch.half`
+/// (`modules/arch_specific/qwen3_5_mtp.py`). `nn.Embedding` returns the bf16
+/// row, then `to2` (`util/tensor.py`) is `.to(torch.half)`. Widening bf16 to
+/// fp32 is exact, and fp32 to fp16 is round-to-nearest-even, so
+/// `__float2half(__bfloat162float(v))` equals that cast. Decode keeps
+/// [`embed_tokens`] (fp32). `ids` must already be in range.
+///
+/// # Errors
+///
+/// A null pointer, or non-positive `hidden` or `n`, returns [`Error::Launch`]
+/// before CUDA.
+///
+/// # Safety
+///
+/// `weight` is BF16 row-major with stride `hidden` and covers every id.
+/// `ids` has `n` `i32` elements. `out` is fp16 `[n, hidden]`. All three stay
+/// alive until `stream` completes.
+pub unsafe fn embed_tokens_f16(
+    weight: *const c_void,
+    ids: *const i32,
+    out: *mut c_void,
+    hidden: i32,
+    n: i32,
+    stream: *mut c_void,
+) -> Result<()> {
+    let rc = unsafe { ffi::berth_ops_embed_tokens_f16(weight, ids, out, hidden, n, stream) };
+    if rc == 0 {
+        return Ok(());
+    }
+    Err(Error::Launch(error_message(rc)))
+}
+
+/// `cudaMemcpyAsync` of `bytes` from `src` to `dst`, device to device.
+///
+/// Ordered on `stream`. The regions must not overlap. Used to build the MTP
+/// shifted hidden (`cat(carry, export[:-1])`) without a host round trip.
+///
+/// # Errors
+///
+/// A null pointer or `bytes == 0` returns [`Error::Launch`] before CUDA.
+///
+/// # Safety
+///
+/// `src` and `dst` are device allocations of at least `bytes` and do not
+/// overlap. They stay alive until `stream` completes.
+pub unsafe fn memcpy_d2d(
+    dst: *mut c_void,
+    src: *const c_void,
+    bytes: u64,
+    stream: *mut c_void,
+) -> Result<()> {
+    let rc = unsafe { ffi::berth_ops_memcpy_d2d(dst, src, bytes, stream) };
+    if rc == 0 {
+        return Ok(());
+    }
+    Err(Error::Launch(error_message(rc)))
+}
+
+/// `out = cat((embedding, hidden), dim=-1)` in fp16.
+///
+/// `embedding` and `hidden` are `[rows, hidden_size]`. `out` is
+/// `[rows, 2 * hidden_size]`, embedding in the first half. This is
+/// `torch.cat((x, y), dim=-1)` in `Qwen3_5MTPInputLayer.forward`.
+///
+/// # Errors
+///
+/// A null pointer, or non-positive `rows` or `hidden_size`, returns
+/// [`Error::Launch`] before CUDA.
+///
+/// # Safety
+///
+/// The three buffers are fp16, do not overlap, and stay alive until
+/// `stream` completes.
+pub unsafe fn cat_f16_last(
+    embedding: *const c_void,
+    hidden: *const c_void,
+    out: *mut c_void,
+    rows: i32,
+    hidden_size: i32,
+    stream: *mut c_void,
+) -> Result<()> {
+    let rc =
+        unsafe { ffi::berth_ops_cat_f16_last(embedding, hidden, out, rows, hidden_size, stream) };
     if rc == 0 {
         return Ok(());
     }

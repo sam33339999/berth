@@ -454,6 +454,17 @@ Kernel 測試，Python 參考的寫法和 `crates/berth-kernels/tests/attn_prefi
 
 **P2，MTP 頭和 target prefill export。** 檔案：新的 `crates/berth-engine/src/mtp.rs`，`model.rs` 只加 `prefill_for_mtp`，`gdn.rs` 只加寬 state 的配置函數（現有 buffer 和 launch 不動）。draft cache 用現有的 cq3 頁配置再配一份。CPU：`mtp.fc` 的形狀、`chunk_bounds` 在 `N` 底下不變、`prefill_block_pages` 加 `N` 之後的頁數（含 8190 從 32 頁變 33 頁）、carry / shift 的列數。`cargo test -p berth-engine`。不跑 GPU。
 
+**P2 已完成。** 公開入口是 `Model::prefill_mtp`（不是這段原稿的 `prefill_for_mtp`）。`max_history == 0` 時 GDN 的 `history_stride` 仍是 1、`state_size` 仍是 4，prefill 仍走 `state_size = 4` 的 cubin。`prefill_block_pages` 沒改。沒跑 GPU。`<= 16` 列的 MTP refresh 回 `Error::Input`，q_len 路徑是 P3。
+
+- `gdn_state_launch`、`GdnLayer::set_max_history`、`Model::set_max_history`。
+- `AttnLayer::load_prefixed`、`AttnLayer::set_decode_pages`、`MlpLayer::load_prefixed`。
+- `MtpHead::load`、`MtpHead::prefill_chunk`、`MtpHead::draft_step`、`MtpHead::draft_norm`。
+- `Model::prefill_mtp`、`Model::prefill_mtp_with`。`export_norm` 關掉時，prefill 的最後一層仍只跑 mixer。
+- `prefill_block_pages_mtp`。8190、`max_new_tokens = 1`、`N = 2` 是 33 頁；`prefill_block_pages(8190, 1)` 仍是 32。
+- `shifted_row`、`next_carry_row`。
+- kernel：`rms_norm_f16`（half in / half out / bf16 weight）、`embed_tokens_f16`（bf16 → fp32 → fp16）、`memcpy_d2d`、`cat_f16_last`。
+- CPU 測試：`gdn_state_launch_matches_max_history`、`mtp_tensor_list_has_39_names`、`mtp_27b_tensors_match_the_checkpoint`、`shifted_hidden_rows`、`chunk_bounds_ignore_draft_width`、`prefill_pages_8190_grows_by_draft_tokens`。
+
 **P3，驗證、草稿、接受、rewind。** 檔案：`generate.rs` 的 MTP 分支，`model.rs` 的 `verify_step`，`gdn.rs` 的 `rewind`，`attn.rs` 只加 `q_len = n` 的呼叫（kv rewind 是長度，不是新 kernel），`sampler.rs` 不改。`crates/berth` 的 `--mtp-steps`。CPU：接受條件、EOS 不 rewind、`kv_position % 2048 == 0` 停、`rewind` 的 slot、草稿 / 驗證 block table 寬度。用假的 logits 列，不載模型。`cargo test -p berth-engine` 和 `cargo test -p berth`。
 
 **P4，參考和 GPU 測試。** 檔案：`scripts/dump_27b_mtp_reference.py`、`crates/berth-engine/tests/mtp_ref.rs`、`crates/berth-kernels/tests/` 裡第 9 節的三支。CPU：新測試在沒設 `BERTH_GPU_TESTS` 時直接成功；腳本能被 Python 語法檢查（`python3 -m py_compile`，不 import torch）。不跑 dump，不跑 GPU。

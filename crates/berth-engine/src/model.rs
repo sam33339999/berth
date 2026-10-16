@@ -31,6 +31,7 @@
 //! `prefer_cpu` and `model_ls.py` loads it on the host; that choice is for
 //! the service, which also keeps a draft model on the same card.
 
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
 use berth_cuda::{ByteBuf, PinnedBuf};
@@ -44,6 +45,7 @@ use crate::attn::{AttnLayer, AttnPrefillScratch};
 use crate::device::{self, ptr, Exl3Linear, RowScratch};
 use crate::gdn::{GdnLayer, GdnPrefillScratch};
 use crate::mlp::{MlpLayer, MlpPrefillScratch};
+use crate::mtp::MtpHead;
 use crate::prefill::{self, AttnCacheImage, GdnStateImage, HostTensor};
 use crate::{Error, Gpu, Result};
 
@@ -535,6 +537,21 @@ impl Model {
         Ok(())
     }
 
+    /// Widen every GDN layer's conv and recurrent state to `n` history tokens.
+    ///
+    /// Full-attention layers are left alone. `n == 0` restores the load-time
+    /// buffers. See [`crate::gdn::GdnLayer::set_max_history`]. Synchronize
+    /// `gpu.stream` first if a forward is still queued: the old allocation
+    /// is dropped.
+    pub fn set_max_history(&mut self, gpu: &Gpu, n: u32) -> Result<()> {
+        for block in &mut self.blocks {
+            if let MixerSlot::Gdn(layer) = &mut block.mixer {
+                layer.set_max_history(gpu, n)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn reset_sequence(&mut self, gpu: &Gpu) -> Result<()> {
         self.synchronize(gpu)?;
         self.captured = false;
@@ -553,6 +570,32 @@ impl Model {
     /// Number of decoder layers loaded.
     pub fn num_layers(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Hidden width. 5120 on the 27B.
+    pub fn hidden_size(&self) -> i32 {
+        self.hidden
+    }
+
+    /// Vocabulary width. `lm_head` `N` matches this.
+    pub fn vocab_size(&self) -> i32 {
+        self.vocab
+    }
+
+    /// Epsilon, bias, and scale of the text RMSNorms.
+    pub fn text_norm(&self) -> TextNorm {
+        self.norm
+    }
+
+    /// BF16 embedding table `[vocab, hidden]`. The MTP head gathers from this
+    /// buffer; it is not copied.
+    pub fn embedding(&self) -> &ByteBuf {
+        &self.embed
+    }
+
+    /// Target `lm_head`. The MTP draft step projects with this linear.
+    pub fn lm_head_mut(&mut self) -> &mut Exl3Linear {
+        &mut self.lm_head
     }
 
     /// fp16 `[vocab]` logits of the last [`Self::decode_step`].
@@ -1028,7 +1071,7 @@ fn default_cubin_dir() -> PathBuf {
 /// `ModelConfig` does not keep this field. The fork reads it from
 /// `config.json` (`read_cfg(float, "text_config->rms_norm_eps")`). On the
 /// 27B that number is `1e-6`.
-fn read_rms_eps(ckpt: &Checkpoint) -> Result<f32> {
+pub(crate) fn read_rms_eps(ckpt: &Checkpoint) -> Result<f32> {
     let path = ckpt.directory.join("config.json");
     let text = std::fs::read_to_string(&path).map_err(|source| Error::Read {
         name: path.display().to_string(),
@@ -1099,7 +1142,7 @@ fn load_embedding(gpu: &Gpu, ckpt: &Checkpoint, vocab: u32, hidden: u32) -> Resu
     device::upload_tensor(gpu, ckpt, &name)
 }
 
-fn load_norm(gpu: &Gpu, ckpt: &Checkpoint, name: &str, hidden: u32) -> Result<ByteBuf> {
+pub(crate) fn load_norm(gpu: &Gpu, ckpt: &Checkpoint, name: &str, hidden: u32) -> Result<ByteBuf> {
     let info = tensor(ckpt, name)?;
     if info.dtype != DType::Bf16 {
         return Err(Error::Weights(format!(
@@ -1164,6 +1207,66 @@ fn expect_bytes(buf: &ByteBuf, bytes: usize, what: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// `shifted = cat(carry, export[:-1])`, then `carry = export[-1]`.
+///
+/// Three device copies. Row 0 of `shifted` is the previous carry (zeros on
+/// the first chunk). Rows `1..rows` are `export[0..rows-1]`. The new carry
+/// is `export[rows-1]`. [`crate::mtp::shifted_row`] is that index map.
+/// A one-row chunk copies only the old carry into `shifted` and replaces
+/// carry with `export[0]`.
+fn shift_hidden(
+    gpu: &Gpu,
+    export: &ByteBuf,
+    shifted: &mut ByteBuf,
+    carry: &mut ByteBuf,
+    hidden: i32,
+    rows: u32,
+) -> Result<()> {
+    if rows < 1 {
+        return Err(Error::Input(
+            "mtp export shift needs at least one row".into(),
+        ));
+    }
+    let row = rows_bytes(hidden, 1, 2)?;
+    let used = rows_bytes(hidden, rows, 2)?;
+    expect_bytes(export, used, "mtp export")?;
+    expect_bytes(shifted, used, "mtp shifted hidden")?;
+    expect_bytes(carry, row, "mtp hidden carry")?;
+    let stream = gpu.raw_stream();
+    let row_len = u64::try_from(row).expect("row byte count fits u64");
+    // Carry is overwritten last. The first copy still reads the old row.
+    // SAFETY: the three buffers are distinct device allocations. Each copy's
+    // source and destination are disjoint and stay allocated until `stream`
+    // finishes. Lengths were checked above.
+    unsafe {
+        ops::memcpy_d2d(ptr(shifted), ptr(carry), row_len, stream)?;
+        if rows > 1 {
+            let prefix = rows_bytes(hidden, rows - 1, 2)?;
+            let prefix_bytes = u64::try_from(prefix).expect("prefix byte count fits u64");
+            ops::memcpy_d2d(ptr_offset(shifted, row)?, ptr(export), prefix_bytes, stream)?;
+        }
+        let last = rows_bytes(hidden, rows - 1, 2)?;
+        ops::memcpy_d2d(ptr(carry), ptr_offset(export, last)?, row_len, stream)?;
+    }
+    Ok(())
+}
+
+/// Device address `offset` bytes into `buf`.
+fn ptr_offset(buf: &ByteBuf, offset: usize) -> Result<*mut c_void> {
+    if offset > buf.num_bytes() {
+        return Err(Error::Input(format!(
+            "device offset {offset} is past {} bytes",
+            buf.num_bytes()
+        )));
+    }
+    let addr = buf
+        .ptr()
+        .as_u64()
+        .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
+        .ok_or_else(|| Error::Input("device offset overflows".into()))?;
+    Ok(addr as *mut c_void)
 }
 
 fn rows_bytes(hidden: i32, rows: u32, elem: usize) -> Result<usize> {
@@ -1373,6 +1476,13 @@ fn stage_chunk_ids(gpu: &Gpu, ids_buf: &mut ByteBuf, tokens: &[u32]) -> Result<(
 /// call. `'cb` is the closure's own borrow, not the residual slice.
 pub type BlockResidualCb<'cb> = dyn for<'a> FnMut(u32, u32, u32, &'a [u8]) -> Result<()> + 'cb;
 
+/// Host observer for one chunk's fp16 final-norm export.
+///
+/// Arguments are `(start, end, export)`. `export` is little-endian fp16,
+/// `(end - start) * hidden` elements, the rows [`Model::prefill_mtp`] writes
+/// before the shifted-hidden MTP prefill. The slice is live only for the call.
+pub type ExportCb<'cb> = dyn for<'a> FnMut(u32, u32, &'a [u8]) -> Result<()> + 'cb;
+
 struct ResidualSnap<'a> {
     residual: &'a ByteBuf,
     host: &'a mut Vec<u8>,
@@ -1464,8 +1574,71 @@ impl Model {
             return Err(Error::Input("prefill chunk is empty".into()));
         }
         self.with_prefill(gpu, |model, ws| {
-            model.prefill_chunk_loaded(gpu, ws, ids, start, &mut None)
+            model.prefill_chunk_loaded(gpu, ws, ids, start, &mut None, false, None)
         })
+    }
+
+    /// Prefill `tokens` (`prompt[..len-1]`) and the MTP cache for the same chunks.
+    ///
+    /// See [`Self::prefill_mtp_with`]. An empty slice is a one-token prompt:
+    /// no prefill, and the return is `None` without touching `head` or the GPU.
+    pub fn prefill_mtp(
+        &mut self,
+        gpu: &Gpu,
+        tokens: &[u32],
+        head: &mut MtpHead,
+        block_pages: u32,
+    ) -> Result<Option<ByteBuf>> {
+        self.prefill_mtp_with(gpu, tokens, head, block_pages, None, None)
+    }
+
+    /// [`Self::prefill_mtp`], with the same per-block residual observer as
+    /// [`Self::prefill_with`] and a per-chunk final-norm export.
+    ///
+    /// Layers 0..62 match today's prefill. Layer 63 runs its mixer and its
+    /// MLP, then the final norm writes fp16 `[rows, hidden]`. There is no
+    /// `lm_head`. `on_export` receives that fp16 buffer for the chunk
+    /// (`start`, `end`, bytes). `None` does not copy it to the host.
+    ///
+    /// After each chunk the MTP head prefills `cat(carry, export[:-1])` at
+    /// the same positions. Carry starts as zeros and becomes `export[-1]`.
+    /// The returned buffer is that last carry: the post-norm row of
+    /// `tokens[len-1]` (`mtp_last_hidden`). `block_pages` is the job's
+    /// block-table width, including draft tokens; both the target and the
+    /// MTP attention use it.
+    ///
+    /// # Errors
+    ///
+    /// The same input errors as [`Self::prefill`], a rejected `block_pages`,
+    /// or an MTP chunk of 16 or fewer rows (that refresh needs the q_len
+    /// path, which is not loaded yet).
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_mtp_with(
+        &mut self,
+        gpu: &Gpu,
+        tokens: &[u32],
+        head: &mut MtpHead,
+        block_pages: u32,
+        mut on_block: Option<&mut BlockResidualCb<'_>>,
+        mut on_export: Option<&mut ExportCb<'_>>,
+    ) -> Result<Option<ByteBuf>> {
+        if tokens.is_empty() {
+            self.captured = false;
+            return Ok(None);
+        }
+        self.set_prefill_pages(block_pages)?;
+        self.with_prefill(gpu, |model, ws| {
+            model.prefill_mtp_loaded(
+                gpu,
+                ws,
+                tokens,
+                head,
+                block_pages,
+                &mut on_block,
+                &mut on_export,
+            )
+        })
+        .map(Some)
     }
 
     /// Used rows of every attention cache, in layer order.
@@ -1539,8 +1712,10 @@ impl Model {
 
     /// Live GDN slot of every linear-attention layer, in layer order.
     ///
-    /// Conv is bf16. Recurrent is fp32. `max_batch` 1 and `max_history` 0, so
-    /// the allocation is the slot the fork hashes after prefill.
+    /// Conv is bf16. Recurrent is fp32. `max_batch` is 1. `max_history` 0,
+    /// the load default, keeps conv `[fdim, conv_k]` and recurrent
+    /// `[1, num_v_heads, k_head_dim, v_head_dim]`. A wider history reports
+    /// those real axes.
     pub fn gdn_state(&self, gpu: &Gpu) -> Result<Vec<GdnStateImage>> {
         let mut out = Vec::new();
         for (index, block) in self.blocks.iter().enumerate() {
@@ -1555,14 +1730,15 @@ impl Model {
                     dtype: "bfloat16".to_string(),
                     shape: vec![
                         usize::try_from(state.fdim).unwrap_or(0),
-                        usize::try_from(state.conv_k).unwrap_or(0),
+                        usize::try_from(state.conv_k.saturating_add(state.max_history))
+                            .unwrap_or(0),
                     ],
                     bytes: state.conv,
                 },
                 recurrent: HostTensor {
                     dtype: "float32".to_string(),
                     shape: vec![
-                        1,
+                        usize::try_from(state.max_history.saturating_add(1)).unwrap_or(0),
                         usize::try_from(state.num_v_heads).unwrap_or(0),
                         usize::try_from(state.k_head_dim).unwrap_or(0),
                         usize::try_from(state.v_head_dim).unwrap_or(0),
@@ -1633,11 +1809,80 @@ impl Model {
         for (start, end) in bounds {
             let chunk = &tokens[usize::try_from(start).expect("chunk start fits usize")
                 ..usize::try_from(end).expect("chunk end fits usize")];
-            self.prefill_chunk_loaded(gpu, ws, chunk, start, on_block)?;
+            self.prefill_chunk_loaded(gpu, ws, chunk, start, on_block, false, None)?;
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_mtp_loaded(
+        &mut self,
+        gpu: &Gpu,
+        ws: &mut PrefillWorkspace,
+        tokens: &[u32],
+        head: &mut MtpHead,
+        block_pages: u32,
+        on_block: &mut Option<&mut BlockResidualCb<'_>>,
+        on_export: &mut Option<&mut ExportCb<'_>>,
+    ) -> Result<ByteBuf> {
+        let written = u32::try_from(tokens.len())
+            .map_err(|_| Error::Input("prefill is longer than u32::MAX".into()))?;
+        if written > self.max_tokens {
+            return Err(Error::Input(format!(
+                "prefill of {written} tokens does not fit the {}-token cache",
+                self.max_tokens
+            )));
+        }
+        let prompt_len = written
+            .checked_add(1)
+            .ok_or_else(|| Error::Input("prefill length overflows".into()))?;
+        let bounds = prefill::chunk_bounds(prompt_len);
+        let mut cursor = 0u32;
+        for &(start, end) in &bounds {
+            if start != cursor || end <= start || end > written {
+                return Err(Error::Input(format!(
+                    "prefill chunk [{start}, {end}) does not continue from {cursor}"
+                )));
+            }
+            cursor = end;
+        }
+        if cursor != written {
+            return Err(Error::Input(
+                "prefill chunks do not cover the tokens".into(),
+            ));
+        }
+        let hidden = self.hidden;
+        let row = rows_bytes(hidden, 1, 2)?;
+        let chunk_bytes = rows_bytes(hidden, ws.max_rows, 2)?;
+        // Carry is one fp16 row. The first chunk's shifted row 0 is zeros,
+        // which is `torch.cat` of a zero vector with `export[:-1]`.
+        let mut carry = gpu.zeroed(row)?;
+        let mut export = gpu.zeroed(chunk_bytes)?;
+        let mut shifted = gpu.zeroed(chunk_bytes)?;
+        let mut export_host = Vec::new();
+        for (start, end) in bounds {
+            let chunk = &tokens[usize::try_from(start).expect("chunk start fits usize")
+                ..usize::try_from(end).expect("chunk end fits usize")];
+            let rows = end - start;
+            self.prefill_chunk_loaded(gpu, ws, chunk, start, on_block, true, Some(&mut export))?;
+            if let Some(callback) = on_export.as_deref_mut() {
+                if export_host.len() != export.num_bytes() {
+                    export_host.resize(export.num_bytes(), 0);
+                }
+                export.copy_to_host(&gpu.stream, &mut export_host)?;
+                let used = rows_bytes(hidden, rows, 2)?;
+                if used > export_host.len() {
+                    return Err(Error::Input("mtp export is shorter than the chunk".into()));
+                }
+                callback(start, end, &export_host[..used])?;
+            }
+            shift_hidden(gpu, &export, &mut shifted, &mut carry, hidden, rows)?;
+            head.prefill_chunk(gpu, self, chunk, &shifted, start, block_pages)?;
+        }
+        Ok(carry)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn prefill_chunk_loaded(
         &mut self,
         gpu: &Gpu,
@@ -1645,6 +1890,8 @@ impl Model {
         ids: &[u32],
         start: u32,
         on_block: &mut Option<&mut BlockResidualCb<'_>>,
+        export_norm: bool,
+        export: Option<&mut ByteBuf>,
     ) -> Result<()> {
         let rows = u32::try_from(ids.len())
             .map_err(|_| Error::Input("prefill chunk is longer than u32::MAX".into()))?;
@@ -1689,7 +1936,25 @@ impl Model {
         embed_ids(gpu, &self.embed, &ws.ids, hidden, n, &mut ws.residual)?;
         let layers = self.blocks.len();
         for index in 0..layers {
-            self.forward_prefill_block(gpu, ws, index, start, rows, on_block)?;
+            self.forward_prefill_block(gpu, ws, index, start, rows, on_block, export_norm)?;
+        }
+        if export_norm {
+            let export = export
+                .ok_or_else(|| Error::Input("mtp prefill export buffer is missing".into()))?;
+            let hidden = self.hidden;
+            let norm = self.norm;
+            // Same kernel as the decode final norm: float in, half out,
+            // `constant_bias` 1. The fork's forward export is `y.half()`, and
+            // y is already fp16, so this buffer is the export.
+            Self::norm_rows(
+                gpu,
+                &ws.residual,
+                &self.final_norm,
+                export,
+                hidden,
+                rows,
+                norm,
+            )?;
         }
         // The next chunk, and the decode step at `tokens.len()`, read this
         // length. `end` of the last chunk is the number of tokens written.
@@ -1704,6 +1969,7 @@ impl Model {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_prefill_block(
         &mut self,
         gpu: &Gpu,
@@ -1712,10 +1978,15 @@ impl Model {
         start: u32,
         rows: u32,
         on_block: &mut Option<&mut BlockResidualCb<'_>>,
+        export_norm: bool,
     ) -> Result<()> {
         let hidden = self.hidden;
         let norm = self.norm;
-        let early = index + 1 == self.blocks.len();
+        // `export_norm` is the MTP path: the last layer runs its MLP, and the
+        // caller norms the residual afterwards. With the flag off this is
+        // `index + 1 == self.blocks.len()`, the last KV module returning the
+        // residual it was given.
+        let early = !export_norm && index + 1 == self.blocks.len();
         let layer = u32::try_from(index).expect("layer count fits u32");
         let end = start
             .checked_add(rows)
