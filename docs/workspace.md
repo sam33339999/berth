@@ -202,6 +202,8 @@ MTP（P2）加了 `Model::prefill_mtp` 和 `Model::set_max_history`。沒開 MTP
 
 `--mtp-steps`（P3）預設 0。開著時多一份 draft cache、MTP 權重，以及約 5 倍的 GDN recurrent state，建議把 `--cache-tokens` 調小，否則 24 GiB 可能放不下；放不下就在載入時回 OOM。
 
+P4 第一段是 `Engine::generate_traced`（`MtpTrace`，預設不啟用）和 `tests/mtp_ref.rs`。`generate` 在 `mtp_steps > 0` 時用同一個迴圈、不複製狀態。`mtp_steps == 0` 不呼叫 trace。GPU 對照逐輪比 digest，第一個不一致就停，不改數值路徑。N=4 `A_greedy` 第 0 輪（q_len 1）欄位和 `logits_A_N4_greedy_round0.bin` 一致（max abs diff 0）。下一輪 verify 的 n 列 `lm_head`（K=6、mul1）走 `Exl3Linear::forward_n`，prefill shim 只連結 K=4，launch 前丟錯。`100_greedy` 的最後一個 prefill chunk 要和第一次 verify 合成同一輪，所以第 0 輪還沒寫進 trace 就停在同一個 launch。
+
 實測在 `127.0.0.1:18889`，`max_tokens` 20、溫度 0、串流。TTFT 從送出請求算到第一個 reasoning token（角色那一包不算）。載入後、還沒送請求是 22255 MiB。
 
 | prompt_tokens | TTFT | 跑完後的 nvidia-smi |

@@ -12,7 +12,9 @@
 //! fit in the cache. The stop token is reported.
 //!
 //! `mtp_steps == 0` keeps that loop. `mtp_steps > 0` drafts, verifies, and
-//! rewinds (`docs/mtp.md` section 8). The zero path does not load the MTP head.
+//! rewinds (`docs/mtp.md` section 8). The zero path does not load the MTP head
+//! and does not call [`MtpTrace`]. A traced MTP generate copies device state
+//! only when [`MtpTrace::active`] is true.
 
 use std::path::Path;
 
@@ -24,8 +26,9 @@ use berth_plan::from_exl3::model_shape;
 use crate::device::ptr;
 use crate::model::Model;
 use crate::mtp::{
-    accept_row, draft_block_pages, nodraft_block_pages, verify_block_pages, AcceptStep, MtpHead,
-    RowSample,
+    accept_row, draft_block_pages, gdn_snaps, nodraft_block_pages, union_pages, verify_block_pages,
+    AcceptStep, MtpChunkEvent, MtpDraftSnap, MtpGdnSnap, MtpHead, MtpPageSnap, MtpPrefillSnap,
+    MtpRound, MtpTrace, MtpVerifySnap, RowSample,
 };
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::{Error, Gpu, Result};
@@ -96,6 +99,13 @@ pub struct Engine {
 const _: fn(&Engine) = assert_engine_send;
 
 fn assert_engine_send<T: Send>(_: &T) {}
+
+/// Observer for one MTP generate. `held` is the last prefill chunk, which
+/// shares an iterate with the verify that follows it.
+struct TraceObs<'a> {
+    trace: &'a mut dyn MtpTrace,
+    held: &'a mut Option<MtpPrefillSnap>,
+}
 
 impl Engine {
     /// Open the checkpoint at `model_dir` and load it with a `max_tokens` cache.
@@ -189,13 +199,53 @@ impl Engine {
         request: &GenerateRequest,
         on_token: &mut dyn FnMut(u32) -> Flow,
     ) -> Result<(Finish, Usage)> {
+        if self.mtp_steps == 0 {
+            return self.generate_plain(request, on_token);
+        }
+        let mut trace = NopTrace;
+        self.generate_traced(request, on_token, &mut trace)
+    }
+
+    /// [`Self::generate`] with an MTP observer.
+    ///
+    /// `mtp_steps == 0` ignores `trace` and runs the plain loop. `mtp_steps > 0`
+    /// is the same draft / verify / accept path as [`Self::generate`]. Device
+    /// state is copied only when `trace.active()` is true, after each fork
+    /// `iterate` (a prefill-only chunk, or a verify after rewind and refresh).
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`Self::generate`].
+    pub fn generate_traced(
+        &mut self,
+        request: &GenerateRequest,
+        on_token: &mut dyn FnMut(u32) -> Flow,
+        trace: &mut dyn MtpTrace,
+    ) -> Result<(Finish, Usage)> {
+        if self.mtp_steps == 0 {
+            return self.generate_plain(request, on_token);
+        }
         let prompt_len = self.check_request(request)?;
         self.model.reset_sequence(&self.gpu)?;
-        if self.mtp_steps > 0 {
-            self.sampler
-                .reset(&self.gpu, &request.sampler, &request.prompt)?;
-            return self.generate_mtp(request, on_token, prompt_len);
+        // The reference zeroes KV between jobs. `reset_sequence` clears GDN
+        // and the cache length, not the cq3 bytes a whole-page digest reads.
+        // The no-op trace is inactive, so a normal generate does not do this.
+        if trace.active() {
+            self.zero_kv_for_trace()?;
         }
+        self.sampler
+            .reset(&self.gpu, &request.sampler, &request.prompt)?;
+        self.generate_mtp(request, on_token, prompt_len, trace)
+    }
+
+    /// The `mtp_steps == 0` loop. No trace parameter, so it cannot copy for one.
+    fn generate_plain(
+        &mut self,
+        request: &GenerateRequest,
+        on_token: &mut dyn FnMut(u32) -> Flow,
+    ) -> Result<(Finish, Usage)> {
+        let prompt_len = self.check_request(request)?;
+        self.model.reset_sequence(&self.gpu)?;
         // The fork sizes the decode block table from the job's whole length
         // (`Job.get_max_seq_len`: prompt plus max_new_tokens).
         self.model
@@ -280,13 +330,24 @@ impl Engine {
         request: &GenerateRequest,
         on_token: &mut dyn FnMut(u32) -> Flow,
         prompt_len: u32,
+        trace: &mut dyn MtpTrace,
     ) -> Result<(Finish, Usage)> {
         let mut completion = 0u32;
-        match self.prime_prompt(request, on_token, prompt_len, &mut completion)? {
+        let mut held = None;
+        let mut obs = TraceObs {
+            trace,
+            held: &mut held,
+        };
+        match self.prime_prompt(request, on_token, prompt_len, &mut completion, &mut obs)? {
             Prime::Done(finish) => Ok((finish, usage(prompt_len, completion))),
-            Prime::Live(cursor) => {
-                self.speculate(request, on_token, prompt_len, cursor, &mut completion)
-            }
+            Prime::Live(cursor) => self.speculate(
+                request,
+                on_token,
+                prompt_len,
+                cursor,
+                &mut completion,
+                &mut obs,
+            ),
         }
     }
 
@@ -296,9 +357,10 @@ impl Engine {
         on_token: &mut dyn FnMut(u32) -> Flow,
         prompt_len: u32,
         completion: &mut u32,
+        obs: &mut TraceObs<'_>,
     ) -> Result<Prime> {
         if prompt_len == 1 {
-            return self.prime_one_token(request, on_token, completion);
+            return self.prime_one_token(request, on_token, completion, obs.trace);
         }
         let pages = crate::prefill::prefill_block_pages_mtp(
             prompt_len,
@@ -307,6 +369,7 @@ impl Engine {
         );
         let prefix =
             &request.prompt[..usize::try_from(prompt_len).expect("prompt len fits usize") - 1];
+        let capture = obs.trace.active();
         let carry = {
             let Engine {
                 gpu, model, head, ..
@@ -314,9 +377,26 @@ impl Engine {
             let head = head
                 .as_mut()
                 .ok_or_else(|| Error::Input("mtp head is not loaded".into()))?;
-            model
-                .prefill_mtp(gpu, prefix, head, pages)?
-                .ok_or_else(|| Error::Input("mtp prefill returned no carry".into()))?
+            let carried = if capture {
+                model.prefill_mtp_traced(
+                    gpu,
+                    prefix,
+                    head,
+                    pages,
+                    None,
+                    None,
+                    Some(&mut |event| {
+                        match event {
+                            MtpChunkEvent::Round(round) => obs.trace.on_round(&round),
+                            MtpChunkEvent::Hold(prefill) => *obs.held = Some(prefill),
+                        }
+                        Ok(())
+                    }),
+                )?
+            } else {
+                model.prefill_mtp(gpu, prefix, head, pages)?
+            };
+            carried.ok_or_else(|| Error::Input("mtp prefill returned no carry".into()))?
         };
         self.mtp_hidden = Some(carry);
         let last = usize::try_from(prompt_len).expect("prompt len fits usize") - 1;
@@ -331,6 +411,7 @@ impl Engine {
         request: &GenerateRequest,
         on_token: &mut dyn FnMut(u32) -> Flow,
         completion: &mut u32,
+        trace: &mut dyn MtpTrace,
     ) -> Result<Prime> {
         let pages = nodraft_block_pages(1, self.mtp_steps)?;
         // quant_cache on the existing 1-token path keeps blocks_per_seq at
@@ -339,6 +420,12 @@ impl Engine {
         self.model.set_decode_pages(pages)?;
         self.model.decode_step(&self.gpu, request.prompt[0], 0)?;
         self.model.synchronize(&self.gpu)?;
+        // The sampler overwrites this row. The trace wants the forward's logits.
+        let logit_row = if trace.active() {
+            Some(self.copy_decode_logits()?)
+        } else {
+            None
+        };
         self.copy_final_norm()?;
         let token = {
             let Engine {
@@ -350,7 +437,12 @@ impl Engine {
             sampler.sample(gpu, model.logits_mut()?)?
         };
         *completion += 1;
-        if on_token(token) == Flow::Cancel {
+        let flow = on_token(token);
+        if let Some(row) = logit_row {
+            let round = self.trace_bootstrap(row, vec![token])?;
+            trace.on_round(&round);
+        }
+        if flow == Flow::Cancel {
             return Ok(Prime::Done(Finish::Cancelled));
         }
         if request.stop_tokens.contains(&token) {
@@ -372,6 +464,7 @@ impl Engine {
         prompt_len: u32,
         mut cursor: LiveCursor,
         completion: &mut u32,
+        obs: &mut TraceObs<'_>,
     ) -> Result<(Finish, Usage)> {
         let k = self.mtp_steps;
         let n = k + 1;
@@ -395,6 +488,11 @@ impl Engine {
             ids.push(cursor.pending);
             ids.extend_from_slice(&drafts);
             self.model.verify_step(&self.gpu, &ids, cursor.kv, pages)?;
+            let logit_rows = if obs.trace.active() {
+                Some(self.model.copy_verify_logit_rows(&self.gpu, n)?)
+            } else {
+                None
+            };
             let round = VerifyRound {
                 request,
                 drafts: &drafts,
@@ -402,9 +500,45 @@ impl Engine {
                 n,
                 pages,
             };
-            match self.walk_verify(&round, on_token, completion)? {
-                Walk::Done(finish) => return Ok((finish, usage(prompt_len, *completion))),
-                Walk::Next(next) => cursor = next,
+            let mut emitted = Vec::new();
+            match self.walk_verify(&round, on_token, completion, &mut emitted)? {
+                Walk::Done(finish) => {
+                    if let Some(rows) = logit_rows {
+                        self.emit_verify(
+                            obs.trace,
+                            obs.held,
+                            verify_snap(cursor.kv, n, true, Some(drafts), rows),
+                            emitted,
+                            None,
+                        )?;
+                    }
+                    return Ok((finish, usage(prompt_len, *completion)));
+                }
+                Walk::Next {
+                    cursor: next,
+                    accepted,
+                } => {
+                    if let Some(rows) = logit_rows {
+                        let refresh = if accepted > 1 {
+                            Some((
+                                cursor.kv.checked_add(1).ok_or_else(|| {
+                                    Error::Input("refresh start overflows".into())
+                                })?,
+                                accepted - 1,
+                            ))
+                        } else {
+                            None
+                        };
+                        self.emit_verify(
+                            obs.trace,
+                            obs.held,
+                            verify_snap(cursor.kv, n, true, Some(drafts), rows),
+                            emitted,
+                            refresh,
+                        )?;
+                    }
+                    cursor = next;
+                }
             }
         }
     }
@@ -505,11 +639,13 @@ impl Engine {
         round: &VerifyRound<'_>,
         on_token: &mut dyn FnMut(u32) -> Flow,
         completion: &mut u32,
+        emitted: &mut Vec<u32>,
     ) -> Result<Walk> {
         for i in 0..round.n {
             let token = self.sample_verify_row(i)?;
             let step = classify_row(round, token, i, *completion)?;
             *completion += 1;
+            emitted.push(token);
             if on_token(token) == Flow::Cancel {
                 return Ok(Walk::Done(Finish::Cancelled));
             }
@@ -523,8 +659,14 @@ impl Engine {
                 AcceptStep::AcceptAll => Some(0),
             };
             if let Some(num_rejected) = rejected {
+                let accepted = round.n.checked_sub(num_rejected).ok_or_else(|| {
+                    Error::Input("rewind rejected more tokens than the verify window".into())
+                })?;
                 let next = self.finish_accept(num_rejected, token, round)?;
-                return Ok(Walk::Next(next));
+                return Ok(Walk::Next {
+                    cursor: next,
+                    accepted,
+                });
             }
         }
         Err(Error::Input(
@@ -608,6 +750,112 @@ impl Engine {
             .ok_or_else(|| Error::Input("mtp hidden is not allocated".into()))?;
         model.copy_verify_export_row(gpu, dst, index)
     }
+
+    fn zero_kv_for_trace(&mut self) -> Result<()> {
+        self.model.zero_attn_pages(&self.gpu)?;
+        if let Some(head) = self.head.as_mut() {
+            head.zero_cache(&self.gpu)?;
+        }
+        Ok(())
+    }
+
+    fn copy_decode_logits(&self) -> Result<Vec<u8>> {
+        let logits = self.model.logits()?;
+        let mut bytes = vec![0u8; logits.num_bytes()];
+        logits.copy_to_host(&self.gpu.stream, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn trace_bootstrap(&self, logit_row: Vec<u8>, emitted: Vec<u32>) -> Result<MtpRound> {
+        let (gdn, target_pages, draft_refresh) = self.trace_tail(&[(0, 1)], None)?;
+        Ok(MtpRound {
+            prefill: None,
+            verify: Some(MtpVerifySnap {
+                kv_pos: 0,
+                q_len: 1,
+                recurrent_history: false,
+                draft_ids: None,
+                logit_rows: vec![logit_row],
+            }),
+            emitted,
+            gdn,
+            target_pages,
+            draft_refresh,
+        })
+    }
+
+    fn emit_verify(
+        &mut self,
+        trace: &mut dyn MtpTrace,
+        held: &mut Option<MtpPrefillSnap>,
+        verify: MtpVerifySnap,
+        emitted: Vec<u32>,
+        refresh: Option<(u32, u32)>,
+    ) -> Result<()> {
+        let mut spans = Vec::new();
+        if let Some(prefill) = held.as_ref() {
+            spans.push((prefill.start, prefill.end));
+        }
+        let end = verify
+            .kv_pos
+            .checked_add(verify.q_len)
+            .ok_or_else(|| Error::Input("verify span end overflows".into()))?;
+        spans.push((verify.kv_pos, end));
+        let (gdn, target_pages, draft_refresh) = self.trace_tail(&spans, refresh)?;
+        trace.on_round(&MtpRound {
+            prefill: held.take(),
+            verify: Some(verify),
+            emitted,
+            gdn,
+            target_pages,
+            draft_refresh,
+        });
+        Ok(())
+    }
+
+    fn trace_tail(
+        &self,
+        spans: &[(u32, u32)],
+        refresh: Option<(u32, u32)>,
+    ) -> Result<(Vec<MtpGdnSnap>, Vec<MtpPageSnap>, Option<MtpDraftSnap>)> {
+        let gdn = gdn_snaps(self.model.gdn_state(&self.gpu)?);
+        let target_pages = self
+            .model
+            .mtp_target_pages(&self.gpu, &union_pages(spans))?;
+        let draft_refresh = match refresh {
+            Some((start, length)) => {
+                let head = self
+                    .head
+                    .as_ref()
+                    .ok_or_else(|| Error::Input("mtp head is not loaded".into()))?;
+                Some(head.draft_span(&self.gpu, start, length)?)
+            }
+            None => None,
+        };
+        Ok((gdn, target_pages, draft_refresh))
+    }
+}
+
+/// [`MtpTrace`] that stays inactive. [`Engine::generate`] uses this so the
+/// MTP loop has one path and still does no extra device-to-host copy.
+struct NopTrace;
+
+impl MtpTrace for NopTrace {}
+
+fn verify_snap(
+    kv_pos: u32,
+    q_len: u32,
+    recurrent_history: bool,
+    draft_ids: Option<Vec<u32>>,
+    logit_rows: Vec<Vec<u8>>,
+) -> MtpVerifySnap {
+    MtpVerifySnap {
+        kv_pos,
+        q_len,
+        recurrent_history,
+        draft_ids,
+        logit_rows,
+    }
 }
 
 /// Where the MTP loop is after the prompt is in the cache.
@@ -625,7 +873,11 @@ struct LiveCursor {
 /// One verify window, either finished or ready for another round.
 enum Walk {
     Done(Finish),
-    Next(LiveCursor),
+    /// `accepted` is the tokens kept from this window, including the anchor.
+    Next {
+        cursor: LiveCursor,
+        accepted: u32,
+    },
 }
 
 /// Borrowed inputs of one verify accept loop.

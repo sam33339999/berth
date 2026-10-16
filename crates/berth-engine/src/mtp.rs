@@ -327,6 +327,36 @@ impl MtpHead {
         self.qlen_block(gpu, model, ids, hidden, start, block_pages)
     }
 
+    /// Host copy of draft cq3 rows `[start, start + length)`.
+    ///
+    /// The payload is the dump's `cq3_rows`: written rows in position order,
+    /// not the other rows on those pages. The single MTP attention layer is
+    /// layer 0.
+    ///
+    /// # Errors
+    ///
+    /// `length` is 0, or a position is outside the block table or the allocation.
+    pub(crate) fn draft_span(&self, gpu: &Gpu, start: u32, length: u32) -> Result<MtpDraftSnap> {
+        let pages = self.attn.copy_cache(gpu)?;
+        let [qk, qv, sk, sv] = pages.span_rows(start, length)?;
+        Ok(MtpDraftSnap {
+            start,
+            length,
+            layers: vec![MtpCq3Snap {
+                layer: 0,
+                qk,
+                qv,
+                sk,
+                sv,
+            }],
+        })
+    }
+
+    /// Zero the draft cq3 codes and scales. See [`AttnLayer::zero_pages`].
+    pub(crate) fn zero_cache(&mut self, gpu: &Gpu) -> Result<()> {
+        self.attn.zero_pages(gpu)
+    }
+
     /// Input layer plus `q_len` attention for 1..=16 rows.
     ///
     /// `set_decode_pages` stores `block_pages`, and [`AttnLayer::forward_qlen`]
@@ -1120,6 +1150,154 @@ pub fn rewind_plan(last_history: u32, num_tokens: u32, state_size: u32) -> Resul
     })
 }
 
+/// Test observer for one MTP generate.
+///
+/// [`Engine::generate`] passes a no-op when `mtp_steps > 0`. That no-op
+/// reports [`MtpTrace::active`] false, and the generator then does not copy
+/// device state. `mtp_steps == 0` never calls the trace.
+///
+/// Each [`MtpTrace::on_round`] is one fork `Generator.iterate`: a prefill-only
+/// chunk, the last prefill chunk together with the first draft/verify, the
+/// one-token bootstrap (`"A"` round 0: `q_len` 1, history off, no draft ids),
+/// or a later verify. `block_in` is not captured.
+pub trait MtpTrace {
+    /// When false, generate does no extra device-to-host copy for this trace.
+    fn active(&self) -> bool {
+        false
+    }
+
+    /// One iterate, after rewind and refresh when those ran.
+    fn on_round(&mut self, _round: &MtpRound) {}
+}
+
+/// Host bytes of one iterate. Digests are computed by the caller.
+///
+/// Layouts match `scripts/dump_27b_mtp_reference.py`: fp16 and bf16 are the
+/// raw 16-bit patterns, fp32 and int32 are little-endian, C order, no header.
+#[derive(Clone, Debug)]
+pub struct MtpRound {
+    pub prefill: Option<MtpPrefillSnap>,
+    pub verify: Option<MtpVerifySnap>,
+    /// Ids appended to the sequence during this iterate. Empty on a prefill-only round.
+    pub emitted: Vec<u32>,
+    /// One entry per GDN layer, in layer order. Whole tensors, history tail included.
+    pub gdn: Vec<MtpGdnSnap>,
+    /// Logical pages this iterate wrote, sorted. Each page is all 256 rows.
+    pub target_pages: Vec<MtpPageSnap>,
+    pub draft_refresh: Option<MtpDraftSnap>,
+}
+
+/// Target final-norm export and the MTP prompt prefill that consumed it.
+///
+/// `block_in` (fp32 residual entering each block) is not captured.
+/// TODO: copy those 64 residuals when a comparison needs them.
+#[derive(Clone, Debug)]
+pub struct MtpPrefillSnap {
+    pub start: u32,
+    pub end: u32,
+    /// fp16 `[end - start, hidden]`.
+    pub export: Vec<u8>,
+    pub draft_prefill: MtpDraftSnap,
+}
+
+/// One target forward that produced logits.
+#[derive(Clone, Debug)]
+pub struct MtpVerifySnap {
+    /// `cache_seqlens` at the forward. The write starts here.
+    pub kv_pos: u32,
+    pub q_len: u32,
+    /// False only for the one-token bootstrap.
+    pub recurrent_history: bool,
+    /// `None` on that bootstrap. Otherwise `N` draft ids.
+    pub draft_ids: Option<Vec<u32>>,
+    /// One fp16 `[vocab]` row per logit row, in order.
+    pub logit_rows: Vec<Vec<u8>>,
+}
+
+/// One GDN layer after the iterate, slot 0, including the history tail.
+#[derive(Clone, Debug)]
+pub struct MtpGdnSnap {
+    pub layer: u32,
+    /// bf16 `[fdim, conv_k + max_history]`.
+    pub conv: Vec<u8>,
+    /// fp32 `[max_history + 1, num_v_heads, k_head_dim, v_head_dim]`.
+    pub recurrent: Vec<u8>,
+}
+
+/// One logical cq3 page of the target cache, every attention layer.
+#[derive(Clone, Debug)]
+pub struct MtpPageSnap {
+    pub logical: u32,
+    pub layers: Vec<MtpCq3Snap>,
+}
+
+/// `qk` / `qv` are packed int32. `sk` / `sv` are fp16 scales.
+///
+/// A page snap is 256 rows. A draft snap is `length` rows concatenated in
+/// position order.
+#[derive(Clone, Debug)]
+pub struct MtpCq3Snap {
+    pub layer: u32,
+    pub qk: Vec<u8>,
+    pub qv: Vec<u8>,
+    pub sk: Vec<u8>,
+    pub sv: Vec<u8>,
+}
+
+/// Draft-cache rows written by prompt prefill or by refresh.
+#[derive(Clone, Debug)]
+pub struct MtpDraftSnap {
+    pub start: u32,
+    pub length: u32,
+    /// Parallel to the draft attention layers. The 27B head has one.
+    pub layers: Vec<MtpCq3Snap>,
+}
+
+/// What [`Model::prefill_mtp_traced`] reports after a chunk when a trace is active.
+pub(crate) enum MtpChunkEvent {
+    /// Prefill-only iterate. State is already after this chunk.
+    Round(MtpRound),
+    /// Last prompt chunk. Its state is snapshotted with the verify that follows.
+    Hold(MtpPrefillSnap),
+}
+
+pub(crate) type MtpChunkCb<'cb> = dyn FnMut(MtpChunkEvent) -> Result<()> + 'cb;
+
+/// Logical pages touched by token positions `[start, end)`.
+#[must_use]
+pub(crate) fn pages_of_span(start: u32, end: u32) -> Vec<u32> {
+    if end <= start {
+        return Vec::new();
+    }
+    let page = crate::prefill::PAGE_SIZE;
+    let first = start / page;
+    let last = (end - 1) / page;
+    (first..=last).collect()
+}
+
+/// Sorted union of [`pages_of_span`] over end-exclusive spans.
+#[must_use]
+pub(crate) fn union_pages(spans: &[(u32, u32)]) -> Vec<u32> {
+    let mut set = std::collections::BTreeSet::new();
+    for &(start, end) in spans {
+        for page in pages_of_span(start, end) {
+            set.insert(page);
+        }
+    }
+    set.into_iter().collect()
+}
+
+pub(crate) fn gdn_snaps(images: Vec<crate::prefill::GdnStateImage>) -> Vec<MtpGdnSnap> {
+    images
+        .into_iter()
+        .map(|image| MtpGdnSnap {
+            layer: image.layer,
+            conv: image.conv.bytes,
+            recurrent: image.recurrent.bytes,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -1294,6 +1472,16 @@ mod tests {
     fn prefill_pages_8190_grows_by_draft_tokens() {
         assert_eq!(prefill::prefill_block_pages(8190, 1), 32);
         assert_eq!(prefill::prefill_block_pages_mtp(8190, 1, 2), 33);
+    }
+
+    #[test]
+    fn trace_pages_follow_the_iterate_span() {
+        assert_eq!(pages_of_span(0, 99), vec![0]);
+        assert_eq!(pages_of_span(0, 1), vec![0]);
+        assert_eq!(pages_of_span(0, 1280), vec![0, 1, 2, 3, 4]);
+        // Last 8190 chunk is [7936, 8189). The verify that shares that
+        // iterate writes [8189, 8194) and crosses into the next page.
+        assert_eq!(union_pages(&[(7936, 8189), (8189, 8194)]), vec![31, 32]);
     }
 
     fn row(token: u32, seq_pos: u32) -> RowSample {

@@ -2304,6 +2304,197 @@ impl AttnLayer {
             page_tokens: usize::try_from(PAGE).unwrap_or(0),
         })
     }
+
+    /// Zero cq3 codes and scales in place.
+    ///
+    /// The MTP reference zeroes both caches between jobs. [`Self::reset_cache`]
+    /// only clears the length words, so a traced generate that compares whole
+    /// pages calls this. The bytes are a host zero copied back; nothing is
+    /// reallocated.
+    pub(crate) fn zero_pages(&mut self, gpu: &Gpu) -> Result<()> {
+        zero_buf(gpu, &mut self.k_pages)?;
+        zero_buf(gpu, &mut self.v_pages)?;
+        zero_buf(gpu, &mut self.k_scales)?;
+        zero_buf(gpu, &mut self.v_scales)?;
+        Ok(())
+    }
+}
+
+impl CachePages {
+    /// One physical page, all `page_tokens` rows. Order is `qk`, `qv`, `sk`, `sv`.
+    ///
+    /// `logical` is the block-table column. The bytes come from
+    /// `block_table[logical]`. On this runtime that index equals `logical`.
+    pub(crate) fn full_page(&self, logical: u32) -> Result<[Vec<u8>; 4]> {
+        let phys = self.phys(logical)?;
+        Ok([
+            page_bytes(
+                &self.qk,
+                phys,
+                self.page_tokens,
+                self.q_cols.saturating_mul(4),
+            )?,
+            page_bytes(
+                &self.qv,
+                phys,
+                self.page_tokens,
+                self.q_cols.saturating_mul(4),
+            )?,
+            page_bytes(
+                &self.sk,
+                phys,
+                self.page_tokens,
+                self.s_cols.saturating_mul(2),
+            )?,
+            page_bytes(
+                &self.sv,
+                phys,
+                self.page_tokens,
+                self.s_cols.saturating_mul(2),
+            )?,
+        ])
+    }
+
+    /// Rows `[start, start + length)` in position order, not the rest of the page.
+    ///
+    /// Position `p` is page `block_table[p / page_tokens]`, row `p % page_tokens`.
+    /// Order is `qk`, `qv`, `sk`, `sv`. This is the draft `cq3_rows` payload.
+    pub(crate) fn span_rows(&self, start: u32, length: u32) -> Result<[Vec<u8>; 4]> {
+        if length == 0 {
+            return Err(Error::Input("cache span is empty".into()));
+        }
+        Ok([
+            span_bytes(
+                &self.qk,
+                &self.block_table,
+                start,
+                length,
+                self.page_tokens,
+                self.q_cols.saturating_mul(4),
+            )?,
+            span_bytes(
+                &self.qv,
+                &self.block_table,
+                start,
+                length,
+                self.page_tokens,
+                self.q_cols.saturating_mul(4),
+            )?,
+            span_bytes(
+                &self.sk,
+                &self.block_table,
+                start,
+                length,
+                self.page_tokens,
+                self.s_cols.saturating_mul(2),
+            )?,
+            span_bytes(
+                &self.sv,
+                &self.block_table,
+                start,
+                length,
+                self.page_tokens,
+                self.s_cols.saturating_mul(2),
+            )?,
+        ])
+    }
+
+    fn phys(&self, logical: u32) -> Result<usize> {
+        let index = usize::try_from(logical).unwrap_or(usize::MAX);
+        let phys = self.block_table.get(index).copied().ok_or_else(|| {
+            Error::Input(format!(
+                "block table has {} pages, logical page {logical} is needed",
+                self.block_table.len()
+            ))
+        })?;
+        if phys < 0 {
+            return Err(Error::Input(format!(
+                "block table page {logical} is {phys}"
+            )));
+        }
+        usize::try_from(phys).map_err(|_| Error::Input(format!("page index {phys} is negative")))
+    }
+}
+
+fn page_bytes(raw: &[u8], phys: usize, page_tokens: usize, row_bytes: usize) -> Result<Vec<u8>> {
+    if page_tokens == 0 || row_bytes == 0 {
+        return Err(Error::Input("cache page geometry is empty".into()));
+    }
+    let off = phys
+        .checked_mul(page_tokens)
+        .and_then(|rows| rows.checked_mul(row_bytes))
+        .ok_or_else(|| Error::Input("cache page offset overflows".into()))?;
+    let len = page_tokens
+        .checked_mul(row_bytes)
+        .ok_or_else(|| Error::Input("cache page length overflows".into()))?;
+    let end = off
+        .checked_add(len)
+        .ok_or_else(|| Error::Input("cache page offset overflows".into()))?;
+    raw.get(off..end).map(<[u8]>::to_vec).ok_or_else(|| {
+        Error::Input(format!(
+            "cache page {phys} needs {end} bytes, the allocation has {}",
+            raw.len()
+        ))
+    })
+}
+
+fn span_bytes(
+    raw: &[u8],
+    table: &[i32],
+    start: u32,
+    length: u32,
+    page_tokens: usize,
+    row_bytes: usize,
+) -> Result<Vec<u8>> {
+    if page_tokens == 0 || row_bytes == 0 {
+        return Err(Error::Input("cache page geometry is empty".into()));
+    }
+    let page = u32::try_from(page_tokens).unwrap_or(0);
+    if page == 0 {
+        return Err(Error::Input("cache page geometry is empty".into()));
+    }
+    let mut out = Vec::new();
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| Error::Input("cache span end overflows".into()))?;
+    for pos in start..end {
+        let logical = usize::try_from(pos / page).unwrap_or(usize::MAX);
+        let row = usize::try_from(pos % page).unwrap_or(usize::MAX);
+        let phys = table.get(logical).copied().ok_or_else(|| {
+            Error::Input(format!(
+                "block table has {} pages, token {pos} needs page {logical}",
+                table.len()
+            ))
+        })?;
+        if phys < 0 {
+            return Err(Error::Input(format!(
+                "block table page {logical} is {phys}"
+            )));
+        }
+        let phys = usize::try_from(phys).unwrap_or(usize::MAX);
+        let off = phys
+            .checked_mul(page_tokens)
+            .and_then(|rows| rows.checked_add(row))
+            .and_then(|rows| rows.checked_mul(row_bytes))
+            .ok_or_else(|| Error::Input("cache row offset overflows".into()))?;
+        let row_end = off
+            .checked_add(row_bytes)
+            .ok_or_else(|| Error::Input("cache row offset overflows".into()))?;
+        let bytes = raw.get(off..row_end).ok_or_else(|| {
+            Error::Input(format!(
+                "cache row at {pos} needs {row_end} bytes, the allocation has {}",
+                raw.len()
+            ))
+        })?;
+        out.extend_from_slice(bytes);
+    }
+    Ok(out)
+}
+
+fn zero_buf(gpu: &Gpu, buf: &mut ByteBuf) -> Result<()> {
+    let zeros = vec![0u8; buf.num_bytes()];
+    buf.copy_from_host(&gpu.stream, &zeros)?;
+    Ok(())
 }
 
 fn download_bytes(gpu: &Gpu, buf: &ByteBuf) -> Result<Vec<u8>> {

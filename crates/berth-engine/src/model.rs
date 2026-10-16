@@ -45,7 +45,10 @@ use crate::attn::{AttnLayer, AttnPrefillScratch, AttnQlenScratch};
 use crate::device::{self, ptr, Exl3Linear, RowScratch};
 use crate::gdn::{GdnHistoryScratch, GdnLayer, GdnPrefillScratch};
 use crate::mlp::{MlpLayer, MlpPrefillScratch};
-use crate::mtp::MtpHead;
+use crate::mtp::{
+    gdn_snaps, pages_of_span, MtpChunkCb, MtpChunkEvent, MtpCq3Snap, MtpHead, MtpPageSnap,
+    MtpPrefillSnap, MtpRound,
+};
 use crate::prefill::{self, AttnCacheImage, GdnStateImage, HostTensor};
 use crate::{Error, Gpu, Result};
 
@@ -1343,6 +1346,21 @@ fn rows_bytes(hidden: i32, rows: u32, elem: usize) -> Result<usize> {
         .ok_or_else(|| Error::Input("row byte count overflows".into()))
 }
 
+/// First `nbytes` of `buf`. The device copy is the whole allocation; the
+/// caller keeps the live prefix. `buf.copy_to_host` requires equal lengths.
+fn copy_prefix(gpu: &Gpu, buf: &ByteBuf, nbytes: usize) -> Result<Vec<u8>> {
+    let mut host = vec![0u8; buf.num_bytes()];
+    buf.copy_to_host(&gpu.stream, &mut host)?;
+    if nbytes > host.len() {
+        return Err(Error::Input(format!(
+            "device buffer has {} bytes, the prefix asks for {nbytes}",
+            host.len()
+        )));
+    }
+    host.truncate(nbytes);
+    Ok(host)
+}
+
 fn positive_rows(rows: u32) -> Result<i32> {
     let rows =
         i32::try_from(rows).map_err(|_| Error::Input("prefill rows do not fit in i32".into()))?;
@@ -1675,12 +1693,33 @@ impl Model {
     /// block-table width, including draft tokens; both the target and the
     /// MTP attention use it.
     ///
+    /// A chunk of 16 or fewer rows uses the q_len attention path.
+    ///
     /// # Errors
     ///
     /// The same input errors as [`Self::prefill`], or a rejected `block_pages`.
-    /// A chunk of 16 or fewer rows uses the q_len attention path.
-    #[allow(clippy::too_many_arguments)]
     pub fn prefill_mtp_with(
+        &mut self,
+        gpu: &Gpu,
+        tokens: &[u32],
+        head: &mut MtpHead,
+        block_pages: u32,
+        on_block: Option<&mut BlockResidualCb<'_>>,
+        on_export: Option<&mut ExportCb<'_>>,
+    ) -> Result<Option<ByteBuf>> {
+        self.prefill_mtp_traced(gpu, tokens, head, block_pages, on_block, on_export, None)
+    }
+
+    /// [`Self::prefill_mtp_with`] plus the test trace.
+    ///
+    /// `on_chunk` of `None` does not copy the export, the draft rows, or the
+    /// GDN / page state. The callback type stays crate-private.
+    ///
+    /// # Errors
+    ///
+    /// The same input errors as [`Self::prefill_mtp_with`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prefill_mtp_traced(
         &mut self,
         gpu: &Gpu,
         tokens: &[u32],
@@ -1688,6 +1727,7 @@ impl Model {
         block_pages: u32,
         mut on_block: Option<&mut BlockResidualCb<'_>>,
         mut on_export: Option<&mut ExportCb<'_>>,
+        mut on_chunk: Option<&mut MtpChunkCb<'_>>,
     ) -> Result<Option<ByteBuf>> {
         if tokens.is_empty() {
             self.captured = false;
@@ -1703,6 +1743,7 @@ impl Model {
                 block_pages,
                 &mut on_block,
                 &mut on_export,
+                &mut on_chunk,
             )
         })
         .map(Some)
@@ -1817,6 +1858,55 @@ impl Model {
         Ok(out)
     }
 
+    /// Whole cq3 pages, one snap per logical page, attention layers in order.
+    ///
+    /// `logical` is the page list for this iterate. The bytes are
+    /// `block_table[logical]`, which is `logical` itself on this runtime.
+    /// Each tensor is all 256 rows.
+    pub(crate) fn mtp_target_pages(&self, gpu: &Gpu, logical: &[u32]) -> Result<Vec<MtpPageSnap>> {
+        let mut caches = Vec::new();
+        for (index, block) in self.blocks.iter().enumerate() {
+            let MixerSlot::FullAttn(layer) = &block.mixer else {
+                continue;
+            };
+            let layer_id = u32::try_from(index).expect("layer count fits u32");
+            caches.push((layer_id, layer.copy_cache(gpu)?));
+        }
+        let mut pages = Vec::with_capacity(logical.len());
+        for &page in logical {
+            let mut layers = Vec::with_capacity(caches.len());
+            for (layer_id, cache) in &caches {
+                let [qk, qv, sk, sv] = cache.full_page(page)?;
+                layers.push(MtpCq3Snap {
+                    layer: *layer_id,
+                    qk,
+                    qv,
+                    sk,
+                    sv,
+                });
+            }
+            pages.push(MtpPageSnap {
+                logical: page,
+                layers,
+            });
+        }
+        Ok(pages)
+    }
+
+    /// Zero every attention layer's cq3 codes and scales.
+    ///
+    /// Used by a traced generate so the next job starts from the same zeros
+    /// the reference dump writes between jobs. [`Self::reset_sequence`] does
+    /// not scrub these bytes.
+    pub(crate) fn zero_attn_pages(&mut self, gpu: &Gpu) -> Result<()> {
+        for block in &mut self.blocks {
+            if let MixerSlot::FullAttn(layer) = &mut block.mixer {
+                layer.zero_pages(gpu)?;
+            }
+        }
+        Ok(())
+    }
+
     fn with_prefill<T>(
         &mut self,
         gpu: &Gpu,
@@ -1891,6 +1981,7 @@ impl Model {
         block_pages: u32,
         on_block: &mut Option<&mut BlockResidualCb<'_>>,
         on_export: &mut Option<&mut ExportCb<'_>>,
+        on_chunk: &mut Option<&mut MtpChunkCb<'_>>,
     ) -> Result<ByteBuf> {
         let written = u32::try_from(tokens.len())
             .map_err(|_| Error::Input("prefill is longer than u32::MAX".into()))?;
@@ -1927,7 +2018,8 @@ impl Model {
         let mut export = gpu.zeroed(chunk_bytes)?;
         let mut shifted = gpu.zeroed(chunk_bytes)?;
         let mut export_host = Vec::new();
-        for (start, end) in bounds {
+        let chunk_count = bounds.len();
+        for (index, (start, end)) in bounds.into_iter().enumerate() {
             let chunk = &tokens[usize::try_from(start).expect("chunk start fits usize")
                 ..usize::try_from(end).expect("chunk end fits usize")];
             let rows = end - start;
@@ -1945,8 +2037,58 @@ impl Model {
             }
             shift_hidden(gpu, &export, &mut shifted, &mut carry, hidden, rows)?;
             head.prefill_chunk(gpu, self, chunk, &shifted, start, block_pages)?;
+            // The trace copies only when a caller passed `on_chunk`. The
+            // no-op generate path leaves it `None` and does not reach here.
+            if on_chunk.is_some() {
+                let event = self.trace_prefill_chunk(
+                    gpu,
+                    head,
+                    &export,
+                    start,
+                    end,
+                    rows,
+                    index + 1 == chunk_count,
+                )?;
+                on_chunk.as_mut().expect("on_chunk was checked")(event)?;
+            }
         }
         Ok(carry)
+    }
+
+    /// Host snapshot of one MTP prefill chunk. Called only from the trace path.
+    #[allow(clippy::too_many_arguments)]
+    fn trace_prefill_chunk(
+        &self,
+        gpu: &Gpu,
+        head: &MtpHead,
+        export: &ByteBuf,
+        start: u32,
+        end: u32,
+        rows: u32,
+        last: bool,
+    ) -> Result<MtpChunkEvent> {
+        let used = rows_bytes(self.hidden, rows, 2)?;
+        let export_bytes = copy_prefix(gpu, export, used)?;
+        let draft_prefill = head.draft_span(gpu, start, rows)?;
+        let prefill = MtpPrefillSnap {
+            start,
+            end,
+            export: export_bytes,
+            draft_prefill,
+        };
+        if last {
+            return Ok(MtpChunkEvent::Hold(prefill));
+        }
+        let gdn = gdn_snaps(self.gdn_state(gpu)?);
+        let target_pages = self.mtp_target_pages(gpu, &pages_of_span(start, end))?;
+        Ok(MtpChunkEvent::Round(MtpRound {
+            prefill: Some(prefill),
+            verify: None,
+            emitted: Vec::new(),
+            gdn,
+            target_pages,
+            draft_refresh: None,
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2382,6 +2524,41 @@ impl Model {
             )?;
         }
         Ok(())
+    }
+
+    /// Copy the first `rows` verify logit rows. Each is fp16 `[vocab]`.
+    ///
+    /// The matrix is the full window. `rows` is the forward's `q_len`, which
+    /// may be larger than [`Self::verify_rows`] after a rewind. Call this
+    /// before the sampler; the one-row buffer is what penalties overwrite.
+    ///
+    /// # Errors
+    ///
+    /// The verify scratch is absent, or `rows` is outside 1..=16.
+    pub(crate) fn copy_verify_logit_rows(&self, gpu: &Gpu, rows: u32) -> Result<Vec<Vec<u8>>> {
+        if rows == 0 || rows > 16 {
+            return Err(Error::Input(format!(
+                "verify logit copy of {rows} rows is outside 1..=16"
+            )));
+        }
+        let ws = self.verify_ready()?;
+        let mut all = vec![0u8; ws.logits.num_bytes()];
+        ws.logits.copy_to_host(&gpu.stream, &mut all)?;
+        let row = rows_bytes(self.vocab, 1, 2)?;
+        let need = rows_bytes(self.vocab, rows, 2)?;
+        if need > all.len() {
+            return Err(Error::Input(
+                "verify logits are shorter than the requested rows".into(),
+            ));
+        }
+        let mut out = Vec::with_capacity(usize::try_from(rows).unwrap_or(0));
+        for index in 0..usize::try_from(rows).unwrap_or(0) {
+            let off = index
+                .checked_mul(row)
+                .ok_or_else(|| Error::Input("verify logit row offset overflows".into()))?;
+            out.push(all[off..off + row].to_vec());
+        }
+        Ok(out)
     }
 
     /// The one-row logit buffer filled by [`Self::copy_verify_logit_row`].
