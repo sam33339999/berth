@@ -5,7 +5,10 @@ Compiles `_paged_attn_decode_split_kernel` and `_paged_attn_decode_combine_kerne
 with the same `triton.compile` arguments `BCAttn._configure` uses
 (`exllamav3/modules/attention_fn/bc_attn.py`): signature, constexprs, num_warps,
 num_stages. The slot is autoregressive decode, q_len 1, causal, cq3 K and V.
-`splits_cap` is not a constexpr.
+`splits_cap` is not a constexpr. `build_decode_qlen_cubins`, called at the
+end of `main`, captures the same pair for q_len 2..16. Each length is its
+own constexpr cubin, named `_paged_attn_decode_{split,combine}_kernel_q{n}.cubin`.
+The q_len 1 names and bytes stay as the block above wrote them.
 
 Also JIT-captures `_paged_attn_prefill_kernel` and, when `num_splits > 1`,
 `_paged_attn_prefill_combine_kernel`, by calling `paged_attn_triton_prefill`
@@ -46,8 +49,8 @@ import sys
 import types
 from pathlib import Path
 
-# Autoregressive decode. DFlash2's verify window is a different q_len and a
-# different cubin; this script only builds the q_len 1 pair.
+# Autoregressive decode. q_len 1 is the serve slot and keeps the unsuffixed
+# cubin names. q_len 2..16 is captured afterwards by build_decode_qlen_cubins.
 Q_LEN = 1
 # Serve default, profiled in docs/kernels.md. Not in config.json.
 K_BITS = 3
@@ -567,6 +570,14 @@ def main() -> None:
             print("  no pre-existing fork cache cubin with the same bytes")
         print(f"  cross-check: parameter list matches attention.cpp and PTX ({len(rec['parameters'])} launch slots)")
     for note in prefill_notes:
+        print(note)
+
+    # After prefill so this is the last writer of manifest.json. q_len 1
+    # filenames are not in this set.
+    qlen_notes = build_decode_qlen_cubins(
+        paged, shape, triton, out, ext_tree, window_left, window_right, sm_count,
+    )
+    for note in qlen_notes:
         print(note)
 
 
@@ -1374,6 +1385,134 @@ def build_prefill_cubins(paged, shape: dict, out: Path, fork_marker: str, ext_tr
         "classes": [key for key, _record in written],
         "combine_classes": [key for key, _record in combine_written],
     }
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    return notes
+
+
+def build_decode_qlen_cubins(
+    paged, shape: dict, triton, out: Path, ext_tree: str,
+    window_left: int, window_right: int, sm_count: int,
+) -> list[str]:
+    """Capture decode split/combine cubins for q_len 2..16.
+
+    q_len is a constexpr, so each length is its own cubin even when the tile
+    matches a neighbour. q_len 1 keeps the names main() already wrote. A file
+    that already exists is kept when the bytes match and refused when they
+    do not. The listener is cleared so these compiles are not counted as the
+    two decode events main() already checked.
+    """
+    import triton.knobs as knobs
+
+    knobs.compilation.listener = None
+    manifest_path = out / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    kernels = manifest["kernels"]
+    cache_t = "*i32"
+    q1_names = {f"{SPLIT_NAME}.cubin", f"{COMBINE_NAME}.cubin"}
+    notes = []
+
+    def one(q_len: int, fn, sig, consts, num_warps, num_stages, cpp_args, kind, geom, qshape):
+        ck = compile_kernel(fn, sig, consts, num_warps, num_stages)
+        if ck.metadata.target.arch != 86:
+            raise SystemExit(f"{fn.__name__} q_len {q_len} targeted sm_{ck.metadata.target.arch}")
+        if ck.metadata.global_scratch_size or ck.metadata.profile_scratch_size:
+            raise SystemExit(
+                f"{fn.__name__} q_len {q_len} scratch sizes "
+                f"{ck.metadata.global_scratch_size}/{ck.metadata.profile_scratch_size}"
+            )
+        if ck.metadata.num_warps != num_warps:
+            raise SystemExit(
+                f"{fn.__name__} q_len {q_len} num_warps {ck.metadata.num_warps} != {num_warps}"
+            )
+        params = runtime_params(fn, sig)
+        check_against_cpp(fn.__name__, params, cpp_args)
+        ptx = ck.asm["ptx"]
+        if not isinstance(ptx, str):
+            ptx = ptx.decode()
+        launch_params = check_against_ptx(ck.metadata.name, params, ptx)
+        cubin = ck.asm["cubin"]
+        if not isinstance(cubin, (bytes, bytearray)) or len(cubin) == 0:
+            raise SystemExit(f"{fn.__name__} q_len {q_len} cubin is empty")
+        filename = f"{fn.__name__}_q{q_len}.cubin"
+        key = f"{fn.__name__}_q{q_len}"
+        if q_len < 2 or q_len > 16 or "_q" not in filename or filename in q1_names:
+            raise SystemExit(f"refusing to write decode cubin {filename}")
+        dest = out / filename
+        cubin = bytes(cubin)
+        if dest.is_file() and dest.read_bytes() != cubin:
+            raise SystemExit(
+                f"{key} cubin bytes differ from the existing {dest} "
+                f"({dest.stat().st_size} on disk, {len(cubin)} newly compiled). "
+                "Refusing to overwrite."
+            )
+        note = grid_note_split(qshape, geom, num_warps, sm_count) if kind == "split" \
+            else grid_note_combine(qshape, geom, num_warps, sm_count)
+        dest.write_bytes(cubin)
+        kernels[key] = {
+            "cubin": filename,
+            "name": ck.metadata.name,
+            "num_warps": ck.metadata.num_warps,
+            "num_stages": num_stages,
+            "shared": ck.metadata.shared,
+            "global_scratch_size": ck.metadata.global_scratch_size,
+            "profile_scratch_size": ck.metadata.profile_scratch_size,
+            "parameters": launch_params,
+            "constexprs": jsonable_constexprs(consts),
+            "grid": note,
+            "triton_version": triton.__version__,
+            "ext_tree": ext_tree,
+        }
+        notes.append(
+            f"{key}: q_len {q_len} symbol {ck.metadata.name} "
+            f"BLOCK_M {consts['BLOCK_M']} BLOCK_H {consts['BLOCK_H']} "
+            f"bytes {len(cubin)}"
+        )
+
+    for q_len in range(2, 17):
+        qshape = dict(shape)
+        qshape["q_len"] = q_len
+        geom = tile(qshape, triton)
+        split_sig = {
+            "q": "*fp16", "k_cache": cache_t, "v_cache": cache_t,
+            "block_table": "*i32", "cache_seqlens": "*i32", "out": "*fp16",
+            "partial_o": "*fp32", "partial_ml": "*fp32",
+            "k_scales": "*fp16", "v_scales": "*fp16", "h32": "*fp16",
+            "split_len": "i32", "num_pages_per_seq": "i32", "num_splits": "i32",
+            "sinks": "*fp32",
+        } | {n: "constexpr" for n in (
+            "QCK", "QCV", "q_len", "kv_append_len", "n_q_heads", "n_kv_heads",
+            "page_size", "head_dim", "HD_PAD", "scale", "CAUSAL", "WINDOW_LEFT", "WINDOW_RIGHT",
+            "SOFTCAP", "FINAL", "HAS_SINKS", "BLOCK_M", "BLOCK_H", "BLOCK_ROWS", "BLOCK_N")}
+        split_consts = dict(
+            QCK=qshape["k_bits"], QCV=qshape["v_bits"],
+            q_len=q_len, kv_append_len=q_len,
+            n_q_heads=qshape["n_q_heads"], n_kv_heads=qshape["n_kv_heads"],
+            page_size=qshape["page_size"], head_dim=qshape["head_dim"], HD_PAD=geom["hd_pad"],
+            scale=float(qshape["sm_scale"]),
+            CAUSAL=bool(CAUSAL), WINDOW_LEFT=window_left, WINDOW_RIGHT=window_right,
+            SOFTCAP=float(SOFTCAP or 0.0), FINAL=False, HAS_SINKS=False,
+            BLOCK_M=geom["block_m"], BLOCK_H=geom["block_h"], BLOCK_ROWS=geom["block_rows"],
+            BLOCK_N=geom["block_n"],
+        )
+        combine_sig = {
+            "partial_o": "*fp32", "partial_ml": "*fp32", "out": "*fp16", "h32": "*fp16",
+            "num_splits": "i32", "sinks": "*fp32",
+        } | {n: "constexpr" for n in (
+            "QCV", "HAS_SINKS", "q_len", "n_q_heads", "n_kv_heads", "head_dim", "HD_PAD",
+            "BLOCK_M", "BLOCK_H", "BLOCK_ROWS")}
+        combine_consts = dict(
+            QCV=qshape["v_bits"], HAS_SINKS=HAS_SINKS, q_len=q_len,
+            n_q_heads=qshape["n_q_heads"], n_kv_heads=qshape["n_kv_heads"],
+            head_dim=qshape["head_dim"], HD_PAD=geom["hd_pad"],
+            BLOCK_M=geom["block_m"], BLOCK_H=geom["block_h"], BLOCK_ROWS=geom["block_rows"],
+        )
+        specs = [
+            (paged._paged_attn_decode_split_kernel, split_sig, split_consts, 4, 2, SPLIT_CPP_ARGS, "split"),
+            (paged._paged_attn_decode_combine_kernel, combine_sig, combine_consts, 4, 1, COMBINE_CPP_ARGS, "combine"),
+        ]
+        for fn, sig, consts, num_warps, num_stages, cpp_args, kind in specs:
+            one(q_len, fn, sig, consts, num_warps, num_stages, cpp_args, kind, geom, qshape)
+
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     return notes
 

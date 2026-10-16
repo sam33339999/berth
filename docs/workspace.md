@@ -178,6 +178,7 @@ cargo build --release -p berth
 | `--freq-penalty` | `FREQ_PENALTY` | `0` |
 | `--freq-range` | `FREQ_RANGE` | `512` |
 | `--presence-penalty` | `PRESENCE_PENALTY` | `0` |
+| `--mtp-steps` | `BERTH_MTP_STEPS` | `0`（0 不載 MTP；1..=15 才載 MTP head 並加寬 GDN history） |
 
 `/v1/models` 的 `max_model_len` 和請求的長度檢查用 `--max-model-len`，不是整份 KV cache。抽樣旗標是全伺服器的起點，請求裡的同名欄位仍可蓋過。`--max-concurrent` 只限制同時收下的請求數（正在跑的加上排隊的）；超過回 HTTP 429。GPU 還是一次一個 job。0 表示不限制排隊。
 
@@ -196,6 +197,20 @@ Triton 依整數參數的值特化 kernel（等於 1、能被 16 整除、其他
 prefill 的 split 已接上，跟 fork 的 `paged_attn_triton_prefill` 同一條路。`bound_kv = 頁數 × 256 + q_len ≥ 8192` 才拆：候選是 2、3、4、5、6、8，先挑 `ceil(programs × cand / sms) / cand + 0.03 × (cand − 1)` 最小的，平手留前面那個，再把 fp32 partial 壓在 128 MiB 以內。split kernel 的 grid 是 `(q_blocks, n_q_heads, num_splits)`，combine 在 `mul_sigmoid` 之前跑。partial 放在各層共用的 prefill scratch，第一次用到才配，高水位不超過 128 MiB，不跟 decode 的 partial 共用。
 
 prefill 的 block table 寬度是整份 job 的配置，每個 chunk 都一樣：`ceil((prompt_len + max_new_tokens + 1) / 256)` 頁，不補到 16 的倍數。fork 在 `Job.prepare_for_queue`（`generator/job.py` 1118–1120）沒有明示 `max_rq_tokens` 時設 `max_rq_tokens = max_new_tokens + 1 + num_draft_tokens`。berth 還沒有草稿，對齊的是 fork 不開草稿的情況（`generator.py` 171 把 `num_draft_tokens` 設成 0）。正式服務開了 DFlash2，寬度會再多 `num_draft_tokens`，接 DFlash2 時要跟著加。`Sequence.prepare`（`generator/pagetable.py` 235–238）用這個預算算出 `total_pages`，prefill 每個 chunk 都傳整張 `seq.block_index_tensor`（`job.py` 1398）。之前 berth 用該段結尾的 `end.div_ceil(256)`，長 prompt 的前段頁數少一截，過了 8192 之後 split 數會和 fork 不同。100 兩種算法都是 1 頁。1500 的第一段舊寬度是 5 頁、fork 是 6 頁，兩種都還低於 8192，頁數類別都是 other，kernel 不讀多出來的那一頁，所以 digest 不變。一個 prompt 只有一種頁數類別：8190 是 32 頁（div16），8400 是 33 頁（other）。decode 的寬度沒改，還是 `ceil((prompt + max_new_tokens) / 256)` 頁補到 16 的倍數。
+
+MTP（P2）加了 `Model::prefill_mtp` 和 `Model::set_max_history`。沒開 MTP 的 prefill 還是同一條路：第 63 層只跑 mixer，`prefill_block_pages` 不變（8190 仍是 32 頁）。`prefill_block_pages_mtp` 把草稿 token 加進 `max_new_tokens`，N = 2 時 8190 是 33 頁，不補到 16。GDN 在 `max_history == 0`（載入預設）時 launch 參數和 state 形狀跟以前一樣；`set_max_history` 才把 conv 加寬 `n`、recurrent 的 history 軸改成 `n + 1`。GPU 對照是 P4。
+
+`--mtp-steps`（P3）預設 0。開著時多一份 draft cache、MTP 權重，以及約 5 倍的 GDN recurrent state，建議把 `--cache-tokens` 調小，否則 24 GiB 可能放不下；放不下就在載入時回 OOM。
+
+P4 接了 `Engine::generate_traced`（`MtpTrace`，預設不啟用）和 `tests/mtp_ref.rs`。`generate` 在 `mtp_steps > 0` 時用同一個迴圈。`mtp_steps == 0` 不呼叫 trace。
+
+P5 讓這支 GPU 對照和 fork 逐位元一致。N=2 和 N=4 的 16 個 case（prompt A / 100 / 1500 / 8190，greedy 和 temperature 0.7）全部通過，每輪 digest 一致，logit 第 0 列 max abs diff 是 0。三處對齊：
+
+- n 列 `lm_head`（K=6、mul1）在 `Exl3Linear::forward_n` 改走 decode shim 的 `berth_kernels::exl3_linear`（`size_m = rows`，`a_had` 用呼叫端的 n 列）。int8 只收 K≤5、QTIP 只收 K=2..4，所以是 coop GEMM，autotune key `max(m, 2)`（`exllamav3_ext/quant/exl3_gemm.cu` 255）。沒有新 kernel。
+- 視窗裡的 EOS / `max_new_tokens` 不呼叫 `reject_remainder`（cache 長度留在整窗），`rejected` 維持 0，所以仍 `rewind(0)`（`generator.py` 1192–1202、1244–1246）。`accepted_length > 1` 時仍 refresh（1301–1333）。
+- 只有 `mtp_steps > 0` 的載入會裝上 `SS_DRY` 預設 sequence breaker（`custom.py` 883–890，抽樣時 1008–1010 才解析）。`mtp_steps == 0` 仍是 null mask。
+
+`mtp_steps == 0` 的 prefill / decode / generate、launch 參數、cubin、block table 寬度沒改。
 
 實測在 `127.0.0.1:18889`，`max_tokens` 20、溫度 0、串流。TTFT 從送出請求算到第一個 reasoning token（角色那一包不算）。載入後、還沒送請求是 22255 MiB。
 

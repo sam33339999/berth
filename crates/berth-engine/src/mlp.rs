@@ -39,17 +39,38 @@ pub struct MlpLayer {
 }
 
 impl MlpLayer {
+    /// `gate_proj` in-features.
+    pub(crate) fn hidden_size(&self) -> i32 {
+        self.hidden
+    }
+
+    /// `gate_proj` out-features.
+    pub(crate) fn intermediate(&self) -> i64 {
+        self.intermediate
+    }
+}
+
+impl MlpLayer {
     /// Load layer `layer`'s MLP weights.
     pub fn load(gpu: &Gpu, ckpt: &Checkpoint, layer: u32) -> Result<Self> {
-        let gate_prefix = format!("model.language_model.layers.{layer}.mlp.gate_proj");
-        let up_prefix = format!("model.language_model.layers.{layer}.mlp.up_proj");
-        let down_prefix = format!("model.language_model.layers.{layer}.mlp.down_proj");
+        let prefix = format!("model.language_model.layers.{layer}.mlp");
+        Self::load_prefixed(gpu, ckpt, &prefix)
+    }
+
+    /// Load `{prefix}.gate_proj`, `.up_proj`, and `.down_proj`.
+    ///
+    /// [`Self::load`] passes `model.language_model.layers.{layer}.mlp`. The
+    /// MTP head passes `mtp.layers.0.mlp`.
+    pub fn load_prefixed(gpu: &Gpu, ckpt: &Checkpoint, prefix: &str) -> Result<Self> {
+        let gate_prefix = format!("{prefix}.gate_proj");
+        let up_prefix = format!("{prefix}.up_proj");
+        let down_prefix = format!("{prefix}.down_proj");
         // `BC_GatedMLP::run_bszN_gr` adds a bias when the linear has one. The
         // 27B language-model linears do not, and `Exl3Linear` does not add one.
-        for prefix in [&gate_prefix, &up_prefix, &down_prefix] {
-            if find_linear(ckpt, prefix)?.bias.is_some() {
+        for part in [&gate_prefix, &up_prefix, &down_prefix] {
+            if find_linear(ckpt, part)?.bias.is_some() {
                 return Err(Error::Weights(format!(
-                    "{prefix}: bias is present and is not applied"
+                    "{part}: bias is present and is not applied"
                 )));
             }
         }
@@ -59,13 +80,13 @@ impl MlpLayer {
         let down = Exl3Linear::load(gpu, ckpt, &down_prefix)?;
         if gate.size_k != up.size_k || gate.size_n != up.size_n {
             return Err(Error::Weights(format!(
-                "layer {layer}: gate is {}x{}, up is {}x{}",
+                "{prefix}: gate is {}x{}, up is {}x{}",
                 gate.size_k, gate.size_n, up.size_k, up.size_n
             )));
         }
         if down.size_k != gate.size_n || down.size_n != gate.size_k {
             return Err(Error::Weights(format!(
-                "layer {layer}: down is {}x{}, gate is {}x{}",
+                "{prefix}: down is {}x{}, gate is {}x{}",
                 down.size_k, down.size_n, gate.size_k, gate.size_n
             )));
         }
@@ -74,7 +95,7 @@ impl MlpLayer {
         // `silu_mul` requires a positive even count (`act_mul_kernel_h` steps by half2).
         if intermediate < 2 || intermediate % 2 != 0 {
             return Err(Error::Weights(format!(
-                "layer {layer}: intermediate {intermediate} must be positive and even"
+                "{prefix}: intermediate {intermediate} must be positive and even"
             )));
         }
         let bytes = intermediate as usize * 2;
@@ -281,6 +302,34 @@ impl MlpLayer {
         self.down
             .forward_rows(gpu, rows_scratch, &scratch.up, output, rows, OutDtype::F32)?;
         Ok(())
+    }
+
+    /// `n` rows of the unfused gate / up / `silu_mul` / down sequence.
+    ///
+    /// `n == 1` is [`Self::forward`]. `n >= 2` is [`Self::prefill`]. On the
+    /// 27B `multi_gu` is not built, so `BC_GatedMLP::run_bszN` (`n <= 8`) and
+    /// two `Linear.forward` calls (`n > 8`) launch this same sequence
+    /// (`docs/mtp.md` section 4). [`Self::prefill`] still rejects `rows < 2`.
+    pub fn forward_n(
+        &mut self,
+        gpu: &Gpu,
+        rows_scratch: &mut crate::device::RowScratch,
+        scratch: &mut MlpPrefillScratch,
+        input: &ByteBuf,
+        output: &mut ByteBuf,
+        rows: u32,
+    ) -> Result<()> {
+        if rows == 0 {
+            return Err(Error::Input(format!(
+                "{}: MLP rows must be positive",
+                self.gate.prefix
+            )));
+        }
+        if rows == 1 {
+            self.forward(gpu, input, output)
+        } else {
+            self.prefill(gpu, rows_scratch, scratch, input, output, rows)
+        }
     }
 }
 

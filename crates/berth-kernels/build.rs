@@ -256,6 +256,18 @@ const FORK_EXTRACTS: &[Extract] = &[
             },
         ],
     },
+    // Rewind kernel bodies only. The host wrappers at 1962–2010 and the job
+    // structs in gdn.cuh use ATen, so those stay out of the extract. The
+    // launcher in csrc/gdn/gdn_rewind.cu declares the POD jobs itself.
+    Extract {
+        name: "gdn_rewind_kernels.cuh",
+        parts: &[Part {
+            file: "gdn.cu",
+            first: 1923,
+            last: 1960,
+            contains: "batched_conv_rewind_kernel",
+        }],
+    },
     Extract {
         name: "norm_kernels.cuh",
         parts: &[

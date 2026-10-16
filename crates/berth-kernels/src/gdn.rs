@@ -34,6 +34,33 @@ use std::ffi::{c_char, c_int, c_void, CStr};
 
 use crate::{Error, Result};
 
+/// One conv-state rewind, matching `gdn.cuh` `ConvRewindJob`.
+///
+/// `src` and `dst` are device addresses. `stride` is the per-channel element
+/// stride (`conv_state.stride(1)`), not a byte stride. The kernel copies
+/// `cdim` bf16 values, `stride` elements apart, from `src` onto `dst`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConvRewindJob {
+    pub src: u64,
+    pub dst: u64,
+    pub dim: i32,
+    pub cdim: i32,
+    pub stride: i32,
+}
+
+/// One recurrent-state rewind, matching `gdn.cuh` `StateRewindJob`.
+///
+/// Flat fp32 copy of `num_elements` contiguous elements. The fork requires
+/// `num_elements` to be a multiple of 4 (the kernel moves `float4`s).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateRewindJob {
+    pub src: u64,
+    pub dst: u64,
+    pub num_elements: i64,
+}
+
 unsafe extern "C" {
     fn berth_gdn_ba_gemv(
         x: *const c_void,
@@ -109,6 +136,55 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> c_int;
 
+    fn berth_gdn_conv1d_update_history(
+        x: *const c_void,
+        conv_state: *mut c_void,
+        slots: *const c_void,
+        weight: *const c_void,
+        bias: *const c_void,
+        out: *mut c_void,
+        bsz: c_int,
+        dim: c_int,
+        seqlen: c_int,
+        state_size: c_int,
+        k: c_int,
+        history: c_int,
+        stream: *mut c_void,
+    ) -> c_int;
+
+    fn berth_gdn_recurrent_history(
+        mixed_qkv: *const c_void,
+        g: *const c_void,
+        beta: *const c_void,
+        recurrent_state: *mut c_void,
+        core_attn_out: *mut c_void,
+        slots: *const c_void,
+        bsz: c_int,
+        seqlen: c_int,
+        num_k_heads: c_int,
+        num_v_heads: c_int,
+        k_head_dim: c_int,
+        v_head_dim: c_int,
+        history_stride: c_int,
+        history: c_int,
+        stream: *mut c_void,
+    ) -> c_int;
+
+    fn berth_gdn_batched_conv_rewind(
+        jobs: *const ConvRewindJob,
+        n: c_int,
+        stream: *mut c_void,
+    ) -> c_int;
+
+    fn berth_gdn_batched_state_rewind(
+        jobs: *const StateRewindJob,
+        n: c_int,
+        stream: *mut c_void,
+    ) -> c_int;
+
+    fn berth_gdn_rewind_last_error() -> *const c_char;
+    fn berth_gdn_rewind_last_launch() -> *const c_char;
+
     fn berth_gdn_last_error() -> *const c_char;
     fn berth_gdn_last_launch() -> *const c_char;
 }
@@ -177,8 +253,9 @@ pub unsafe fn gdn_ba_gemv(
 ///
 /// Fork: `cuda_causal_conv1d_update` / `cuda_causal_conv1d_update_gr` with
 /// `activation=true` and `history=false`, which is `conv1d_update_kernel<1,0>`
-/// (`gdn.cu`). The sigmoid is `_sigmoid_fast_exp`, not silu. The other three
-/// `(activation, history)` instances are not linked.
+/// (`gdn.cu`). The sigmoid is `_sigmoid_fast_exp`, not silu. The other
+/// `(activation, history)` instances are not linked here.
+/// [`conv1d_update_history`] also links `<1,1>`.
 ///
 /// * `x` — bf16 `[bsz, dim, seqlen]`. This is `mixed_qkv` from
 ///   [`gated_delta_net_fused_op_3`]: `[B, F, S]` with `F = 10240` and `S = 1`.
@@ -299,7 +376,8 @@ pub unsafe fn gated_delta_net_fused_op_3(
 /// with `history=false`, head dim 128, and `v_split = 4`. That is
 /// `cuda_recurrent_gated_delta_rule_kernel_128<0,4,0>` (`gdn.cu`):
 /// `save_history=false`, `V_SPLIT=4`, `CHANNELWISE=false`. KDA (per-channel
-/// decay) and the history-saving instance are not linked.
+/// decay) is not linked. The history-saving instance is
+/// [`recurrent_gated_delta_rule_history`].
 ///
 /// * `mixed_qkv` — bf16 `[bsz, seqlen, F]`, the conv output. Per token the
 ///   layout is Q (`num_k_heads * k_head_dim`), then K (same), then V
@@ -467,8 +545,348 @@ pub fn last_launch() -> String {
 /// Message from the last failed GDN launch on this thread.
 ///
 /// Empty after a successful launch. Copied, same as [`last_launch`].
+/// Rewind failures are reported by the rewind wrappers themselves; they do
+/// not write this string.
 pub fn last_error() -> String {
     c_string(unsafe { berth_gdn_last_error() })
+}
+
+/// Causal conv1d update with an explicit history flag.
+///
+/// Same tensors and grid as [`conv1d_update`]. `history` selects
+/// `conv1d_update_kernel<1,1>` (the fork's `cuda_causal_conv1d_update` with
+/// `activation=true` and `history=true`). `history == false` launches the
+/// already-linked `<1,0>` instance. `state_size` is `conv_state.size(2)`.
+///
+/// # Errors
+///
+/// The same shape checks as [`conv1d_update`]. A CUDA failure is
+/// [`Error::Launch`].
+///
+/// # Safety
+///
+/// Same as [`conv1d_update`]. With history on, the kernel writes the tail of
+/// each channel, up to `state_size` elements.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn conv1d_update_history(
+    x: *const c_void,
+    conv_state: *mut c_void,
+    slots: *const c_void,
+    weight: *const c_void,
+    bias: *const c_void,
+    out: *mut c_void,
+    bsz: i32,
+    dim: i32,
+    seqlen: i32,
+    state_size: i32,
+    k: i32,
+    history: bool,
+    stream: *mut c_void,
+) -> Result<()> {
+    let rc = unsafe {
+        berth_gdn_conv1d_update_history(
+            x,
+            conv_state,
+            slots,
+            weight,
+            bias,
+            out,
+            bsz,
+            dim,
+            seqlen,
+            state_size,
+            k,
+            c_int::from(history),
+            stream,
+        )
+    };
+    check(rc, "conv1d_update_history")
+}
+
+/// Gated delta rule with an explicit history flag.
+///
+/// Same tensors as [`recurrent_gated_delta_rule`]. `history` selects
+/// `cuda_recurrent_gated_delta_rule_kernel_128<1,4,0>`. `v_split` is the
+/// fork's value: 4 when `bsz == 1`, both head dims are 128, and
+/// `num_v_heads <= 64`. Any other shape is rejected; `<*,1>` is not linked.
+/// When `history` is set, `history_stride` must be at least `seqlen`
+/// (`recurrent_state.size(1)`).
+///
+/// # Errors
+///
+/// A null required pointer, a shape that is not `kernel_128` with
+/// `v_split == 4`, or `history_stride < seqlen` while history is on, is
+/// [`Error::Launch`] and does not call CUDA.
+///
+/// # Safety
+///
+/// Same as [`recurrent_gated_delta_rule`]. With history on, indexes
+/// `0..seqlen` of the history dimension are read and written.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn recurrent_gated_delta_rule_history(
+    mixed_qkv: *const c_void,
+    g: *const c_void,
+    beta: *const c_void,
+    recurrent_state: *mut c_void,
+    core_attn_out: *mut c_void,
+    slots: *const c_void,
+    bsz: i32,
+    seqlen: i32,
+    num_k_heads: i32,
+    num_v_heads: i32,
+    k_head_dim: i32,
+    v_head_dim: i32,
+    history_stride: i32,
+    history: bool,
+    stream: *mut c_void,
+) -> Result<()> {
+    let rc = unsafe {
+        berth_gdn_recurrent_history(
+            mixed_qkv,
+            g,
+            beta,
+            recurrent_state,
+            core_attn_out,
+            slots,
+            bsz,
+            seqlen,
+            num_k_heads,
+            num_v_heads,
+            k_head_dim,
+            v_head_dim,
+            history_stride,
+            c_int::from(history),
+            stream,
+        )
+    };
+    check(rc, "recurrent_gated_delta_rule_history")
+}
+
+/// Launch `batched_conv_rewind_kernel` for `jobs`.
+///
+/// An empty slice returns without calling CUDA. Jobs are packed into chunks
+/// of 64. The grid is `(ceil(max_dim / 256), n_chunk)` and the block is 256,
+/// matching `batched_conv_rewind` in `gdn.cu`. `cdim` must be in `0..=16`.
+///
+/// # Errors
+///
+/// `cdim` outside `0..=16`, a negative `dim`, or a CUDA failure is
+/// [`Error::Launch`]. The rewind error channel is separate from [`last_error`].
+///
+/// # Safety
+///
+/// Each job's `src` and `dst` must be device addresses of a bf16 conv state.
+/// The kernel reads `cdim` elements into registers before writing them back,
+/// so an overlapping window is safe. `stream` may be null.
+pub unsafe fn batched_conv_rewind(jobs: &[ConvRewindJob], stream: *mut c_void) -> Result<()> {
+    let n = i32::try_from(jobs.len())
+        .map_err(|_| Error::Launch("batched_conv_rewind: too many jobs".into()))?;
+    let ptr = if n == 0 {
+        std::ptr::null()
+    } else {
+        jobs.as_ptr()
+    };
+    let rc = unsafe { berth_gdn_batched_conv_rewind(ptr, n, stream) };
+    check_rewind(rc, "batched_conv_rewind")
+}
+
+/// Launch `batched_state_rewind_kernel` for `jobs`.
+///
+/// An empty slice returns without calling CUDA. The grid is
+/// `(ceil((max_elements / 4) / 256), n_chunk)` and the block is 256.
+/// `num_elements` must be a non-negative multiple of 4.
+///
+/// # Errors
+///
+/// A `num_elements` that is not a multiple of 4, a count that does not fit
+/// in `int` after dividing by 4, or a CUDA failure is [`Error::Launch`].
+///
+/// # Safety
+///
+/// Each job's `src` and `dst` must be device addresses of `num_elements`
+/// fp32 values. The fork's sources do not overlap the destination.
+pub unsafe fn batched_state_rewind(jobs: &[StateRewindJob], stream: *mut c_void) -> Result<()> {
+    let n = i32::try_from(jobs.len())
+        .map_err(|_| Error::Launch("batched_state_rewind: too many jobs".into()))?;
+    let ptr = if n == 0 {
+        std::ptr::null()
+    } else {
+        jobs.as_ptr()
+    };
+    let rc = unsafe { berth_gdn_batched_state_rewind(ptr, n, stream) };
+    check_rewind(rc, "batched_state_rewind")
+}
+
+/// Name of the last successful rewind launch on this thread.
+///
+/// Empty after a failed rewind and before any rewind. Separate from
+/// [`last_launch`].
+pub fn rewind_last_launch() -> String {
+    c_string(unsafe { berth_gdn_rewind_last_launch() })
+}
+
+fn check_rewind(rc: c_int, what: &str) -> Result<()> {
+    if rc == 0 {
+        return Ok(());
+    }
+    let message = c_string(unsafe { berth_gdn_rewind_last_error() });
+    let message = if message.is_empty() {
+        format!("{what} launch failed ({rc})")
+    } else {
+        message
+    };
+    Err(Error::Launch(message))
+}
+
+fn rewind_counts(last_history: i32, num_tokens: i32) -> Result<()> {
+    if last_history < 0 || num_tokens < 0 {
+        return Err(Error::Launch(
+            "rewind: last_history and num_tokens must be non-negative".into(),
+        ));
+    }
+    if num_tokens > last_history {
+        return Err(Error::Launch(
+            "rewind: num_tokens must be <= last_history".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn rewind_slot_base(base: u64, slot: i64, stride0: i64, elem_size: i64) -> Result<u64> {
+    if slot < 0 || stride0 < 0 || elem_size <= 0 {
+        return Err(Error::Launch(
+            "rewind: slot, stride0, and element size must be non-negative".into(),
+        ));
+    }
+    let delta = i128::from(slot)
+        .checked_mul(i128::from(stride0))
+        .and_then(|n| n.checked_mul(i128::from(elem_size)))
+        .ok_or_else(|| Error::Launch("rewind: slot offset overflows".into()))?;
+    add_ptr(base, delta)
+}
+
+fn add_ptr(base: u64, delta: i128) -> Result<u64> {
+    let addr = i128::from(base)
+        .checked_add(delta)
+        .ok_or_else(|| Error::Launch("rewind: pointer overflows".into()))?;
+    u64::try_from(addr).map_err(|_| Error::Launch("rewind: pointer overflows".into()))
+}
+
+/// Conv rewind addresses, matching `GDNLayerState.rewind_conv_job`.
+///
+/// `None` when `last_history == 0`. Otherwise `p = state_size - num_tokens`
+/// and the job copies elements `[p - conv_k, p)` onto `[0, conv_k)`.
+///
+/// * `base` — `conv_state.data_ptr()`.
+/// * `slot` — which slot. The slot base is `base + slot * stride0 * elem_size`.
+/// * `stride0`, `stride1`, `stride2` — element strides of `[slots, dim, state]`.
+/// * `shape1` — `conv_state.shape[1]` (channels). Stored as `dim`.
+/// * `state_size` — `conv_state.shape[-1]`.
+/// * `conv_k` — `conv_kernel_size`. Stored as `cdim`.
+/// * `elem_size` — `element_size()` in bytes (2 for bf16).
+/// * `stride` on the job is `stride1` in elements, which must fit in `i32`.
+///
+/// `num_tokens > last_history` is an error, same as `GDNState.rewind`.
+///
+/// # Errors
+///
+/// A negative count, `num_tokens > last_history`, a source window that
+/// starts before the buffer, or an offset that overflows.
+#[allow(clippy::too_many_arguments)]
+pub fn rewind_conv_addrs(
+    base: u64,
+    slot: i64,
+    stride0: i64,
+    stride1: i64,
+    stride2: i64,
+    shape1: i32,
+    state_size: i32,
+    conv_k: i32,
+    elem_size: i64,
+    last_history: i32,
+    num_tokens: i32,
+) -> Result<Option<ConvRewindJob>> {
+    rewind_counts(last_history, num_tokens)?;
+    if last_history == 0 {
+        return Ok(None);
+    }
+    if shape1 < 0 || state_size < 1 || conv_k < 1 || stride1 < 0 || stride2 < 0 {
+        return Err(Error::Launch(
+            "rewind: conv shape and strides must be non-negative".into(),
+        ));
+    }
+    let stride = i32::try_from(stride1)
+        .map_err(|_| Error::Launch("rewind: conv stride1 does not fit in i32".into()))?;
+    let p = state_size
+        .checked_sub(num_tokens)
+        .ok_or_else(|| Error::Launch("rewind: conv p underflows".into()))?;
+    let elem_off = i64::from(p)
+        .checked_sub(i64::from(conv_k))
+        .ok_or_else(|| Error::Launch("rewind: conv source starts before the buffer".into()))?;
+    if elem_off < 0 {
+        return Err(Error::Launch(
+            "rewind: conv source starts before the buffer".into(),
+        ));
+    }
+    let slot_base = rewind_slot_base(base, slot, stride0, elem_size)?;
+    let byte_off = i128::from(elem_off)
+        .checked_mul(i128::from(stride2))
+        .and_then(|n| n.checked_mul(i128::from(elem_size)))
+        .ok_or_else(|| Error::Launch("rewind: conv source offset overflows".into()))?;
+    let src = add_ptr(slot_base, byte_off)?;
+    Ok(Some(ConvRewindJob {
+        src,
+        dst: slot_base,
+        dim: shape1,
+        cdim: conv_k,
+        stride,
+    }))
+}
+
+/// Recurrent rewind addresses, matching `GDNLayerState.rewind_state_job`.
+///
+/// `None` when `num_tokens == 0`. Otherwise the source history index is
+/// `last_history + 1 - num_tokens`, and `num_elements` is `stride1`
+/// (one history slice, not the product of the head dims).
+///
+/// * `base` — `recurrent_state.data_ptr()`.
+/// * `stride0`, `stride1` — element strides. `stride1` is the history stride
+///   in elements (`48 * 128 * 128` when the tail is contiguous).
+/// * `elem_size` — 4 for the fp32 recurrent state.
+///
+/// # Errors
+///
+/// A negative count, `num_tokens > last_history`, or an offset that overflows.
+pub fn rewind_state_addrs(
+    base: u64,
+    slot: i64,
+    stride0: i64,
+    stride1: i64,
+    elem_size: i64,
+    last_history: i32,
+    num_tokens: i32,
+) -> Result<Option<StateRewindJob>> {
+    rewind_counts(last_history, num_tokens)?;
+    if num_tokens == 0 {
+        return Ok(None);
+    }
+    if stride1 < 0 {
+        return Err(Error::Launch(
+            "rewind: recurrent stride1 must be non-negative".into(),
+        ));
+    }
+    let index = i64::from(last_history) + 1 - i64::from(num_tokens);
+    let slot_base = rewind_slot_base(base, slot, stride0, elem_size)?;
+    let byte_off = i128::from(index)
+        .checked_mul(i128::from(stride1))
+        .and_then(|n| n.checked_mul(i128::from(elem_size)))
+        .ok_or_else(|| Error::Launch("rewind: state source offset overflows".into()))?;
+    let src = add_ptr(slot_base, byte_off)?;
+    Ok(Some(StateRewindJob {
+        src,
+        dst: slot_base,
+        num_elements: stride1,
+    }))
 }
 
 fn c_string(ptr: *const c_char) -> String {
@@ -501,6 +919,11 @@ mod tests {
         let rms = berth_gdn_gated_rms_norm as *const ();
         let err = berth_gdn_last_error as *const ();
         let launch = berth_gdn_last_launch as *const ();
+        let conv_h = berth_gdn_conv1d_update_history as *const ();
+        let recurrent_h = berth_gdn_recurrent_history as *const ();
+        let conv_rw = berth_gdn_batched_conv_rewind as *const ();
+        let state_rw = berth_gdn_batched_state_rewind as *const ();
+        let rewind_launch = berth_gdn_rewind_last_launch as *const ();
         assert!(!ba.is_null());
         assert!(!conv.is_null());
         assert!(!fused.is_null());
@@ -508,6 +931,11 @@ mod tests {
         assert!(!rms.is_null());
         assert!(!err.is_null());
         assert!(!launch.is_null());
+        assert!(!conv_h.is_null());
+        assert!(!recurrent_h.is_null());
+        assert!(!conv_rw.is_null());
+        assert!(!state_rw.is_null());
+        assert!(!rewind_launch.is_null());
     }
 
     #[test]
@@ -751,5 +1179,184 @@ mod tests {
         .expect_err("gate_act");
         assert!(err.to_string().contains("silu"), "{err}");
         assert!(last_launch().is_empty(), "{}", last_launch());
+    }
+
+    #[test]
+    fn rewind_job_layout() {
+        assert_eq!(std::mem::size_of::<ConvRewindJob>(), 32);
+        assert_eq!(std::mem::size_of::<StateRewindJob>(), 24);
+        assert_eq!(std::mem::offset_of!(ConvRewindJob, src), 0);
+        assert_eq!(std::mem::offset_of!(ConvRewindJob, dst), 8);
+        assert_eq!(std::mem::offset_of!(ConvRewindJob, dim), 16);
+        assert_eq!(std::mem::offset_of!(ConvRewindJob, cdim), 20);
+        assert_eq!(std::mem::offset_of!(ConvRewindJob, stride), 24);
+        assert_eq!(std::mem::offset_of!(StateRewindJob, num_elements), 16);
+    }
+
+    #[test]
+    fn rewind_addrs_match_section6() {
+        // docs/mtp.md section 6. K = 4, conv_k = 4, state_size = 8, n = 5,
+        // last_history = n - 1 = 4. Contiguous bf16 conv [1, 10240, 8].
+        let base = 0x1_0000u64;
+        let es = 2i64;
+        let dim = 10240i32;
+        let state_size = 8i32;
+        let conv_k = 4i32;
+        let stride2 = 1i64;
+        let stride1 = i64::from(state_size);
+        let stride0 = i64::from(dim) * stride1;
+
+        // Reject at i = 0: num_rejected = 4. Source element offset is 0,
+        // so the window copied back is [0, 4).
+        let conv = rewind_conv_addrs(
+            base, 0, stride0, stride1, stride2, dim, state_size, conv_k, es, 4, 4,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(conv.src, base);
+        assert_eq!(conv.dst, base);
+        assert_eq!(conv.dim, dim);
+        assert_eq!(conv.cdim, conv_k);
+        assert_eq!(conv.stride, 8);
+
+        // Contiguous fp32 recurrent [1, 5, 48, 128, 128]. Source index is 1.
+        let heads = 48i64 * 128 * 128;
+        let history = 5i64;
+        let state = rewind_state_addrs(base, 0, history * heads, heads, 4, 4, 4)
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.src, base + (heads as u64) * 4);
+        assert_eq!(state.dst, base);
+        assert_eq!(state.num_elements, heads);
+
+        // Full accept, rewind(0): no state job. Conv copies elements [4, 8).
+        assert!(rewind_state_addrs(base, 0, history * heads, heads, 4, 4, 0)
+            .unwrap()
+            .is_none());
+        let accept = rewind_conv_addrs(
+            base, 0, stride0, stride1, stride2, dim, state_size, conv_k, es, 4, 0,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(accept.src, base + 8);
+        assert_eq!(accept.dst, base);
+        assert_eq!(accept.cdim, conv_k);
+        assert_eq!(accept.stride, 8);
+
+        // last_history == 0 skips the conv job. num_tokens == 0 skips state.
+        assert!(rewind_conv_addrs(
+            base, 0, stride0, stride1, stride2, dim, state_size, conv_k, es, 0, 0,
+        )
+        .unwrap()
+        .is_none());
+        assert!(rewind_state_addrs(base, 0, history * heads, heads, 4, 4, 0)
+            .unwrap()
+            .is_none());
+
+        // Slot 1 shifts by stride0 * element size.
+        let slotted = rewind_conv_addrs(
+            base, 1, stride0, stride1, stride2, dim, state_size, conv_k, es, 4, 4,
+        )
+        .unwrap()
+        .unwrap();
+        let slot_bytes = (stride0 * es) as u64;
+        assert_eq!(slotted.dst, base + slot_bytes);
+        assert_eq!(slotted.src, slotted.dst);
+
+        assert!(rewind_conv_addrs(
+            base, 0, stride0, stride1, stride2, dim, state_size, conv_k, es, 4, 5,
+        )
+        .is_err());
+        assert!(rewind_state_addrs(base, 0, history * heads, heads, 4, 3, 4).is_err());
+    }
+
+    #[test]
+    fn rewind_and_history_reject_before_cuda() {
+        let bad = ConvRewindJob {
+            src: 0x1000,
+            dst: 0x2000,
+            dim: 10240,
+            cdim: 17,
+            stride: 8,
+        };
+        let err = unsafe { batched_conv_rewind(&[bad], std::ptr::null_mut()) }.unwrap_err();
+        assert!(err.to_string().contains("CONV1D_MAX_K"), "{err}");
+
+        assert!(unsafe { batched_conv_rewind(&[], std::ptr::null_mut()) }.is_ok());
+        assert!(unsafe { batched_state_rewind(&[], std::ptr::null_mut()) }.is_ok());
+
+        let bad_state = StateRewindJob {
+            src: 0x1000,
+            dst: 0x2000,
+            num_elements: 2,
+        };
+        let err = unsafe { batched_state_rewind(&[bad_state], std::ptr::null_mut()) }.unwrap_err();
+        assert!(err.to_string().contains("multiple of 4"), "{err}");
+
+        let err = unsafe {
+            conv1d_update_history(
+                fake(),
+                fake_mut(),
+                std::ptr::null(),
+                fake(),
+                std::ptr::null(),
+                fake_mut(),
+                1,
+                10240,
+                5,
+                8,
+                17,
+                true,
+                std::ptr::null_mut(),
+            )
+        }
+        .unwrap_err();
+        assert!(err.to_string().contains("1..=16"), "{err}");
+
+        let err = unsafe {
+            recurrent_gated_delta_rule_history(
+                fake(),
+                fake(),
+                fake(),
+                fake_mut(),
+                fake_mut(),
+                std::ptr::null(),
+                1,
+                5,
+                16,
+                48,
+                128,
+                128,
+                4,
+                true,
+                std::ptr::null_mut(),
+            )
+        }
+        .unwrap_err();
+        assert!(err.to_string().contains("history_stride"), "{err}");
+
+        let err = unsafe {
+            recurrent_gated_delta_rule_history(
+                fake(),
+                fake(),
+                fake(),
+                fake_mut(),
+                fake_mut(),
+                std::ptr::null(),
+                2,
+                1,
+                16,
+                48,
+                128,
+                128,
+                1,
+                true,
+                std::ptr::null_mut(),
+            )
+        }
+        .unwrap_err();
+        assert!(err.to_string().contains("v_split"), "{err}");
+        assert!(last_launch().is_empty(), "{}", last_launch());
+        assert!(rewind_last_launch().is_empty(), "{}", rewind_last_launch());
     }
 }

@@ -190,6 +190,7 @@ dependencies = [
  "blake2",
  "serde_json",
  "thiserror",
+ "tokenizers",
 ]
 
 [[package]]

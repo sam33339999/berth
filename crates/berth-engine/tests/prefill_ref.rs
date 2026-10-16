@@ -251,7 +251,7 @@ fn greedy_100_first_token_is_fork_argmax() {
         Err(why) => return eprintln!("skipping: {why}"),
     };
     let cubin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/triton-cubins");
-    let mut engine = Engine::load(Path::new(&dir), &cubin, max_tokens).unwrap();
+    let mut engine = Engine::load(Path::new(&dir), &cubin, max_tokens, 0).unwrap();
     let request = GenerateRequest {
         prompt: ids,
         max_new_tokens: 1,

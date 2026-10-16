@@ -242,8 +242,10 @@ pub struct AttnCacheImage {
 
 /// One GDN layer's live slot.
 ///
-/// `conv` is bf16. `recurrent` is fp32. `max_batch` 1 and `max_history` 0,
-/// so the allocation is the slot.
+/// `conv` is bf16. `recurrent` is fp32. `max_batch` is 1. At load
+/// `max_history` is 0, so conv is `[fdim, conv_k]` and recurrent is
+/// `[1, num_v_heads, k_head_dim, v_head_dim]`. `Model::set_max_history`
+/// widens conv's last axis by `n` and recurrent's leading axis to `n + 1`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GdnStateImage {
     pub layer: u32,
@@ -278,6 +280,20 @@ pub fn prefill_block_pages(prompt_len: u32, max_new_tokens: u32) -> u32 {
     let total = u64::from(prompt_len) + max_rq;
     let pages = total.div_ceil(u64::from(PAGE_SIZE));
     u32::try_from(pages).unwrap_or(u32::MAX).max(1)
+}
+
+/// Pages in the block table when the job also drafts `draft_tokens` tokens.
+///
+/// The fork's `max_rq_tokens` default is `max_new_tokens + 1 + num_draft_tokens`
+/// (`Job.prepare_for_queue`). This is [`prefill_block_pages`] with those extra
+/// tokens folded into `max_new_tokens`, so the non-MTP function is unchanged.
+/// An overflowing add returns `u32::MAX`. Not padded to 16.
+#[must_use]
+pub fn prefill_block_pages_mtp(prompt_len: u32, max_new_tokens: u32, draft_tokens: u32) -> u32 {
+    match max_new_tokens.checked_add(draft_tokens) {
+        Some(max_new) => prefill_block_pages(prompt_len, max_new),
+        None => u32::MAX,
+    }
 }
 
 /// Chunk ranges `[start, end)` covering `ids[:-1]`.

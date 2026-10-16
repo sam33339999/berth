@@ -4,8 +4,10 @@
 // no_reconstruct, calls BC_LinearEXL3::run_alloc. That reshapes to 2D and
 // calls exl3_gemm (libtorch/linear.cpp). exl3_gemm tries the int8 sq GEMV
 // first; plain mode (EXL3_INT8_GEMV=2) accepts m == 2. Anything larger, and
-// a declined m == 2, continues to the cooperative kernel unless QTIP's free
-// checks pass (m <= 8). QTIP is not linked here, same as the decode shim.
+// a declined m == 2, continues to QTIP when the free checks pass (m <= 8).
+// m == 2 that reaches QTIP is still refused. m = 3..8 tries the narrow
+// exl3_gemv_kernel and falls through to the cooperative kernel when that
+// port declines. m >= 9 is not QTIP. The decode shim still does not link it.
 //
 // rows > 144 calls reconstruct_hgemm. The fp16 weight is scratch for that
 // call (exl3.py allocates `w` inside the function and drops it). It is not
@@ -316,8 +318,25 @@ void launch_prefill(
         && size_m <= kGemvMaxM
         && size_k % 128 == 0
         && size_n % 128 == 0;
-    if (qtip)
+    // m <= 2 keeps the previous refusal. The narrow GEMV is linked for
+    // m = 3..8 only; m == 2 still must not change kernels.
+    if (qtip && size_m < 3)
         throw std::runtime_error("QTIP exl3_gemv is not linked; refusing to launch a different kernel");
+    if (qtip)
+    {
+        int grid = 0;
+        int launched = berth_prefill_try_qtip(
+            a, trellis, c, size_m, size_k, size_n, k_bits, codebook, out_fp32,
+            suh, a_had, svh, stream, &grid);
+        if (launched)
+        {
+            g_launch = "exl3_gemv_kernel<4,"
+                + std::string(out_fp32 ? "1" : "0")
+                + ",2,1,0,0> grid=" + std::to_string(grid)
+                + " block=512 smem=0";
+            return;
+        }
+    }
 
     launch_gemm(
         a, trellis, c, suh, a_had, svh,

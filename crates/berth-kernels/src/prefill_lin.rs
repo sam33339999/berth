@@ -65,6 +65,17 @@ mod ffi {
 
         pub fn berth_prefill_last_error() -> *const c_char;
         pub fn berth_prefill_last_launch() -> *const c_char;
+
+        pub fn berth_exl3_gemv_cfg(
+            cc: c_int,
+            size_m: c_int,
+            size_k: c_int,
+            size_n: c_int,
+            k_bits: c_int,
+            cb: c_int,
+            mode: c_int,
+            narrow_coresident: c_int,
+        ) -> c_int;
     }
 }
 
@@ -91,9 +102,11 @@ mod ffi {
 /// # Errors
 ///
 /// Null pointers, a non-positive size, `size_m <= 1`, or a K / codebook this
-/// shim does not link return [`Error::Launch`] before a kernel launch. QTIP
-/// (`m <= 8` after int8 declines) is refused rather than replaced with a
-/// different kernel. A CUDA failure is the same error.
+/// shim does not link return [`Error::Launch`] before a kernel launch.
+/// `m == 2` that reaches QTIP is still refused. `m` in 3..=8 tries the
+/// narrow QTIP GEMV ([`exl3_gemv_cfg`]) and, when that declines, the
+/// cooperative GEMM. `m >= 9` stays on the cooperative GEMM. A CUDA failure
+/// is the same error.
 ///
 /// # Safety
 ///
@@ -198,6 +211,40 @@ pub fn last_launch() -> String {
     c_string(unsafe { ffi::berth_prefill_last_launch() })
 }
 
+/// `exl3_gemv_cfg` from `quant/exl3_gemv.cu`.
+///
+/// Returns `-1` when the shape is not eligible, `0` for the narrow config,
+/// and `1` for the wide config. `cc` is the fork's device class
+/// (`CC_AMPERE` is 2, `CC_ADA` is 3). `mode` is `EXL3_GEMV` (`1` when unset).
+/// `narrow_coresident` is occupancy times the SM count; the 3090 narrow
+/// kernel is 164. This function does not call CUDA. The prefill launcher
+/// only instantiates narrow `K = 4`, mul1, `m > 1`, so a `1` here declines
+/// to the cooperative GEMM.
+#[allow(clippy::too_many_arguments)]
+pub fn exl3_gemv_cfg(
+    cc: i32,
+    size_m: i32,
+    size_k: i32,
+    size_n: i32,
+    k_bits: i32,
+    cb: i32,
+    mode: i32,
+    narrow_coresident: i32,
+) -> i32 {
+    unsafe {
+        ffi::berth_exl3_gemv_cfg(
+            cc,
+            size_m,
+            size_k,
+            size_n,
+            k_bits,
+            cb,
+            mode,
+            narrow_coresident,
+        )
+    }
+}
+
 /// Message from the last failed [`exl3_linear`] on this thread.
 pub fn last_error() -> String {
     c_string(unsafe { ffi::berth_prefill_last_error() })
@@ -281,9 +328,11 @@ mod tests {
         let linear = ffi::berth_prefill_exl3_linear as *const ();
         let err = ffi::berth_prefill_last_error as *const ();
         let launch = ffi::berth_prefill_last_launch as *const ();
+        let cfg = ffi::berth_exl3_gemv_cfg as *const ();
         assert!(!linear.is_null());
         assert!(!err.is_null());
         assert!(!launch.is_null());
+        assert!(!cfg.is_null());
     }
 
     #[test]
@@ -331,5 +380,64 @@ mod tests {
         };
         let err = rc.expect_err("m = 1");
         assert!(err.to_string().contains("size_m"), "{err}");
+    }
+
+    #[test]
+    fn exl3_gemv_cfg_matches_27b_shapes() {
+        // mode 1 (EXL3_GEMV unset), K = 4, mul1, CC_AMPERE, narrow_coresident
+        // 164. See docs/mtp.md 未確認 item 1.
+        const CC_AMPERE: i32 = 2;
+        const CC_ADA: i32 = 3;
+        const MODE: i32 = 1;
+        const K: i32 = 4;
+        const CB: i32 = 2;
+        const NARROW: i32 = 164;
+        for m in [3, 5, 8] {
+            assert_eq!(
+                exl3_gemv_cfg(CC_AMPERE, m, 5120, 17408, K, CB, MODE, NARROW),
+                -1,
+                "gate/up m={m}"
+            );
+            assert_eq!(
+                exl3_gemv_cfg(CC_AMPERE, m, 17408, 5120, K, CB, MODE, NARROW),
+                0,
+                "down m={m}"
+            );
+            assert_eq!(
+                exl3_gemv_cfg(CC_AMPERE, m, 6144, 5120, K, CB, MODE, NARROW),
+                0,
+                "o_proj m={m}"
+            );
+            assert_eq!(
+                exl3_gemv_cfg(CC_AMPERE, m, 10240, 5120, K, CB, MODE, NARROW),
+                0,
+                "mtp.fc m={m}"
+            );
+        }
+        assert_eq!(
+            exl3_gemv_cfg(CC_AMPERE, 9, 17408, 5120, K, CB, MODE, NARROW),
+            -1,
+            "m=9"
+        );
+        // cfg still reports narrow for m = 2. exl3_linear refuses that case
+        // before QTIP, so the m = 2 launch does not change.
+        assert_eq!(
+            exl3_gemv_cfg(CC_AMPERE, 2, 17408, 5120, K, CB, MODE, NARROW),
+            0
+        );
+        assert_eq!(
+            exl3_gemv_cfg(CC_AMPERE, 3, 17408, 5120, K, CB, 0, NARROW),
+            -1
+        );
+        // n = 8192, k = 5120 misses the narrow wave and the k <= 4096 wide
+        // band, then hits the Ampere-only band.
+        assert_eq!(
+            exl3_gemv_cfg(CC_AMPERE, 3, 5120, 8192, K, CB, MODE, NARROW),
+            1
+        );
+        assert_eq!(
+            exl3_gemv_cfg(CC_ADA, 3, 5120, 8192, K, CB, MODE, NARROW),
+            -1
+        );
     }
 }

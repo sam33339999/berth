@@ -31,6 +31,7 @@
 //! `prefer_cpu` and `model_ls.py` loads it on the host; that choice is for
 //! the service, which also keeps a draft model on the same card.
 
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
 use berth_cuda::{ByteBuf, PinnedBuf};
@@ -40,10 +41,14 @@ use berth_kernels::ops::{self, NormWeight};
 use berth_kernels::OutDtype;
 use berth_plan::{Ffn, LayerKind, Mixer, ModelPlan, ModelShape, ARCH_QWEN3_5};
 
-use crate::attn::{AttnLayer, AttnPrefillScratch};
+use crate::attn::{AttnLayer, AttnPrefillScratch, AttnQlenScratch};
 use crate::device::{self, ptr, Exl3Linear, RowScratch};
-use crate::gdn::{GdnLayer, GdnPrefillScratch};
+use crate::gdn::{GdnHistoryScratch, GdnLayer, GdnPrefillScratch};
 use crate::mlp::{MlpLayer, MlpPrefillScratch};
+use crate::mtp::{
+    gdn_snaps, pages_of_span, MtpChunkCb, MtpChunkEvent, MtpCq3Snap, MtpHead, MtpPageSnap,
+    MtpPrefillSnap, MtpRound,
+};
 use crate::prefill::{self, AttnCacheImage, GdnStateImage, HostTensor};
 use crate::{Error, Gpu, Result};
 
@@ -57,6 +62,9 @@ const TEXT_PREFIX: &str = "model.language_model";
 /// Full-attention KV page, in tokens. `AttnLayer` sizes its cache in these
 /// pages (`berth_kernels::attn`, page size 256).
 const ATTN_PAGE_TOKENS: u32 = 256;
+
+/// Verify and refresh query rows. `q_len` cubins stop at 16.
+const VERIFY_MAX_ROWS: u32 = 16;
 
 /// `constant_bias` passed to every Qwen3.5 text RMSNorm.
 ///
@@ -159,6 +167,16 @@ pub struct Model {
     /// layer. Decode keeps its own one-row buffers: enlarging those would
     /// break the equal-length residual snapshot copy.
     prefill_ws: Option<PrefillWorkspace>,
+    /// n-row verify scratch. Absent unless [`Self::prepare_verify`] ran.
+    /// `mtp_steps == 0` never allocates it.
+    verify_ws: Option<VerifyWorkspace>,
+    /// Cache length at the start of the last [`Self::verify_step`].
+    ///
+    /// [`Self::rewind_mtp`] does not move this. A later `rewind(0)` writes
+    /// the same end length.
+    verify_start: u32,
+    /// Rows still accepted from the last verify, after any rewind.
+    verify_rows: u32,
 }
 
 /// Device buffers for one prefill chunk, shared across layers.
@@ -183,6 +201,58 @@ struct PrefillWorkspace {
     seq_end: PinnedBuf<u8>,
     residual_host: Vec<u8>,
     max_rows: u32,
+}
+
+/// Device buffers for one MTP verify window, shared across layers.
+///
+/// `mtp_steps == 0` does not allocate this. MLP activations stay in
+/// [`PrefillWorkspace`]: verify only borrows that scratch. The export and
+/// the logit matrix are the n-row results. `logit_row` is the one row the
+/// sampler penalizes, copied out so the matrix stays intact.
+struct VerifyWorkspace {
+    gdn: GdnHistoryScratch,
+    attn: AttnQlenScratch,
+    /// fp32 `[16, hidden]`.
+    residual: ByteBuf,
+    /// fp16 `[16, hidden]`. Input norm, then unused by the tail.
+    norm_out: ByteBuf,
+    /// fp32 `[16, hidden]`. Mixer output.
+    mixer_out: ByteBuf,
+    /// fp16 `[16, hidden]`. Post-attention layernorm.
+    mlp_in: ByteBuf,
+    /// fp32 `[16, hidden]`. MLP output.
+    mlp_out: ByteBuf,
+    /// fp16 `[16, hidden]`. Final norm, kept for refresh and the next hidden.
+    export: ByteBuf,
+    /// fp16 `[16, vocab]`.
+    logits: ByteBuf,
+    /// fp16 `[16, hidden]`. Hadamard image for the n-row `lm_head`.
+    lm_had: ByteBuf,
+    /// fp16 `[vocab]`. One copied logit row.
+    logit_row: ByteBuf,
+    /// `VERIFY_MAX_ROWS` i32 ids. A call uses the prefix; the tail stays 0.
+    ids: ByteBuf,
+    /// Pinned cache-length word staged before the kernels.
+    len_in: PinnedBuf<u8>,
+    /// Pinned cache-length word staged after the kernels (`start + rows`).
+    len_out: PinnedBuf<u8>,
+    /// Pinned cache-length word staged by [`Model::rewind_mtp`].
+    len_rewind: PinnedBuf<u8>,
+}
+
+/// Which pinned slot fills the shared cache-length word.
+enum VerifyLen {
+    In,
+    Out,
+    Rewind,
+}
+
+/// One verify launch: same `start` and block-table width on every layer.
+#[derive(Clone, Copy)]
+struct VerifySpan {
+    start: u32,
+    rows: u32,
+    bt_width: u32,
 }
 
 /// How many decode steps may be queued before [`Model::synchronize`].
@@ -403,6 +473,9 @@ impl Model {
             block_residuals,
             captured: false,
             prefill_ws,
+            verify_ws: None,
+            verify_start: 0,
+            verify_rows: 0,
         })
     }
 
@@ -535,6 +608,21 @@ impl Model {
         Ok(())
     }
 
+    /// Widen every GDN layer's conv and recurrent state to `n` history tokens.
+    ///
+    /// Full-attention layers are left alone. `n == 0` restores the load-time
+    /// buffers. See [`crate::gdn::GdnLayer::set_max_history`]. Synchronize
+    /// `gpu.stream` first if a forward is still queued: the old allocation
+    /// is dropped.
+    pub fn set_max_history(&mut self, gpu: &Gpu, n: u32) -> Result<()> {
+        for block in &mut self.blocks {
+            if let MixerSlot::Gdn(layer) = &mut block.mixer {
+                layer.set_max_history(gpu, n)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn reset_sequence(&mut self, gpu: &Gpu) -> Result<()> {
         self.synchronize(gpu)?;
         self.captured = false;
@@ -553,6 +641,32 @@ impl Model {
     /// Number of decoder layers loaded.
     pub fn num_layers(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Hidden width. 5120 on the 27B.
+    pub fn hidden_size(&self) -> i32 {
+        self.hidden
+    }
+
+    /// Vocabulary width. `lm_head` `N` matches this.
+    pub fn vocab_size(&self) -> i32 {
+        self.vocab
+    }
+
+    /// Epsilon, bias, and scale of the text RMSNorms.
+    pub fn text_norm(&self) -> TextNorm {
+        self.norm
+    }
+
+    /// BF16 embedding table `[vocab, hidden]`. The MTP head gathers from this
+    /// buffer; it is not copied.
+    pub fn embedding(&self) -> &ByteBuf {
+        &self.embed
+    }
+
+    /// Target `lm_head`. The MTP draft step projects with this linear.
+    pub fn lm_head_mut(&mut self) -> &mut Exl3Linear {
+        &mut self.lm_head
     }
 
     /// fp16 `[vocab]` logits of the last [`Self::decode_step`].
@@ -1028,7 +1142,7 @@ fn default_cubin_dir() -> PathBuf {
 /// `ModelConfig` does not keep this field. The fork reads it from
 /// `config.json` (`read_cfg(float, "text_config->rms_norm_eps")`). On the
 /// 27B that number is `1e-6`.
-fn read_rms_eps(ckpt: &Checkpoint) -> Result<f32> {
+pub(crate) fn read_rms_eps(ckpt: &Checkpoint) -> Result<f32> {
     let path = ckpt.directory.join("config.json");
     let text = std::fs::read_to_string(&path).map_err(|source| Error::Read {
         name: path.display().to_string(),
@@ -1099,7 +1213,7 @@ fn load_embedding(gpu: &Gpu, ckpt: &Checkpoint, vocab: u32, hidden: u32) -> Resu
     device::upload_tensor(gpu, ckpt, &name)
 }
 
-fn load_norm(gpu: &Gpu, ckpt: &Checkpoint, name: &str, hidden: u32) -> Result<ByteBuf> {
+pub(crate) fn load_norm(gpu: &Gpu, ckpt: &Checkpoint, name: &str, hidden: u32) -> Result<ByteBuf> {
     let info = tensor(ckpt, name)?;
     if info.dtype != DType::Bf16 {
         return Err(Error::Weights(format!(
@@ -1166,10 +1280,85 @@ fn expect_bytes(buf: &ByteBuf, bytes: usize, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// `shifted = cat(carry, export[:-1])`, then `carry = export[-1]`.
+///
+/// Three device copies. Row 0 of `shifted` is the previous carry (zeros on
+/// the first chunk). Rows `1..rows` are `export[0..rows-1]`. The new carry
+/// is `export[rows-1]`. [`crate::mtp::shifted_row`] is that index map.
+/// A one-row chunk copies only the old carry into `shifted` and replaces
+/// carry with `export[0]`.
+fn shift_hidden(
+    gpu: &Gpu,
+    export: &ByteBuf,
+    shifted: &mut ByteBuf,
+    carry: &mut ByteBuf,
+    hidden: i32,
+    rows: u32,
+) -> Result<()> {
+    if rows < 1 {
+        return Err(Error::Input(
+            "mtp export shift needs at least one row".into(),
+        ));
+    }
+    let row = rows_bytes(hidden, 1, 2)?;
+    let used = rows_bytes(hidden, rows, 2)?;
+    expect_bytes(export, used, "mtp export")?;
+    expect_bytes(shifted, used, "mtp shifted hidden")?;
+    expect_bytes(carry, row, "mtp hidden carry")?;
+    let stream = gpu.raw_stream();
+    let row_len = u64::try_from(row).expect("row byte count fits u64");
+    // Carry is overwritten last. The first copy still reads the old row.
+    // SAFETY: the three buffers are distinct device allocations. Each copy's
+    // source and destination are disjoint and stay allocated until `stream`
+    // finishes. Lengths were checked above.
+    unsafe {
+        ops::memcpy_d2d(ptr(shifted), ptr(carry), row_len, stream)?;
+        if rows > 1 {
+            let prefix = rows_bytes(hidden, rows - 1, 2)?;
+            let prefix_bytes = u64::try_from(prefix).expect("prefix byte count fits u64");
+            ops::memcpy_d2d(ptr_offset(shifted, row)?, ptr(export), prefix_bytes, stream)?;
+        }
+        let last = rows_bytes(hidden, rows - 1, 2)?;
+        ops::memcpy_d2d(ptr(carry), ptr_offset(export, last)?, row_len, stream)?;
+    }
+    Ok(())
+}
+
+/// Device address `offset` bytes into `buf`.
+fn ptr_offset(buf: &ByteBuf, offset: usize) -> Result<*mut c_void> {
+    if offset > buf.num_bytes() {
+        return Err(Error::Input(format!(
+            "device offset {offset} is past {} bytes",
+            buf.num_bytes()
+        )));
+    }
+    let addr = buf
+        .ptr()
+        .as_u64()
+        .checked_add(u64::try_from(offset).unwrap_or(u64::MAX))
+        .ok_or_else(|| Error::Input("device offset overflows".into()))?;
+    Ok(addr as *mut c_void)
+}
+
 fn rows_bytes(hidden: i32, rows: u32, elem: usize) -> Result<usize> {
     row_bytes(hidden, elem)?
         .checked_mul(usize::try_from(rows).unwrap_or(usize::MAX))
         .ok_or_else(|| Error::Input("row byte count overflows".into()))
+}
+
+/// First `nbytes` of `buf`. The device copy is the whole allocation; the
+/// caller keeps the live prefix. `buf.copy_to_host` requires equal lengths.
+fn copy_prefix(gpu: &Gpu, buf: &ByteBuf, nbytes: usize) -> Result<Vec<u8>> {
+    let mut host = vec![0u8; buf.num_bytes()];
+    buf.copy_to_host(&gpu.stream, &mut host)?;
+    if nbytes > host.len() {
+        return Err(Error::Input(format!(
+            "device buffer has {} bytes, the prefix asks for {nbytes}",
+            host.len()
+        )));
+    }
+    host.truncate(nbytes);
+    Ok(host)
 }
 
 fn positive_rows(rows: u32) -> Result<i32> {
@@ -1373,6 +1562,13 @@ fn stage_chunk_ids(gpu: &Gpu, ids_buf: &mut ByteBuf, tokens: &[u32]) -> Result<(
 /// call. `'cb` is the closure's own borrow, not the residual slice.
 pub type BlockResidualCb<'cb> = dyn for<'a> FnMut(u32, u32, u32, &'a [u8]) -> Result<()> + 'cb;
 
+/// Host observer for one chunk's fp16 final-norm export.
+///
+/// Arguments are `(start, end, export)`. `export` is little-endian fp16,
+/// `(end - start) * hidden` elements, the rows [`Model::prefill_mtp`] writes
+/// before the shifted-hidden MTP prefill. The slice is live only for the call.
+pub type ExportCb<'cb> = dyn for<'a> FnMut(u32, u32, &'a [u8]) -> Result<()> + 'cb;
+
 struct ResidualSnap<'a> {
     residual: &'a ByteBuf,
     host: &'a mut Vec<u8>,
@@ -1464,8 +1660,93 @@ impl Model {
             return Err(Error::Input("prefill chunk is empty".into()));
         }
         self.with_prefill(gpu, |model, ws| {
-            model.prefill_chunk_loaded(gpu, ws, ids, start, &mut None)
+            model.prefill_chunk_loaded(gpu, ws, ids, start, &mut None, false, None)
         })
+    }
+
+    /// Prefill `tokens` (`prompt[..len-1]`) and the MTP cache for the same chunks.
+    ///
+    /// See [`Self::prefill_mtp_with`]. An empty slice is a one-token prompt:
+    /// no prefill, and the return is `None` without touching `head` or the GPU.
+    pub fn prefill_mtp(
+        &mut self,
+        gpu: &Gpu,
+        tokens: &[u32],
+        head: &mut MtpHead,
+        block_pages: u32,
+    ) -> Result<Option<ByteBuf>> {
+        self.prefill_mtp_with(gpu, tokens, head, block_pages, None, None)
+    }
+
+    /// [`Self::prefill_mtp`], with the same per-block residual observer as
+    /// [`Self::prefill_with`] and a per-chunk final-norm export.
+    ///
+    /// Layers 0..62 match today's prefill. Layer 63 runs its mixer and its
+    /// MLP, then the final norm writes fp16 `[rows, hidden]`. There is no
+    /// `lm_head`. `on_export` receives that fp16 buffer for the chunk
+    /// (`start`, `end`, bytes). `None` does not copy it to the host.
+    ///
+    /// After each chunk the MTP head prefills `cat(carry, export[:-1])` at
+    /// the same positions. Carry starts as zeros and becomes `export[-1]`.
+    /// The returned buffer is that last carry: the post-norm row of
+    /// `tokens[len-1]` (`mtp_last_hidden`). `block_pages` is the job's
+    /// block-table width, including draft tokens; both the target and the
+    /// MTP attention use it.
+    ///
+    /// A chunk of 16 or fewer rows uses the q_len attention path.
+    ///
+    /// # Errors
+    ///
+    /// The same input errors as [`Self::prefill`], or a rejected `block_pages`.
+    pub fn prefill_mtp_with(
+        &mut self,
+        gpu: &Gpu,
+        tokens: &[u32],
+        head: &mut MtpHead,
+        block_pages: u32,
+        on_block: Option<&mut BlockResidualCb<'_>>,
+        on_export: Option<&mut ExportCb<'_>>,
+    ) -> Result<Option<ByteBuf>> {
+        self.prefill_mtp_traced(gpu, tokens, head, block_pages, on_block, on_export, None)
+    }
+
+    /// [`Self::prefill_mtp_with`] plus the test trace.
+    ///
+    /// `on_chunk` of `None` does not copy the export, the draft rows, or the
+    /// GDN / page state. The callback type stays crate-private.
+    ///
+    /// # Errors
+    ///
+    /// The same input errors as [`Self::prefill_mtp_with`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prefill_mtp_traced(
+        &mut self,
+        gpu: &Gpu,
+        tokens: &[u32],
+        head: &mut MtpHead,
+        block_pages: u32,
+        mut on_block: Option<&mut BlockResidualCb<'_>>,
+        mut on_export: Option<&mut ExportCb<'_>>,
+        mut on_chunk: Option<&mut MtpChunkCb<'_>>,
+    ) -> Result<Option<ByteBuf>> {
+        if tokens.is_empty() {
+            self.captured = false;
+            return Ok(None);
+        }
+        self.set_prefill_pages(block_pages)?;
+        self.with_prefill(gpu, |model, ws| {
+            model.prefill_mtp_loaded(
+                gpu,
+                ws,
+                tokens,
+                head,
+                block_pages,
+                &mut on_block,
+                &mut on_export,
+                &mut on_chunk,
+            )
+        })
+        .map(Some)
     }
 
     /// Used rows of every attention cache, in layer order.
@@ -1539,8 +1820,10 @@ impl Model {
 
     /// Live GDN slot of every linear-attention layer, in layer order.
     ///
-    /// Conv is bf16. Recurrent is fp32. `max_batch` 1 and `max_history` 0, so
-    /// the allocation is the slot the fork hashes after prefill.
+    /// Conv is bf16. Recurrent is fp32. `max_batch` is 1. `max_history` 0,
+    /// the load default, keeps conv `[fdim, conv_k]` and recurrent
+    /// `[1, num_v_heads, k_head_dim, v_head_dim]`. A wider history reports
+    /// those real axes.
     pub fn gdn_state(&self, gpu: &Gpu) -> Result<Vec<GdnStateImage>> {
         let mut out = Vec::new();
         for (index, block) in self.blocks.iter().enumerate() {
@@ -1555,14 +1838,15 @@ impl Model {
                     dtype: "bfloat16".to_string(),
                     shape: vec![
                         usize::try_from(state.fdim).unwrap_or(0),
-                        usize::try_from(state.conv_k).unwrap_or(0),
+                        usize::try_from(state.conv_k.saturating_add(state.max_history))
+                            .unwrap_or(0),
                     ],
                     bytes: state.conv,
                 },
                 recurrent: HostTensor {
                     dtype: "float32".to_string(),
                     shape: vec![
-                        1,
+                        usize::try_from(state.max_history.saturating_add(1)).unwrap_or(0),
                         usize::try_from(state.num_v_heads).unwrap_or(0),
                         usize::try_from(state.k_head_dim).unwrap_or(0),
                         usize::try_from(state.v_head_dim).unwrap_or(0),
@@ -1572,6 +1856,55 @@ impl Model {
             });
         }
         Ok(out)
+    }
+
+    /// Whole cq3 pages, one snap per logical page, attention layers in order.
+    ///
+    /// `logical` is the page list for this iterate. The bytes are
+    /// `block_table[logical]`, which is `logical` itself on this runtime.
+    /// Each tensor is all 256 rows.
+    pub(crate) fn mtp_target_pages(&self, gpu: &Gpu, logical: &[u32]) -> Result<Vec<MtpPageSnap>> {
+        let mut caches = Vec::new();
+        for (index, block) in self.blocks.iter().enumerate() {
+            let MixerSlot::FullAttn(layer) = &block.mixer else {
+                continue;
+            };
+            let layer_id = u32::try_from(index).expect("layer count fits u32");
+            caches.push((layer_id, layer.copy_cache(gpu)?));
+        }
+        let mut pages = Vec::with_capacity(logical.len());
+        for &page in logical {
+            let mut layers = Vec::with_capacity(caches.len());
+            for (layer_id, cache) in &caches {
+                let [qk, qv, sk, sv] = cache.full_page(page)?;
+                layers.push(MtpCq3Snap {
+                    layer: *layer_id,
+                    qk,
+                    qv,
+                    sk,
+                    sv,
+                });
+            }
+            pages.push(MtpPageSnap {
+                logical: page,
+                layers,
+            });
+        }
+        Ok(pages)
+    }
+
+    /// Zero every attention layer's cq3 codes and scales.
+    ///
+    /// Used by a traced generate so the next job starts from the same zeros
+    /// the reference dump writes between jobs. [`Self::reset_sequence`] does
+    /// not scrub these bytes.
+    pub(crate) fn zero_attn_pages(&mut self, gpu: &Gpu) -> Result<()> {
+        for block in &mut self.blocks {
+            if let MixerSlot::FullAttn(layer) = &mut block.mixer {
+                layer.zero_pages(gpu)?;
+            }
+        }
+        Ok(())
     }
 
     fn with_prefill<T>(
@@ -1633,11 +1966,132 @@ impl Model {
         for (start, end) in bounds {
             let chunk = &tokens[usize::try_from(start).expect("chunk start fits usize")
                 ..usize::try_from(end).expect("chunk end fits usize")];
-            self.prefill_chunk_loaded(gpu, ws, chunk, start, on_block)?;
+            self.prefill_chunk_loaded(gpu, ws, chunk, start, on_block, false, None)?;
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_mtp_loaded(
+        &mut self,
+        gpu: &Gpu,
+        ws: &mut PrefillWorkspace,
+        tokens: &[u32],
+        head: &mut MtpHead,
+        block_pages: u32,
+        on_block: &mut Option<&mut BlockResidualCb<'_>>,
+        on_export: &mut Option<&mut ExportCb<'_>>,
+        on_chunk: &mut Option<&mut MtpChunkCb<'_>>,
+    ) -> Result<ByteBuf> {
+        let written = u32::try_from(tokens.len())
+            .map_err(|_| Error::Input("prefill is longer than u32::MAX".into()))?;
+        if written > self.max_tokens {
+            return Err(Error::Input(format!(
+                "prefill of {written} tokens does not fit the {}-token cache",
+                self.max_tokens
+            )));
+        }
+        let prompt_len = written
+            .checked_add(1)
+            .ok_or_else(|| Error::Input("prefill length overflows".into()))?;
+        let bounds = prefill::chunk_bounds(prompt_len);
+        let mut cursor = 0u32;
+        for &(start, end) in &bounds {
+            if start != cursor || end <= start || end > written {
+                return Err(Error::Input(format!(
+                    "prefill chunk [{start}, {end}) does not continue from {cursor}"
+                )));
+            }
+            cursor = end;
+        }
+        if cursor != written {
+            return Err(Error::Input(
+                "prefill chunks do not cover the tokens".into(),
+            ));
+        }
+        let hidden = self.hidden;
+        let row = rows_bytes(hidden, 1, 2)?;
+        let chunk_bytes = rows_bytes(hidden, ws.max_rows, 2)?;
+        // Carry is one fp16 row. The first chunk's shifted row 0 is zeros,
+        // which is `torch.cat` of a zero vector with `export[:-1]`.
+        let mut carry = gpu.zeroed(row)?;
+        let mut export = gpu.zeroed(chunk_bytes)?;
+        let mut shifted = gpu.zeroed(chunk_bytes)?;
+        let mut export_host = Vec::new();
+        let chunk_count = bounds.len();
+        for (index, (start, end)) in bounds.into_iter().enumerate() {
+            let chunk = &tokens[usize::try_from(start).expect("chunk start fits usize")
+                ..usize::try_from(end).expect("chunk end fits usize")];
+            let rows = end - start;
+            self.prefill_chunk_loaded(gpu, ws, chunk, start, on_block, true, Some(&mut export))?;
+            if let Some(callback) = on_export.as_deref_mut() {
+                if export_host.len() != export.num_bytes() {
+                    export_host.resize(export.num_bytes(), 0);
+                }
+                export.copy_to_host(&gpu.stream, &mut export_host)?;
+                let used = rows_bytes(hidden, rows, 2)?;
+                if used > export_host.len() {
+                    return Err(Error::Input("mtp export is shorter than the chunk".into()));
+                }
+                callback(start, end, &export_host[..used])?;
+            }
+            shift_hidden(gpu, &export, &mut shifted, &mut carry, hidden, rows)?;
+            head.prefill_chunk(gpu, self, chunk, &shifted, start, block_pages)?;
+            // The trace copies only when a caller passed `on_chunk`. The
+            // no-op generate path leaves it `None` and does not reach here.
+            if on_chunk.is_some() {
+                let event = self.trace_prefill_chunk(
+                    gpu,
+                    head,
+                    &export,
+                    start,
+                    end,
+                    rows,
+                    index + 1 == chunk_count,
+                )?;
+                on_chunk.as_mut().expect("on_chunk was checked")(event)?;
+            }
+        }
+        Ok(carry)
+    }
+
+    /// Host snapshot of one MTP prefill chunk. Called only from the trace path.
+    #[allow(clippy::too_many_arguments)]
+    fn trace_prefill_chunk(
+        &self,
+        gpu: &Gpu,
+        head: &MtpHead,
+        export: &ByteBuf,
+        start: u32,
+        end: u32,
+        rows: u32,
+        last: bool,
+    ) -> Result<MtpChunkEvent> {
+        let used = rows_bytes(self.hidden, rows, 2)?;
+        let export_bytes = copy_prefix(gpu, export, used)?;
+        let draft_prefill = head.draft_span(gpu, start, rows)?;
+        let prefill = MtpPrefillSnap {
+            start,
+            end,
+            export: export_bytes,
+            draft_prefill,
+        };
+        if last {
+            return Ok(MtpChunkEvent::Hold(prefill));
+        }
+        let gdn = gdn_snaps(self.gdn_state(gpu)?);
+        let target_pages = self.mtp_target_pages(gpu, &pages_of_span(start, end))?;
+        Ok(MtpChunkEvent::Round(MtpRound {
+            prefill: Some(prefill),
+            verify: None,
+            emitted: Vec::new(),
+            gdn,
+            target_pages,
+            draft_refresh: None,
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn prefill_chunk_loaded(
         &mut self,
         gpu: &Gpu,
@@ -1645,6 +2099,8 @@ impl Model {
         ids: &[u32],
         start: u32,
         on_block: &mut Option<&mut BlockResidualCb<'_>>,
+        export_norm: bool,
+        export: Option<&mut ByteBuf>,
     ) -> Result<()> {
         let rows = u32::try_from(ids.len())
             .map_err(|_| Error::Input("prefill chunk is longer than u32::MAX".into()))?;
@@ -1689,7 +2145,25 @@ impl Model {
         embed_ids(gpu, &self.embed, &ws.ids, hidden, n, &mut ws.residual)?;
         let layers = self.blocks.len();
         for index in 0..layers {
-            self.forward_prefill_block(gpu, ws, index, start, rows, on_block)?;
+            self.forward_prefill_block(gpu, ws, index, start, rows, on_block, export_norm)?;
+        }
+        if export_norm {
+            let export = export
+                .ok_or_else(|| Error::Input("mtp prefill export buffer is missing".into()))?;
+            let hidden = self.hidden;
+            let norm = self.norm;
+            // Same kernel as the decode final norm: float in, half out,
+            // `constant_bias` 1. The fork's forward export is `y.half()`, and
+            // y is already fp16, so this buffer is the export.
+            Self::norm_rows(
+                gpu,
+                &ws.residual,
+                &self.final_norm,
+                export,
+                hidden,
+                rows,
+                norm,
+            )?;
         }
         // The next chunk, and the decode step at `tokens.len()`, read this
         // length. `end` of the last chunk is the number of tokens written.
@@ -1704,6 +2178,7 @@ impl Model {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_prefill_block(
         &mut self,
         gpu: &Gpu,
@@ -1712,10 +2187,15 @@ impl Model {
         start: u32,
         rows: u32,
         on_block: &mut Option<&mut BlockResidualCb<'_>>,
+        export_norm: bool,
     ) -> Result<()> {
         let hidden = self.hidden;
         let norm = self.norm;
-        let early = index + 1 == self.blocks.len();
+        // `export_norm` is the MTP path: the last layer runs its MLP, and the
+        // caller norms the residual afterwards. With the flag off this is
+        // `index + 1 == self.blocks.len()`, the last KV module returning the
+        // residual it was given.
+        let early = !export_norm && index + 1 == self.blocks.len();
         let layer = u32::try_from(index).expect("layer count fits u32");
         let end = start
             .checked_add(rows)
@@ -1834,6 +2314,598 @@ impl Model {
             on_block,
         )
     }
+}
+
+impl Model {
+    /// Allocate the n-row verify scratch. Idempotent.
+    ///
+    /// Requires the prefill workspace (MLP scratch is shared) and at least
+    /// one GDN layer and one attention layer. Call after
+    /// [`Self::set_max_history`] so the history stride covers `K + 1` rows.
+    ///
+    /// # Errors
+    ///
+    /// Prefill scratch is absent, or the model has no GDN or attention layer.
+    pub fn prepare_verify(&mut self, gpu: &Gpu) -> Result<()> {
+        if self.verify_ws.is_some() {
+            return Ok(());
+        }
+        if self.prefill_ws.is_none() {
+            return Err(Error::Input("verify needs the prefill workspace".into()));
+        }
+        let (gdn, attn) = self.verify_scratches(gpu)?;
+        let ws = alloc_verify_workspace(gpu, self.hidden, self.vocab, gdn, attn)?;
+        self.verify_ws = Some(ws);
+        Ok(())
+    }
+
+    /// Set every attention layer's decode block-table width to `pages`.
+    ///
+    /// MTP passes a per-round width. This does not call
+    /// [`Self::set_decode_width`].
+    ///
+    /// # Errors
+    ///
+    /// A layer rejects `pages`.
+    pub fn set_decode_pages(&mut self, pages: u32) -> Result<()> {
+        for block in &mut self.blocks {
+            if let MixerSlot::FullAttn(attn) = &mut block.mixer {
+                attn.set_decode_pages(pages)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify `ids` at `start..start+ids.len()` and write the n-row logits.
+    ///
+    /// `ids[0]` is the token not yet in the cache. The rest are drafts.
+    /// `rows` is 1..=16, not required to equal `mtp_steps`. Every GDN layer
+    /// runs [`GdnLayer::forward_history`]. Every attention layer runs
+    /// [`AttnLayer::forward_qlen`] at the same `start` and `bt_width`. Layer
+    /// 63 runs its MLP too. The final norm stays in the export buffer as
+    /// fp16 `[rows, hidden]`. `lm_head` writes fp16 `[rows, vocab]`.
+    ///
+    /// Attention's shared length word is `start` during the kernels and
+    /// `start + rows` after them. [`Self::logits`] and [`Self::final_norm`]
+    /// stay invalid: this is not a one-row decode.
+    ///
+    /// # Errors
+    ///
+    /// The verify scratch is absent, `rows` is outside 1..=16, a token is
+    /// past the vocabulary, the span does not fit, or a GDN history stride
+    /// or block-table width does not cover the window.
+    pub fn verify_step(&mut self, gpu: &Gpu, ids: &[u32], start: u32, bt_width: u32) -> Result<()> {
+        self.captured = false;
+        let rows = self.check_verify_inputs(ids, start, bt_width)?;
+        self.prepare_verify_inputs(gpu, ids, start)?;
+        let layers = self.blocks.len();
+        let span = VerifySpan {
+            start,
+            rows,
+            bt_width,
+        };
+        for index in 0..layers {
+            verify_block(self, gpu, index, span)?;
+        }
+        self.verify_tail(gpu, rows)?;
+        let end = start + rows;
+        self.stage_verify_slot(gpu, end, VerifyLen::Out)?;
+        self.verify_start = start;
+        self.verify_rows = rows;
+        Ok(())
+    }
+
+    /// Rewind GDN state and the attention length by `num_rejected` tokens.
+    ///
+    /// Jobs are collected from every GDN layer before either batched launch,
+    /// so a bad index does not clear a cursor. Attention length becomes
+    /// `verify_start + verify_rows - num_rejected`. cq3 bytes stay. `rewind(0)`
+    /// still copies the conv tail. Does not move `verify_start`.
+    ///
+    /// # Errors
+    ///
+    /// `num_rejected` is past this window, or a layer's `last_history` is
+    /// shorter than `num_rejected`. Cursors stay put.
+    pub fn rewind_mtp(&mut self, gpu: &Gpu, num_rejected: u32) -> Result<()> {
+        let new_rows = self.verify_rows.checked_sub(num_rejected).ok_or_else(|| {
+            Error::Input(format!(
+                "rewind rejects {num_rejected} tokens from a {}-row window",
+                self.verify_rows
+            ))
+        })?;
+        let new_len = self
+            .verify_start
+            .checked_add(new_rows)
+            .ok_or_else(|| Error::Input("rewind length overflows".into()))?;
+        let (conv_jobs, state_jobs) = self.collect_rewind_jobs(num_rejected)?;
+        // SAFETY: addresses come from this model's GDN state and stay
+        // allocated until `gpu.stream` finishes. An empty list does not call CUDA.
+        unsafe {
+            berth_kernels::gdn::batched_conv_rewind(&conv_jobs, gpu.raw_stream())?;
+            berth_kernels::gdn::batched_state_rewind(&state_jobs, gpu.raw_stream())?;
+        }
+        self.stage_verify_slot(gpu, new_len, VerifyLen::Rewind)?;
+        for block in &mut self.blocks {
+            if let MixerSlot::Gdn(layer) = &mut block.mixer {
+                layer.clear_history_cursor();
+            }
+        }
+        self.verify_rows = new_rows;
+        Ok(())
+    }
+
+    /// Device-to-device copy of export rows `[0, rows)` into `dst`.
+    ///
+    /// # Errors
+    ///
+    /// `rows` is 0 or past the accepted window, or `dst` is shorter than the prefix.
+    pub(crate) fn copy_verify_export_prefix(
+        &self,
+        gpu: &Gpu,
+        dst: &mut ByteBuf,
+        rows: u32,
+    ) -> Result<()> {
+        if rows == 0 || rows > self.verify_rows {
+            return Err(Error::Input(format!(
+                "verify export prefix {rows} is outside 1..={}",
+                self.verify_rows
+            )));
+        }
+        let ws = self.verify_ready()?;
+        let bytes = rows_bytes(self.hidden, rows, 2)?;
+        expect_bytes(dst, bytes, "verify export prefix")?;
+        let n = u64::try_from(bytes)
+            .map_err(|_| Error::Input("verify export prefix does not fit in u64".into()))?;
+        // SAFETY: `dst` and `export` are distinct device buffers. Lengths
+        // were checked. Both stay allocated until `gpu.stream` finishes.
+        unsafe {
+            ops::memcpy_d2d(ptr(dst), ptr(&ws.export), n, gpu.raw_stream())?;
+        }
+        Ok(())
+    }
+
+    /// Device-to-device copy of export row `index` into `dst`.
+    ///
+    /// # Errors
+    ///
+    /// `index` is past the accepted window, or `dst` is shorter than one row.
+    pub(crate) fn copy_verify_export_row(
+        &self,
+        gpu: &Gpu,
+        dst: &mut ByteBuf,
+        index: u32,
+    ) -> Result<()> {
+        if index >= self.verify_rows {
+            return Err(Error::Input(format!(
+                "verify export row {index} is past {} rows",
+                self.verify_rows
+            )));
+        }
+        let ws = self.verify_ready()?;
+        let row = rows_bytes(self.hidden, 1, 2)?;
+        let off = rows_bytes(self.hidden, index, 2)?;
+        expect_bytes(dst, row, "verify export row")?;
+        let n = u64::try_from(row)
+            .map_err(|_| Error::Input("verify export row does not fit in u64".into()))?;
+        // SAFETY: source and destination do not overlap. The offset is inside
+        // the export allocation. Both stay allocated until `gpu.stream` finishes.
+        unsafe {
+            ops::memcpy_d2d(ptr(dst), ptr_offset(&ws.export, off)?, n, gpu.raw_stream())?;
+        }
+        Ok(())
+    }
+
+    /// Copy logit row `index` into the one-row buffer [`Self::verify_logit_row_mut`].
+    ///
+    /// # Errors
+    ///
+    /// `index` is past the accepted window.
+    pub(crate) fn copy_verify_logit_row(&self, gpu: &Gpu, index: u32) -> Result<()> {
+        if index >= self.verify_rows {
+            return Err(Error::Input(format!(
+                "verify logit row {index} is past {} rows",
+                self.verify_rows
+            )));
+        }
+        let ws = self.verify_ready()?;
+        let row = rows_bytes(self.vocab, 1, 2)?;
+        let off = rows_bytes(self.vocab, index, 2)?;
+        expect_bytes(&ws.logit_row, row, "verify logit row")?;
+        let n = u64::try_from(row)
+            .map_err(|_| Error::Input("verify logit row does not fit in u64".into()))?;
+        // SAFETY: `logit_row` and `logits` are distinct allocations. The
+        // source offset is one row inside the matrix.
+        unsafe {
+            ops::memcpy_d2d(
+                ptr(&ws.logit_row),
+                ptr_offset(&ws.logits, off)?,
+                n,
+                gpu.raw_stream(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Copy the first `rows` verify logit rows. Each is fp16 `[vocab]`.
+    ///
+    /// The matrix is the full window. `rows` is the forward's `q_len`, which
+    /// may be larger than [`Self::verify_rows`] after a rewind. Call this
+    /// before the sampler; the one-row buffer is what penalties overwrite.
+    ///
+    /// # Errors
+    ///
+    /// The verify scratch is absent, or `rows` is outside 1..=16.
+    pub(crate) fn copy_verify_logit_rows(&self, gpu: &Gpu, rows: u32) -> Result<Vec<Vec<u8>>> {
+        if rows == 0 || rows > 16 {
+            return Err(Error::Input(format!(
+                "verify logit copy of {rows} rows is outside 1..=16"
+            )));
+        }
+        let ws = self.verify_ready()?;
+        let mut all = vec![0u8; ws.logits.num_bytes()];
+        ws.logits.copy_to_host(&gpu.stream, &mut all)?;
+        let row = rows_bytes(self.vocab, 1, 2)?;
+        let need = rows_bytes(self.vocab, rows, 2)?;
+        if need > all.len() {
+            return Err(Error::Input(
+                "verify logits are shorter than the requested rows".into(),
+            ));
+        }
+        let mut out = Vec::with_capacity(usize::try_from(rows).unwrap_or(0));
+        for index in 0..usize::try_from(rows).unwrap_or(0) {
+            let off = index
+                .checked_mul(row)
+                .ok_or_else(|| Error::Input("verify logit row offset overflows".into()))?;
+            out.push(all[off..off + row].to_vec());
+        }
+        Ok(out)
+    }
+
+    /// The one-row logit buffer filled by [`Self::copy_verify_logit_row`].
+    ///
+    /// The sampler penalizes this row in place.
+    pub(crate) fn verify_logit_row_mut(&mut self) -> Result<&mut ByteBuf> {
+        if self.verify_rows == 0 {
+            return Err(Error::Input("verify has no logit rows".into()));
+        }
+        let ws = self
+            .verify_ws
+            .as_mut()
+            .ok_or_else(|| Error::Input("verify workspace is not allocated".into()))?;
+        Ok(&mut ws.logit_row)
+    }
+
+    fn verify_ready(&self) -> Result<&VerifyWorkspace> {
+        self.verify_ws
+            .as_ref()
+            .ok_or_else(|| Error::Input("verify workspace is not allocated".into()))
+    }
+
+    fn verify_scratches(&self, gpu: &Gpu) -> Result<(GdnHistoryScratch, AttnQlenScratch)> {
+        let mut gdn = None;
+        let mut attn = None;
+        for block in &self.blocks {
+            match &block.mixer {
+                MixerSlot::Gdn(layer) if gdn.is_none() => {
+                    gdn = Some(layer.history_scratch(gpu, VERIFY_MAX_ROWS)?);
+                }
+                MixerSlot::FullAttn(layer) if attn.is_none() => {
+                    attn = Some(layer.qlen_scratch(gpu, VERIFY_MAX_ROWS, gpu.sm_count)?);
+                }
+                _ => {}
+            }
+        }
+        let gdn = gdn.ok_or_else(|| Error::Weights("verify needs a GDN layer".into()))?;
+        let attn = attn.ok_or_else(|| Error::Weights("verify needs an attention layer".into()))?;
+        Ok((gdn, attn))
+    }
+
+    fn check_verify_inputs(&self, ids: &[u32], start: u32, bt_width: u32) -> Result<u32> {
+        if self.verify_ws.is_none() || self.prefill_ws.is_none() {
+            return Err(Error::Input("verify workspace is not allocated".into()));
+        }
+        let rows = u32::try_from(ids.len())
+            .map_err(|_| Error::Input("verify ids are longer than u32::MAX".into()))?;
+        if !(1..=VERIFY_MAX_ROWS).contains(&rows) {
+            return Err(Error::Input(format!(
+                "verify rows {rows} are outside 1..={VERIFY_MAX_ROWS}"
+            )));
+        }
+        let vocab = u32::try_from(self.vocab).expect("vocab is a positive i32");
+        for &token in ids {
+            if token >= vocab {
+                return Err(Error::Input(format!(
+                    "token {token} is past the vocabulary ({vocab})"
+                )));
+            }
+        }
+        let end = start
+            .checked_add(rows)
+            .ok_or_else(|| Error::Input("verify end overflows".into()))?;
+        if end > self.max_tokens {
+            return Err(Error::Input(format!(
+                "verify [{start}, {end}) does not fit the {}-token cache",
+                self.max_tokens
+            )));
+        }
+        if i32::try_from(start).is_err() {
+            return Err(Error::Input(format!(
+                "verify start {start} does not fit in i32"
+            )));
+        }
+        self.check_verify_layers(rows, bt_width)?;
+        Ok(rows)
+    }
+
+    fn check_verify_layers(&self, rows: u32, bt_width: u32) -> Result<()> {
+        let mut saw_gdn = false;
+        let mut saw_attn = false;
+        for block in &self.blocks {
+            match &block.mixer {
+                MixerSlot::Gdn(layer) => {
+                    layer.check_history_rows(rows)?;
+                    saw_gdn = true;
+                }
+                MixerSlot::FullAttn(layer) => {
+                    layer.check_qlen_pages(bt_width)?;
+                    saw_attn = true;
+                }
+            }
+        }
+        if !saw_gdn || !saw_attn {
+            return Err(Error::Weights(
+                "verify needs GDN and attention layers".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn prepare_verify_inputs(&mut self, gpu: &Gpu, ids: &[u32], start: u32) -> Result<()> {
+        {
+            let ws = self
+                .verify_ws
+                .as_mut()
+                .ok_or_else(|| Error::Input("verify workspace is not allocated".into()))?;
+            stage_verify_ids(gpu, &mut ws.ids, ids)?;
+        }
+        self.stage_verify_slot(gpu, start, VerifyLen::In)?;
+        let hidden = self.hidden;
+        let rows = u32::try_from(ids.len()).expect("verify rows were checked");
+        let n = positive_rows(rows)?;
+        let Model {
+            embed, verify_ws, ..
+        } = self;
+        let ws = verify_ws
+            .as_mut()
+            .ok_or_else(|| Error::Input("verify workspace is not allocated".into()))?;
+        embed_ids(gpu, embed, &ws.ids, hidden, n, &mut ws.residual)
+    }
+
+    fn stage_verify_slot(&mut self, gpu: &Gpu, len: u32, which: VerifyLen) -> Result<()> {
+        let Model {
+            staged, verify_ws, ..
+        } = self;
+        let ws = verify_ws
+            .as_mut()
+            .ok_or_else(|| Error::Input("verify workspace is not allocated".into()))?;
+        let slot = match which {
+            VerifyLen::In => &mut ws.len_in,
+            VerifyLen::Out => &mut ws.len_out,
+            VerifyLen::Rewind => &mut ws.len_rewind,
+        };
+        write_seq(slot, len)?;
+        // SAFETY: `slot` is not rewritten until the next stage of this same
+        // word, and that stage uses a different pinned buffer. `staged.seq`
+        // outlives the copy.
+        unsafe {
+            staged.seq.copy_from_pinned_async(&gpu.stream, slot)?;
+        }
+        Ok(())
+    }
+
+    fn verify_tail(&mut self, gpu: &Gpu, rows: u32) -> Result<()> {
+        let hidden = self.hidden;
+        let norm = self.norm;
+        let Model {
+            final_norm,
+            lm_head,
+            verify_ws,
+            ..
+        } = self;
+        let ws = verify_ws
+            .as_mut()
+            .ok_or_else(|| Error::Input("verify workspace is not allocated".into()))?;
+        Self::norm_rows(
+            gpu,
+            &ws.residual,
+            final_norm,
+            &mut ws.export,
+            hidden,
+            rows,
+            norm,
+        )?;
+        if rows == 1 {
+            lm_head.forward(gpu, &ws.export, &mut ws.logits, OutDtype::F16)
+        } else {
+            lm_head.forward_n(
+                gpu,
+                &ws.lm_had,
+                &ws.export,
+                &mut ws.logits,
+                rows,
+                OutDtype::F16,
+            )
+        }
+    }
+
+    fn collect_rewind_jobs(
+        &self,
+        num_rejected: u32,
+    ) -> Result<(
+        Vec<berth_kernels::gdn::ConvRewindJob>,
+        Vec<berth_kernels::gdn::StateRewindJob>,
+    )> {
+        let mut conv_jobs = Vec::new();
+        let mut state_jobs = Vec::new();
+        for block in &self.blocks {
+            let MixerSlot::Gdn(layer) = &block.mixer else {
+                continue;
+            };
+            let (conv, state) = layer.rewind_jobs(num_rejected)?;
+            if let Some(job) = conv {
+                conv_jobs.push(job);
+            }
+            if let Some(job) = state {
+                state_jobs.push(job);
+            }
+        }
+        Ok((conv_jobs, state_jobs))
+    }
+}
+
+fn verify_block(model: &mut Model, gpu: &Gpu, index: usize, span: VerifySpan) -> Result<()> {
+    let hidden = model.hidden;
+    let norm = model.norm;
+    let Model {
+        blocks,
+        verify_ws,
+        prefill_ws,
+        paged,
+        ..
+    } = model;
+    let ws = verify_ws
+        .as_mut()
+        .ok_or_else(|| Error::Input("verify workspace is not allocated".into()))?;
+    let prefill = prefill_ws
+        .as_mut()
+        .ok_or_else(|| Error::Input("verify workspace is not allocated".into()))?;
+    Model::norm_rows(
+        gpu,
+        &ws.residual,
+        &blocks[index].input_norm,
+        &mut ws.norm_out,
+        hidden,
+        span.rows,
+        norm,
+    )?;
+    verify_mixer(gpu, &mut blocks[index].mixer, paged, ws, prefill, span)?;
+    Model::norm_residual_rows(
+        gpu,
+        &ws.mixer_out,
+        &blocks[index].post_norm,
+        &mut ws.mlp_in,
+        &mut ws.residual,
+        hidden,
+        span.rows,
+        norm,
+    )?;
+    verify_mlp(gpu, &mut blocks[index].mlp, ws, prefill, span.rows)?;
+    Model::add_residual_rows(gpu, &mut ws.residual, &ws.mlp_out, hidden, span.rows)
+}
+
+fn verify_mixer(
+    gpu: &Gpu,
+    mixer: &mut MixerSlot,
+    paged: &PagedDecode,
+    ws: &mut VerifyWorkspace,
+    prefill: &mut PrefillWorkspace,
+    span: VerifySpan,
+) -> Result<()> {
+    let VerifyWorkspace {
+        gdn,
+        attn,
+        norm_out,
+        mixer_out,
+        ..
+    } = ws;
+    let PrefillWorkspace { rows_scratch, .. } = prefill;
+    match mixer {
+        MixerSlot::Gdn(layer) => {
+            layer.forward_history(gpu, rows_scratch, gdn, norm_out, mixer_out, span.rows)
+        }
+        MixerSlot::FullAttn(layer) => layer.forward_qlen(
+            gpu,
+            paged,
+            attn,
+            rows_scratch,
+            norm_out,
+            mixer_out,
+            span.start,
+            span.rows,
+            span.bt_width,
+        ),
+    }
+}
+
+fn verify_mlp(
+    gpu: &Gpu,
+    mlp: &mut MlpLayer,
+    ws: &mut VerifyWorkspace,
+    prefill: &mut PrefillWorkspace,
+    rows: u32,
+) -> Result<()> {
+    let PrefillWorkspace {
+        rows_scratch,
+        mlp: activations,
+        ..
+    } = prefill;
+    mlp.forward_n(
+        gpu,
+        rows_scratch,
+        activations,
+        &ws.mlp_in,
+        &mut ws.mlp_out,
+        rows,
+    )
+}
+
+fn alloc_verify_workspace(
+    gpu: &Gpu,
+    hidden: i32,
+    vocab: i32,
+    gdn: GdnHistoryScratch,
+    attn: AttnQlenScratch,
+) -> Result<VerifyWorkspace> {
+    let f32_bytes = rows_bytes(hidden, VERIFY_MAX_ROWS, 4)?;
+    let f16_bytes = rows_bytes(hidden, VERIFY_MAX_ROWS, 2)?;
+    let logits = rows_bytes(vocab, VERIFY_MAX_ROWS, 2)?;
+    let logit_row = rows_bytes(vocab, 1, 2)?;
+    let ids = usize::try_from(VERIFY_MAX_ROWS).expect("verify rows fit usize") * 4;
+    Ok(VerifyWorkspace {
+        gdn,
+        attn,
+        residual: gpu.zeroed(f32_bytes)?,
+        norm_out: gpu.zeroed(f16_bytes)?,
+        mixer_out: gpu.zeroed(f32_bytes)?,
+        mlp_in: gpu.zeroed(f16_bytes)?,
+        mlp_out: gpu.zeroed(f32_bytes)?,
+        export: gpu.zeroed(f16_bytes)?,
+        logits: gpu.zeroed(logits)?,
+        lm_had: gpu.zeroed(f16_bytes)?,
+        logit_row: gpu.zeroed(logit_row)?,
+        ids: gpu.zeroed(ids)?,
+        len_in: PinnedBuf::zeroed(&gpu.ctx, 4)?,
+        len_out: PinnedBuf::zeroed(&gpu.ctx, 4)?,
+        len_rewind: PinnedBuf::zeroed(&gpu.ctx, 4)?,
+    })
+}
+
+fn stage_verify_ids(gpu: &Gpu, ids_buf: &mut ByteBuf, tokens: &[u32]) -> Result<()> {
+    let bytes = ids_buf.num_bytes();
+    if tokens.len().saturating_mul(4) > bytes {
+        return Err(Error::Input(format!(
+            "verify window of {} tokens exceeds the id buffer",
+            tokens.len()
+        )));
+    }
+    let mut host = vec![0u8; bytes];
+    for (index, token) in tokens.iter().enumerate() {
+        let id = i32::try_from(*token)
+            .map_err(|_| Error::Input(format!("token {token} does not fit in i32")))?;
+        host[index * 4..index * 4 + 4].copy_from_slice(&id.to_le_bytes());
+    }
+    ids_buf.copy_from_host(&gpu.stream, &host)?;
+    Ok(())
 }
 
 #[cfg(test)]

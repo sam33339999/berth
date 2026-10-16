@@ -340,13 +340,31 @@ impl GdnPrefill {
             let key = format!("conv_combined_bs{block_s}");
             conv.push((
                 key.clone(),
-                load_conv(ctx, dir, kernels, &key, "conv_combined", block_s)?,
+                load_conv(
+                    ctx,
+                    dir,
+                    kernels,
+                    &key,
+                    "conv_combined",
+                    block_s,
+                    CONV_STATE,
+                    CONV_STATE,
+                )?,
             ));
             if block_s >= 16 {
                 let div = format!("{key}_div16");
                 conv.push((
                     div.clone(),
-                    load_conv(ctx, dir, kernels, &div, "conv_combined", block_s)?,
+                    load_conv(
+                        ctx,
+                        dir,
+                        kernels,
+                        &div,
+                        "conv_combined",
+                        block_s,
+                        CONV_STATE,
+                        CONV_STATE,
+                    )?,
                 ));
             }
         }
@@ -359,8 +377,60 @@ impl GdnPrefill {
             let block_s = if grid == "conv_state" { 0 } else { 256 };
             conv.push((
                 key.to_string(),
-                load_conv(ctx, dir, kernels, key, grid, block_s)?,
+                load_conv(
+                    ctx, dir, kernels, key, grid, block_s, CONV_STATE, CONV_STATE,
+                )?,
             ));
+        }
+
+        for state_size in 5..=19 {
+            let block_state = next_pow2(state_size)?;
+            for block_s in [1, 2, 4, 8, 16, 32, 64, 128, 256] {
+                let base = format!("conv_combined_bs{block_s}");
+                push_wide_conv(
+                    &mut conv,
+                    ctx,
+                    dir,
+                    kernels,
+                    &conv_key_for(state_size, &base),
+                    "conv_combined",
+                    block_s,
+                    state_size,
+                    block_state,
+                )?;
+                if block_s >= 16 {
+                    let div = format!("{base}_div16");
+                    push_wide_conv(
+                        &mut conv,
+                        ctx,
+                        dir,
+                        kernels,
+                        &conv_key_for(state_size, &div),
+                        "conv_combined",
+                        block_s,
+                        state_size,
+                        block_state,
+                    )?;
+                }
+            }
+            for (base, grid, block_s) in [
+                ("conv_output", "conv_output", 256),
+                ("conv_output_div16", "conv_output", 256),
+                ("conv_state", "conv_state", 0),
+                ("conv_state_div16", "conv_state", 0),
+            ] {
+                push_wide_conv(
+                    &mut conv,
+                    ctx,
+                    dir,
+                    kernels,
+                    &conv_key_for(state_size, base),
+                    grid,
+                    block_s,
+                    state_size,
+                    block_state,
+                )?;
+            }
         }
 
         Ok(Self {
@@ -399,6 +469,40 @@ impl GdnPrefill {
     /// `conv_state` and `recurrent_state` are read and written. `stream`
     /// must belong to the context `load` used.
     pub unsafe fn run(&self, stream: &Stream, args: &GdnPrefillArgs) -> Result<()> {
+        unsafe { self.run_at(stream, args, CONV_STATE) }
+    }
+
+    /// Prefill with conv `state_size` in `4..=19`.
+    ///
+    /// `4` is [`Self::run`]. `5..=19` selects the `_ss{state_size}` conv
+    /// cubins. A cubin that was not loaded fails here, not in [`Self::load`].
+    /// The fla chunk kernels do not read `state_size`.
+    ///
+    /// # Errors
+    ///
+    /// `state_size` outside `4..=19`, or the same failures as [`Self::run`].
+    ///
+    /// # Safety
+    ///
+    /// Same as [`Self::run`]. `conv_state`'s last dimension is `state_size`.
+    pub unsafe fn run_with_state_size(
+        &self,
+        stream: &Stream,
+        args: &GdnPrefillArgs,
+        state_size: i32,
+    ) -> Result<()> {
+        if state_size == CONV_STATE {
+            return unsafe { self.run(stream, args) };
+        }
+        if !(5..=19).contains(&state_size) {
+            return Err(Error::Launch(format!(
+                "gdn prefill: state_size {state_size} is outside 4..=19"
+            )));
+        }
+        unsafe { self.run_at(stream, args, state_size) }
+    }
+
+    unsafe fn run_at(&self, stream: &Stream, args: &GdnPrefillArgs, state_size: i32) -> Result<()> {
         let seqlen = args.seqlen;
         let lay = layout(seqlen)?;
         if args.workspace == 0 || !args.workspace.is_multiple_of(ALIGN as u64) {
@@ -475,6 +579,7 @@ impl GdnPrefill {
             slot_ptr,
             conv_weight,
             conv_out,
+            state_size,
         )?;
 
         if seqlen < NUM_V_HEADS {
@@ -543,11 +648,12 @@ impl GdnPrefill {
         slots: u64,
         weight: u64,
         out: u64,
+        state_size: i32,
     ) -> Result<()> {
         let div16 = seqlen % 16 == 0;
         if seqlen <= 256 {
             let block_s = next_pow2(seqlen)?;
-            let key = conv_combined_key(block_s, div16);
+            let key = conv_key_for(state_size, &conv_combined_key(block_s, div16));
             let image = self.conv_image(&key)?;
             let grid = Dim3::new(1, cdiv_u32(QKV_DIM, 32)?, 1);
             launch_named(
@@ -565,18 +671,24 @@ impl GdnPrefill {
                 ],
             )
         } else {
-            let output_key = if div16 {
-                "conv_output_div16"
-            } else {
-                "conv_output"
-            };
-            let state_key = if div16 {
-                "conv_state_div16"
-            } else {
-                "conv_state"
-            };
-            let output = self.conv_image(output_key)?;
-            let state = self.conv_image(state_key)?;
+            let output_key = conv_key_for(
+                state_size,
+                if div16 {
+                    "conv_output_div16"
+                } else {
+                    "conv_output"
+                },
+            );
+            let state_key = conv_key_for(
+                state_size,
+                if div16 {
+                    "conv_state_div16"
+                } else {
+                    "conv_state"
+                },
+            );
+            let output = self.conv_image(&output_key)?;
+            let state = self.conv_image(&state_key)?;
             let y = cdiv_u32(QKV_DIM, 32)?;
             let z = cdiv_u32(seqlen, 256)?;
             launch_named(
@@ -782,7 +894,15 @@ impl GdnPrefill {
             .iter()
             .find(|(name, _)| name == key)
             .map(|(_, image)| image)
-            .ok_or_else(|| Error::Launch(format!("gdn prefill: no cubin {key}")))
+            .ok_or_else(|| {
+                if key.contains("_ss") {
+                    Error::Launch(format!(
+                        "gdn prefill cubin {key} is missing. Run: {TRITON_FLA_BUILD}"
+                    ))
+                } else {
+                    Error::Launch(format!("gdn prefill: no cubin {key}"))
+                }
+            })
     }
 }
 
@@ -792,6 +912,14 @@ fn conv_combined_key(block_s: i32, div16: bool) -> String {
         key.push_str("_div16");
     }
     key
+}
+
+fn conv_key_for(state_size: i32, base: &str) -> String {
+    if state_size == CONV_STATE {
+        base.to_string()
+    } else {
+        format!("{base}_ss{state_size}")
+    }
 }
 
 fn next_pow2(n: i32) -> Result<i32> {
@@ -1117,6 +1245,46 @@ fn load_image(ctx: &Context, dir: &Path, kernels: &Json, key: &str, grid: &str) 
     load_record(ctx, dir, key, record)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn push_wide_conv(
+    conv: &mut Vec<(String, Image)>,
+    ctx: &Context,
+    dir: &Path,
+    kernels: &Json,
+    key: &str,
+    grid: &str,
+    block_s: i32,
+    want_state: i32,
+    block_state: i32,
+) -> Result<()> {
+    let Some(record) = kernels.get(key) else {
+        return Ok(());
+    };
+    if !conv_file_ready(dir, record) {
+        return Ok(());
+    }
+    let image = load_conv(
+        ctx,
+        dir,
+        kernels,
+        key,
+        grid,
+        block_s,
+        want_state,
+        block_state,
+    )?;
+    conv.push((key.to_string(), image));
+    Ok(())
+}
+
+fn conv_file_ready(dir: &Path, record: &Json) -> bool {
+    let Some(file) = record.get("cubin").and_then(Json::as_str) else {
+        return false;
+    };
+    std::fs::metadata(dir.join(file)).is_ok_and(|meta| meta.len() > 0)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn load_conv(
     ctx: &Context,
     dir: &Path,
@@ -1124,6 +1292,8 @@ fn load_conv(
     key: &str,
     grid: &str,
     block_s: i32,
+    want_state: i32,
+    block_state: i32,
 ) -> Result<Image> {
     let image = load_image(ctx, dir, kernels, key, grid)?;
     if image.num_warps != 4 {
@@ -1137,7 +1307,7 @@ fn load_conv(
         .get("constexprs")
         .ok_or_else(|| Error::Launch(format!("{key} constexprs missing")))?;
     require_i32(c, "dim", QKV_DIM)?;
-    require_i32(c, "state_size", CONV_STATE)?;
+    require_i32(c, "state_size", want_state)?;
     require_i32(c, "conv_kernel_size", CONV_STATE)?;
     require_i32(c, "BLOCK_D", 32)?;
     // Triton folds an integer argument whose value is 1 into a constexpr.
@@ -1162,7 +1332,7 @@ fn load_conv(
     if grid == "conv_state" {
         // The state kernel has `history` and no bias/output constexprs.
         require_bool(c, "history", false)?;
-        require_i32(c, "BLOCK_STATE", CONV_STATE)?;
+        require_i32(c, "BLOCK_STATE", block_state)?;
         allow_only(
             c,
             &[
@@ -1194,7 +1364,7 @@ fn load_conv(
         require_i32(c, "BLOCK_K", CONV_STATE)?;
         if grid == "conv_combined" {
             require_bool(c, "history", false)?;
-            require_i32(c, "BLOCK_STATE", CONV_STATE)?;
+            require_i32(c, "BLOCK_STATE", block_state)?;
         }
         allow_only(
             c,
@@ -1867,6 +2037,23 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conv_key_for_keeps_state_size_4() {
+        assert_eq!(conv_key_for(4, "conv_output"), "conv_output");
+        assert_eq!(
+            conv_key_for(4, "conv_combined_bs16_div16"),
+            "conv_combined_bs16_div16"
+        );
+        assert_eq!(conv_key_for(5, "conv_output"), "conv_output_ss5");
+        assert_eq!(
+            conv_key_for(19, "conv_combined_bs16_div16"),
+            "conv_combined_bs16_div16_ss19"
+        );
+        assert_eq!(next_pow2(5).unwrap(), 8);
+        assert_eq!(next_pow2(9).unwrap(), 16);
+        assert_eq!(next_pow2(17).unwrap(), 32);
+    }
 
     #[test]
     fn scratch_rejects_out_of_range() {

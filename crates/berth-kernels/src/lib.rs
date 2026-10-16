@@ -22,8 +22,10 @@
 //!   (block 256, 82 SMs, concurrency 1).
 //!
 //! Other shapes fail closed: residual int8 (`EXL3_INT8_GEMV=1`), the M = 2 sq
-//! instance, cooperative int8, QTIP `exl3_gemv`, and GEMM other than K = 6
-//! mul1 fp16 are not linked. `last_launch` names the kernel that ran.
+//! instance, cooperative int8, and GEMM other than K = 6 mul1 fp16 are not
+//! linked on this m = 1 path. QTIP `exl3_gemv` is not linked here either.
+//! Prefill links the narrow instance for m = 3..=8. `last_launch` names the
+//! kernel that ran.
 //!
 //! This crate does not use `berth-cuda` types. Pointers are device addresses
 //! and `stream` is a `cudaStream_t` (`null` is the default stream). Bias is
