@@ -562,27 +562,15 @@ impl Model {
         Ok(())
     }
 
-    /// Drop per-sequence state so the next token is position 0.
+    /// Size every attention layer's decode block table from the live
+    /// sequence length, as the fork's `iterate_gen` does.
     ///
-    /// A fresh fork job with no prefix hit does the same thing and then
-    /// prefills from the start (`generator/job.py` allocates pages, then
-    /// `Cache.get_new_state` with `clear=True` when no GDN checkpoint was
-    /// stashed). Prefix reuse is out of scope here.
-    ///
-    /// * Every GDN layer's conv and recurrent state is zeroed in its existing
-    ///   device allocation (`GDNLayerState.clear`).
-    /// * Every attention layer's cache length goes back to 0. The fork's
-    ///   `Sequence` starts at `kv_position = 0` and `add_ref_unique` does
-    ///   not scrub K/V bytes; the next write overwrites a position before
-    ///   attention reads it. The live length is the shared `cache_seqlens`
-    ///   word this model stages, plus each layer's private word for the
-    ///   unbound path.
-    ///
-    /// Finishes any queued kernels first. After this returns, [`Self::logits`]
-    /// is not readable until the next [`Self::decode_step`].
-    /// Size every attention layer's decode block table for a request of
-    /// `max_seq_len` tokens (prompt plus `max_new_tokens`), as the fork's
-    /// `iterate_gen` does. The split count, and so the logits bits, follow it.
+    /// `max_seq_len` is `position + 1` for the token this step decodes
+    /// (`Job.get_max_seq_len` is `len(sequence_ids)`, including the token
+    /// not yet in the cache). Pages are `ceil(max_seq_len / 256)` rounded
+    /// up to a multiple of 16. `prompt + max_new_tokens` agrees only when
+    /// the request does not cross a 16-page boundary. The split count, and
+    /// so the logits bits, follow the width.
     pub fn set_decode_width(&mut self, max_seq_len: u32) {
         for block in &mut self.blocks {
             if let MixerSlot::FullAttn(attn) = &mut block.mixer {
@@ -623,6 +611,24 @@ impl Model {
         Ok(())
     }
 
+    /// Drop per-sequence state so the next token is position 0.
+    ///
+    /// A fresh fork job with no prefix hit does the same thing and then
+    /// prefills from the start (`generator/job.py` allocates pages, then
+    /// `Cache.get_new_state` with `clear=True` when no GDN checkpoint was
+    /// stashed). Prefix reuse is out of scope here.
+    ///
+    /// * Every GDN layer's conv and recurrent state is zeroed in its existing
+    ///   device allocation (`GDNLayerState.clear`).
+    /// * Every attention layer's cache length goes back to 0. The fork's
+    ///   `Sequence` starts at `kv_position = 0` and `add_ref_unique` does
+    ///   not scrub K/V bytes; the next write overwrites a position before
+    ///   attention reads it. The live length is the shared `cache_seqlens`
+    ///   word this model stages, plus each layer's private word for the
+    ///   unbound path.
+    ///
+    /// Finishes any queued kernels first. After this returns, [`Self::logits`]
+    /// is not readable until the next [`Self::decode_step`].
     pub fn reset_sequence(&mut self, gpu: &Gpu) -> Result<()> {
         self.synchronize(gpu)?;
         self.captured = false;

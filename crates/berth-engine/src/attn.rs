@@ -75,10 +75,13 @@ pub struct AttnLayer {
     codebook: Codebook,
     num_pages: i32,
     /// Block-table width the decode attention is launched with. The fork
-    /// sizes it per request, not per cache: `ceil(max_seq_len / 256)` pages
-    /// rounded up to a multiple of 16 (`generator.py` `iterate_gen`), and the
-    /// split count follows it. [`Self::set_decode_width`] sets it; it starts
-    /// as the whole cache.
+    /// sizes it from the live sequence length (`len(sequence_ids)`, which
+    /// already includes the token this step decodes): `ceil((position + 1) /
+    /// 256)` pages rounded up to a multiple of 16 (`generator.py`
+    /// `iterate_gen`). `prompt + max_new_tokens` matches that only when the
+    /// request does not cross a 16-page boundary. The split count follows
+    /// the width. [`Self::set_decode_width`] sets it; it starts as the whole
+    /// cache.
     decode_width: i32,
     /// Block-table width of the current prefill job. `None` means a direct
     /// [`Self::prefill`] uses the pages that chunk has written. The model
@@ -467,20 +470,16 @@ impl AttnLayer {
         self.bound_seqlens.is_some() || self.bound_positions.is_some()
     }
 
-    /// Set this layer's cache length to 0.
+    /// Set the decode block-table width from the live sequence length.
     ///
-    /// A fresh job starts at `kv_position = 0` (`generator/pagetable.py`,
-    /// `Sequence.__init__` and `CachePage.add_ref_unique`). Those paths do
-    /// not zero K/V pages. The next token overwrites position 0 before
-    /// attention reads it, and the kernel stops at `cache_seqlens`.
-    ///
-    /// Writes the private `seqlens` and rope `positions` words. When
-    /// [`Self::bind_sequence`] is in effect the kernels read the shared word
-    /// instead; [`crate::model::Model::reset_sequence`] clears that too.
-    /// The page allocations are unchanged.
-    /// Set the decode block-table width for a request whose prompt plus
-    /// `max_new_tokens` is `max_seq_len` tokens, the way the fork's
-    /// `iterate_gen` sizes it.
+    /// `max_seq_len` is this step's `len(sequence_ids)` (`generator/job.py`
+    /// `get_max_seq_len`): the token about to be decoded is already in that
+    /// length, so the caller passes `position + 1`. Pages are
+    /// `ceil(max_seq_len / 256)`, then rounded up to a multiple of 16, and
+    /// capped at this layer's cache padded the same way (`generator.py`
+    /// `iterate_gen`). Sizing from `prompt + max_new_tokens` matches only
+    /// when the request never crosses a 16-page boundary. The split count
+    /// follows this width.
     pub fn set_decode_width(&mut self, max_seq_len: u32) {
         let pages = max_seq_len.div_ceil(PAGE).max(1);
         let padded = pages.div_ceil(16) * 16;
@@ -546,6 +545,17 @@ impl AttnLayer {
         Ok(())
     }
 
+    /// Set this layer's cache length to 0.
+    ///
+    /// A fresh job starts at `kv_position = 0` (`generator/pagetable.py`,
+    /// `Sequence.__init__` and `CachePage.add_ref_unique`). Those paths do
+    /// not zero K/V pages. The next token overwrites position 0 before
+    /// attention reads it, and the kernel stops at `cache_seqlens`.
+    ///
+    /// Writes the private `seqlens` and rope `positions` words. When
+    /// [`Self::bind_sequence`] is in effect the kernels read the shared word
+    /// instead; [`crate::model::Model::reset_sequence`] clears that too.
+    /// The page allocations are unchanged.
     pub fn reset_cache(&mut self, gpu: &Gpu) -> Result<()> {
         let zero = [0u8; 4];
         self.seqlens.copy_from_host(&gpu.stream, &zero)?;
