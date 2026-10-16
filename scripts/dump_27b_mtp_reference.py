@@ -659,7 +659,9 @@ class Recorder:
         if ids is None:
             self.draft_ids = None
             return
-        flat = [int(v) for v in ids.detach().to("cpu").reshape(-1).tolist()]
+        # `iterate_draftmodel_mtp_gen` returns `draft_ids_pinned[:, :window]`,
+        # every pinned row; this job is batch row 0.
+        flat = [int(v) for v in ids[0].detach().to("cpu").reshape(-1).tolist()]
         if len(flat) != self.num_draft:
             raise RuntimeError(f"draft returned {len(flat)} ids, N is {self.num_draft}")
         self.draft_ids = flat
