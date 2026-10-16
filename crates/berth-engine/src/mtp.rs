@@ -1009,7 +1009,12 @@ pub enum AcceptStep {
     Reject { num_rejected: u32 },
     /// Row `i == n - 1` had no draft. Call `rewind(0)`.
     AcceptAll,
-    /// Stop token or `max_new_tokens`. Emit the token and do not rewind.
+    /// Stop token or `max_new_tokens`. Stop walking this window.
+    ///
+    /// This is not `reject_remainder`: the cache length stays at the full
+    /// window. `generator.py` leaves `rejected == 0` on that break, so the
+    /// caller still runs `rewind(0)` (`generator.py` 1244–1246) and, when
+    /// more than one token was kept, the MTP refresh (1301–1333).
     Halt,
 }
 
@@ -1027,8 +1032,9 @@ pub enum AcceptEnd {
 /// Accept rule for verify row `i` (`generator.py` 1156–1259).
 ///
 /// Stop is tested before length, and both are tested before the draft
-/// compare, so a stop on a checkpoint row does not rewind. `draft` is
-/// `draft_tokens[i]` when `i < n - 1` and `None` on the last row.
+/// compare, so a stop on a checkpoint row does not call `reject_remainder`.
+/// The post-loop `rewind(0)` is the caller's job (see [`AcceptStep::Halt`]).
+/// `draft` is `draft_tokens[i]` when `i < n - 1` and `None` on the last row.
 ///
 /// # Errors
 ///

@@ -246,7 +246,7 @@ berth：`Exl3Linear::forward` 只做 m = 1（合格就 int8）。`prefill_lin.rs
 
 final RMSNorm 跑在全部 n 列上，fp16。key 在 `export_state_norm_keys` 裡，所以 `export_states[-1]` 是這 n 列（`rmsnorm.py` 169–173）。`last_tokens_only` 在驗證沒設，lm_head 吃全部 n 列。
 
-lm_head 是 K = 6。m = 1 和 m = n 都是 coop GEMM，autotune key `max(m, 2)`。berth 的 1 列已經是 coop。n 列走 `Exl3Linear::forward_rows` → `exl3_linear`，K = 6 不會撞上 QTIP 拒絕。
+lm_head 是 K = 6。m = 1 和 m = n 都是 coop GEMM，autotune key `max(m, 2)`（`exl3_gemm.cu` 255）。int8 只收 K ≤ 5（`exl3_gemv_int8.cu` 245、260），QTIP 只收 K = 2..4（`exl3_gemv.cu` 49），所以 K = 6 兩條都不進。berth 的 1 列已經是 decode shim 的 coop。n 列（2..=144）走 `Exl3Linear::forward_n`：K = 6 改呼叫同一支 `berth_kernels::exl3_linear`（`size_m = rows`，`a_had` 是呼叫端的 n 列），不走只連結 K = 4 的 prefill shim。
 
 logits 形狀 `[1, n, 248320]` fp16。抽樣逐列切 `[1, 1, vocab]`。
 
@@ -270,11 +270,11 @@ sampled != draft_tokens[j, i]  或  is_checkpoint_boundary()
 
 對不上的那個 sample 已經被 `receive_sample` 收進 sequence，它就是這一輪發出的 token。被拒的是它後面的 draft 位置。
 
-視窗裡的 EOS / stop / `max_new_tokens`（1187–1202，`receive_sample` 829–835）：`receive_sample` 回 `eos`。剩下的位置算進 `rejected_draft_tokens`（`n - 1 - i`），**不**呼叫 `reject_remainder`，cache 和 GDN state 都不回捲。job 接著 `deallocate_pages`。stop token 先於 `max_new_tokens`（829 在 834 之前），和 berth `Engine::generate` 的註解一致（`generate.rs` 134–135）。
+視窗裡的 EOS / stop / `max_new_tokens`（1187–1202，`receive_sample` 829–835）：`receive_sample` 回 `eos`，break，**不**呼叫 `reject_remainder`。`rejected` 維持迴圈開頭的 0（1161）。未解的 draft 只計進 `rejected_draft_tokens`（`n - 1 - i`）。cache 的 kv 長度不回捲。因為 `rejected` 仍是 0，1244–1246 還是呼叫 `batch_states[j].rewind(0)`：GDN 把 conv 尾端抄回開頭，recurrent state 不退（`gated_delta_net.py` 113–121）。`accepted_length` 停在 `i + 1`。1301–1333 在 `accepted_length > 1` 時仍 refresh draft cache，然後 `deallocate_pages`（1339–1342）。stop token 先於 `max_new_tokens`（829 在 834 之前）。純函數 `accept_window` 仍回 `Stop` / `Length`，不回 `Rewind`；GPU 迴圈用 `accept_row`，`rewind(0)` 是呼叫端的事。
 
 requeue（`new_tokens > max_rq_tokens - num_draft_tokens`，`job.py` 633）：`reject_remainder` 然後 break（1181–1185）。banned-string 的 checkpoint rewind 在 `receive_sample` 裡做完，`checkpoint_rewound` 讓迴圈把 `rejected` 設成 -1、不再 rewind（1208–1214）。berth 這輪不實作 banned string、filter、requeue；參考 dump 也不開它們。
 
-全部接受且 `rejected == 0`：`batch_states[j].rewind(0)`（1245–1246）。
+`rejected == 0`（全部接受，或 EOS break 沒有改 `rejected`）：`batch_states[j].rewind(0)`（1245–1246）。
 
 ### Sampler 狀態
 
@@ -385,7 +385,7 @@ target 側加新函數，不改現有函數的參數：
 1. `set_prefill_pages` 用加上 `N` 的頁數。`set_decode_width` 的現有呼叫是 `prompt + max_new`，驗證和草稿的寬度每輪不一樣，在循環裡另算，不拿這個欄位硬塞。
 2. `prefill_for_mtp`，接著每個 chunk `MtpHead::prefill_chunk`。單 token prompt 跳過，`mtp_last_hidden` 留空。
 3. 若 `mtp_last_hidden` 是空的（單 token prompt 的第一輪），走一次現有的 1 token `decode_step` + `sample`，把那一列 final norm 留成 `mtp_last_hidden`。這次 `recurrent_history` 是假，寬 state 只有 index 0 被寫。
-4. 否則草稿 K 步，再 `verify_step`，再第 5 節的接受迴圈，再 rewind，再 refresh，更新 `mtp_last_hidden`。發出的 token 仍透過 `on_token`。EOS 不 rewind。`max_new_tokens` 在視窗中間達到就停，剩下的 draft 不算進輸出。checkpoint 邊界（`kv_position % 2048 == 0`，`cached_pages = 0`）視同拒絕。
+4. 否則草稿 K 步，再 `verify_step`，再第 5 節的接受迴圈，再 rewind，再 refresh，更新 `mtp_last_hidden`。發出的 token 仍透過 `on_token`。EOS / `max_new_tokens` 在視窗中間達到就停，不呼叫 `reject_remainder`（cache 不回捲），但仍 `rewind(0)`，`accepted > 1` 時 refresh。剩下的 draft 不算進輸出。checkpoint 邊界（`kv_position % 2048 == 0`，`cached_pages = 0`）視同拒絕。
 
 `Engine::load` 加一個 `mtp_steps: u32`。0 就是現在的載入，不配 draft cache、不配寬 state。`> 0` 才載 `MtpHead` 和 draft cache。上限 15（`q_len = 16`）。`K >= 8` 要走 MLP 的 `Linear.forward` 路徑，文件裡寫清楚，不要假設 `run_bszN` 涵蓋所有 `n <= 16`。
 
@@ -479,7 +479,15 @@ Kernel 測試，Python 參考的寫法和 `crates/berth-kernels/tests/attn_prefi
 - CLI：`--mtp-steps` / `BERTH_MTP_STEPS`，預設 0，`check_config` 和 `Engine::load` 都拒絕 16 以上。
 - CPU 測試：`accept_window_matches_draft`、`accept_window_rejects_mismatch`、`accept_window_accepts_all`、`accept_window_eos_does_not_rewind`、`accept_window_max_new_tokens_stops`、`accept_window_checkpoint_rejects`、`rewind_plan_matches_section6_k4`、`draft_and_verify_pages_match_section3`、`mtp_steps_parses_0_4_and_15`、`mtp_steps_rejects_16`。
 
-P4 第一段接了測試用 trace（`MtpTrace`、`Engine::generate_traced`）和 `tests/mtp_ref.rs`。`mtp_steps == 0` 不經過 trace。trace 沒啟用時不多做 device→host 複製，也不清 cq3。`block_in` 還沒抓。比對停在第一個不一致，數值路徑沒有為了對 digest 而改。N=4 `A_greedy` 第 0 輪整輪對上，logit 第 0 列對 `logits_A_N4_greedy_round0.bin` 的 max abs diff 是 0。第 1 輪在 `Model::verify_tail` 的 n 列 `lm_head`（`model.rs` 的 `forward_n`，K=6）進 `prefill_lin/linear.cu`，該 shim 只連結 K=4 mul1，launch 前丟 `prefill exl3_gemm: no linked kernel for K=6`。`100_greedy` 同樣停在這個 launch，而且因為最後一個 prefill chunk 要等 verify 才合成 round，trace 裡是 0 輪。沒有改 kernel。EOS / `max_new_tokens` 停在視窗中間時不 rewind、也不 refresh（fork 的 `generator.py` 1301–1333 在 deallocate 之前仍可能 refresh draft cache；發出的 token 不受影響，長度字留在 `start + n`，下一次 `generate` 的 `reset_sequence` 才清）。單 token prompt 的第一個 `decode_step` 沿用既有 1-token quant：`blocks_per_seq` 是 `num_pages`，split 用 `decode_width`。cache 剛好只有 `prompt + max_new` 時，投機窗 `K + 1` 可能在 `max_new_tokens` 之前回 `ContextFull`，不會退回 1-token decode。
+P4 接了測試用 trace（`MtpTrace`、`Engine::generate_traced`）和 `tests/mtp_ref.rs`。`mtp_steps == 0` 不經過 trace。trace 沒啟用時不多做 device→host 複製，也不清 cq3。`block_in` 還沒抓。
+
+P5 修了三處，N=2 和 N=4 的 16 個 case 和 fork 逐位元一致（logit 第 0 列 max abs diff 0）。沒有改 kernel，沒有改 `mtp_steps == 0` 的 launch、cubin、block table 寬度。
+
+- n 列 `lm_head`（K=6）走 decode shim 的 coop GEMM，見第 4 節。
+- EOS / `max_new_tokens` 不呼叫 `reject_remainder`，但仍 `rewind(0)`，`accepted > 1` 時 refresh，見第 5 節。
+- `Engine::load` 在 `mtp_steps > 0` 時裝上 `dry_default_sequence_breaker_tokens`（`custom.py` 883–890）。`mtp_steps == 0` 維持 null mask。
+
+單 token prompt 的第一個 `decode_step` 沿用既有 1-token quant：`blocks_per_seq` 是 `num_pages`，split 用 `decode_width`。cache 剛好只有 `prompt + max_new` 時，投機窗 `K + 1` 可能在 `max_new_tokens` 之前回 `ContextFull`，不會退回 1-token decode。
 
 **P4，參考和 GPU 測試。** 檔案：`scripts/dump_27b_mtp_reference.py`、`crates/berth-engine/tests/mtp_ref.rs`、`crates/berth-kernels/tests/` 裡第 9 節的三支。CPU：新測試在沒設 `BERTH_GPU_TESTS` 時直接成功；腳本能被 Python 語法檢查（`python3 -m py_compile`，不 import torch）。不跑 dump，不跑 GPU。
 

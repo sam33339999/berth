@@ -130,12 +130,23 @@ impl Engine {
             )));
         }
         let stop_tokens = read_default_stop_tokens(model_dir)?;
+        // Fork's `SS_DRY` with no explicit breaker set resolves the tokenizer
+        // default at sample time (`custom.py` 1008–1010). Only the MTP load
+        // installs that mask. `mtp_steps == 0` leaves the sampler's null mask.
+        let dry_breakers = if mtp_steps == 0 {
+            None
+        } else {
+            Some(dry_default_breaker_ids(model_dir)?)
+        };
         let ckpt = Checkpoint::open(model_dir)?;
         let shape = model_shape(&ckpt.config).map_err(|err| Error::Weights(err.to_string()))?;
         let plan = build_plan(&shape).map_err(|err| Error::Weights(err.to_string()))?;
         let gpu = Gpu::new()?;
         let mut model = Model::load_with_cubins(&gpu, &ckpt, &plan, max_tokens, cubin_dir)?;
-        let sampler = Sampler::new(&gpu, plan.vocab_size, max_tokens)?;
+        let mut sampler = Sampler::new(&gpu, plan.vocab_size, max_tokens)?;
+        if let Some(ids) = &dry_breakers {
+            sampler.set_sequence_breakers(&gpu, ids)?;
+        }
         let (head, mtp_hidden, mtp_refresh) = if mtp_steps == 0 {
             (None, None, None)
         } else {
@@ -502,14 +513,23 @@ impl Engine {
             };
             let mut emitted = Vec::new();
             match self.walk_verify(&round, on_token, completion, &mut emitted)? {
-                Walk::Done(finish) => {
+                Walk::Done { finish, accepted } => {
                     if let Some(rows) = logit_rows {
+                        let refresh = match accepted {
+                            Some(kept) if kept > 1 => Some((
+                                cursor.kv.checked_add(1).ok_or_else(|| {
+                                    Error::Input("refresh start overflows".into())
+                                })?,
+                                kept - 1,
+                            )),
+                            _ => None,
+                        };
                         self.emit_verify(
                             obs.trace,
                             obs.held,
                             verify_snap(cursor.kv, n, true, Some(drafts), rows),
                             emitted,
-                            None,
+                            refresh,
                         )?;
                     }
                     return Ok((finish, usage(prompt_len, *completion)));
@@ -647,13 +667,29 @@ impl Engine {
             *completion += 1;
             emitted.push(token);
             if on_token(token) == Flow::Cancel {
-                return Ok(Walk::Done(Finish::Cancelled));
+                return Ok(Walk::Done {
+                    finish: Finish::Cancelled,
+                    accepted: None,
+                });
             }
             let rejected = match step {
                 AcceptStep::Continue => None,
                 AcceptStep::Halt => {
-                    // Halt does not rewind. The request ends; the next generate resets state.
-                    return Ok(Walk::Done(finish_halt(round.request, token)));
+                    // `generator.py` 1192–1202 breaks without calling
+                    // `reject_remainder`, so `rejected` stays 0. The
+                    // fallthrough at 1244–1246 still runs `rewind(0)`.
+                    // Cache length is not rolled back. Refresh still runs
+                    // when more than the anchor was kept (1301–1333).
+                    let accepted = i + 1;
+                    self.model.rewind_mtp(&self.gpu, 0)?;
+                    if accepted > 1 {
+                        self.refresh_draft(round.drafts, accepted, round.kv, round.pages)?;
+                    }
+                    self.store_export_row(accepted - 1)?;
+                    return Ok(Walk::Done {
+                        finish: finish_halt(round.request, token),
+                        accepted: Some(accepted),
+                    });
                 }
                 AcceptStep::Reject { num_rejected } => Some(num_rejected),
                 AcceptStep::AcceptAll => Some(0),
@@ -872,12 +908,14 @@ struct LiveCursor {
 
 /// One verify window, either finished or ready for another round.
 enum Walk {
-    Done(Finish),
-    /// `accepted` is the tokens kept from this window, including the anchor.
-    Next {
-        cursor: LiveCursor,
-        accepted: u32,
+    /// `accepted` is set when the fork's `rejected == 0` path ran `rewind(0)`.
+    /// `None` is a caller cancel, which does not rewind.
+    Done {
+        finish: Finish,
+        accepted: Option<u32>,
     },
+    /// `accepted` is the tokens kept from this window, including the anchor.
+    Next { cursor: LiveCursor, accepted: u32 },
 }
 
 /// Borrowed inputs of one verify accept loop.
@@ -1236,6 +1274,319 @@ fn read_required_json(path: &Path) -> Result<serde_json::Value> {
     }
 }
 
+/// Token ids `SS_DRY` treats as sequence breakers when none were passed.
+///
+/// `dry_default_sequence_breaker_tokens` (`custom.py` 883–890): every piece
+/// from `Tokenizer.get_id_to_piece_list(include_special_tokens=True)` that
+/// contains one of `.,!?<>[](){}\n\t"`, plus every `extended_id_to_piece`
+/// id. Pieces for the base vocab are `get_fixed_vocab` (`tokenizer.py`
+/// 597–617), which decodes each id (prefix-stripped when `" t"` is not one
+/// token). The returned ids are sorted and unique.
+fn dry_default_breaker_ids(model_dir: &Path) -> Result<Vec<u32>> {
+    let path = model_dir.join("tokenizer.json");
+    let tokenizer = tokenizers::Tokenizer::from_file(&path)
+        .map_err(|err| Error::Weights(format!("tokenizer.json: {err}")))?;
+    let raw = tokenizer.get_vocab_size(true);
+    let pieces = fixed_vocab_pieces(&tokenizer, raw)?;
+    let mut ids = std::collections::BTreeSet::new();
+    for (index, piece) in pieces.iter().enumerate() {
+        if piece_has_dry_breaker(piece) {
+            let id = u32::try_from(index)
+                .map_err(|_| Error::Weights("tokenizer vocab does not fit in u32".into()))?;
+            ids.insert(id);
+        }
+    }
+    for id in extended_breaker_ids(model_dir, &tokenizer)? {
+        ids.insert(id);
+    }
+    Ok(ids.into_iter().collect())
+}
+
+/// `.,!?<>[](){}\n\t"`. Each entry is one character, so a substring check is
+/// a character check.
+fn piece_has_dry_breaker(piece: &str) -> bool {
+    piece.chars().any(|ch| {
+        matches!(
+            ch,
+            '.' | ','
+                | '!'
+                | '?'
+                | '<'
+                | '>'
+                | '['
+                | ']'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '\n'
+                | '\t'
+                | '"'
+        )
+    })
+}
+
+/// `Tokenizer.get_fixed_vocab` (`tokenizer.py` 597–617).
+fn fixed_vocab_pieces(tokenizer: &tokenizers::Tokenizer, raw: usize) -> Result<Vec<String>> {
+    let probe = tokenizer
+        .encode(" t", false)
+        .map_err(|err| Error::Weights(format!("tokenizer encode: {err}")))?;
+    let probe_ids = probe.get_ids();
+    if probe_ids.len() == 1 {
+        // `decode([test_id])` defaults to skip_special_tokens=True (`tokenizer.py` 602).
+        let decoded = tokenizer
+            .decode(&[probe_ids[0]], true)
+            .map_err(|err| Error::Weights(format!("tokenizer decode: {err}")))?;
+        // Python `len(" t")` is 2 code points.
+        if decoded.chars().count() == 2 {
+            return decode_vocab(tokenizer, raw, None, false);
+        }
+    }
+    let space = tokenizer
+        .encode(" ", false)
+        .map_err(|err| Error::Weights(format!("tokenizer encode: {err}")))?;
+    let prefix_id = space
+        .get_ids()
+        .first()
+        .copied()
+        .ok_or_else(|| Error::Weights("tokenizer encoded a space to zero tokens".into()))?;
+    // `decode([prefix_id])` defaults to skipping special tokens.
+    let prefix_piece = tokenizer
+        .decode(&[prefix_id], true)
+        .map_err(|err| Error::Weights(format!("tokenizer decode: {err}")))?;
+    let prefix_len = prefix_piece.chars().count();
+    let paired = decode_vocab(tokenizer, raw, Some(prefix_id), true)?;
+    Ok(paired
+        .into_iter()
+        .map(|text| text.chars().skip(prefix_len).collect())
+        .collect())
+}
+
+fn decode_vocab(
+    tokenizer: &tokenizers::Tokenizer,
+    raw: usize,
+    prefix: Option<u32>,
+    skip_special_tokens: bool,
+) -> Result<Vec<String>> {
+    let mut out = Vec::with_capacity(raw);
+    let mut owned = Vec::new();
+    let mut index = 0usize;
+    while index < raw {
+        let end = (index + 4096).min(raw);
+        owned.clear();
+        for token in index..end {
+            let id = u32::try_from(token)
+                .map_err(|_| Error::Weights("tokenizer vocab does not fit in u32".into()))?;
+            match prefix {
+                Some(prefix_id) => owned.push(vec![prefix_id, id]),
+                None => owned.push(vec![id]),
+            }
+        }
+        let view: Vec<&[u32]> = owned.iter().map(Vec::as_slice).collect();
+        let decoded = tokenizer
+            .decode_batch(&view, skip_special_tokens)
+            .map_err(|err| Error::Weights(format!("tokenizer decode: {err}")))?;
+        out.extend(decoded);
+        index = end;
+    }
+    Ok(out)
+}
+
+/// Ids in `Tokenizer.extended_id_to_piece` after `__init__` (`tokenizer.py`
+/// 78–201). `added_tokens.json` is applied first, then
+/// `tokenizer_config.json`'s `added_tokens_decoder` overwrites the same
+/// piece. Bos and eos then come from `config.json` (`text_config` included,
+/// `model/config.py` 135–141) or, when that id is absent, from
+/// `get_default_token_id` (`tokenizer.py` 129–148). A null tokenizer-config
+/// value stays unresolved; a missing key falls back to bos 1 / eos 2. Unk is
+/// the BPE `unk_token` string (`tokenizer.py` 120–122), not `config.json`.
+/// An id is inserted only when its piece is non-empty (189–201).
+fn extended_breaker_ids(model_dir: &Path, tokenizer: &tokenizers::Tokenizer) -> Result<Vec<u32>> {
+    let mut ordered: Vec<(String, u32)> = Vec::new();
+    if let Some(added) = read_optional_json(&model_dir.join("added_tokens.json"))? {
+        let obj = added
+            .as_object()
+            .ok_or_else(|| Error::Weights("added_tokens.json is not an object".into()))?;
+        for (piece, value) in obj {
+            upsert_piece(
+                &mut ordered,
+                piece.clone(),
+                json_u32(value, "added_tokens.json id")?,
+            );
+        }
+    }
+    let tok_cfg = read_optional_json(&model_dir.join("tokenizer_config.json"))?;
+    if let Some(decoder) = tok_cfg
+        .as_ref()
+        .and_then(|value| value.get("added_tokens_decoder"))
+        .filter(|value| !value.is_null())
+    {
+        let obj = decoder
+            .as_object()
+            .ok_or_else(|| Error::Weights("added_tokens_decoder is not an object".into()))?;
+        for (key, spec) in obj {
+            let id = key.parse::<u32>().map_err(|_| {
+                Error::Weights(format!(
+                    "added_tokens_decoder key `{key}` is not a u32 token id"
+                ))
+            })?;
+            let content = spec
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    Error::Weights(format!("added_tokens_decoder[{key}] has no string content"))
+                })?;
+            upsert_piece(&mut ordered, content.to_string(), id);
+        }
+    }
+    // `{v: k for k, v in piece_to_id.items()}`: later pairs overwrite the piece.
+    let mut id_to_piece = std::collections::HashMap::<u32, String>::new();
+    for (piece, id) in &ordered {
+        id_to_piece.insert(*id, piece.clone());
+    }
+    let mut ids: Vec<u32> = id_to_piece.keys().copied().collect();
+    if let Some(piece) = model_unk_piece(tokenizer) {
+        if !piece.is_empty() {
+            if let Some(id) = tokenizer.token_to_id(&piece) {
+                ids.push(id);
+            }
+        }
+    }
+    let model_cfg = read_optional_json(&model_dir.join("config.json"))?;
+    let src = ControlSrc {
+        tokenizer,
+        id_to_piece: &id_to_piece,
+        model_cfg: model_cfg.as_ref(),
+        tok_cfg: tok_cfg.as_ref(),
+    };
+    push_resolved_control(
+        &mut ids,
+        &src,
+        "bos_token",
+        &["bos_token_id", "text_config->bos_token_id"],
+        Some(1),
+    )?;
+    push_resolved_control(
+        &mut ids,
+        &src,
+        "eos_token",
+        &["eos_token_id", "text_config->eos_token_id"],
+        Some(2),
+    )?;
+    Ok(ids)
+}
+
+struct ControlSrc<'a> {
+    tokenizer: &'a tokenizers::Tokenizer,
+    id_to_piece: &'a std::collections::HashMap<u32, String>,
+    model_cfg: Option<&'a serde_json::Value>,
+    tok_cfg: Option<&'a serde_json::Value>,
+}
+
+/// Python dict assignment: an existing piece keeps its slot and updates the id.
+fn upsert_piece(ordered: &mut Vec<(String, u32)>, piece: String, id: u32) {
+    if let Some(slot) = ordered.iter_mut().find(|(have, _)| *have == piece) {
+        slot.1 = id;
+    } else {
+        ordered.push((piece, id));
+    }
+}
+
+/// `m.unk_token` for BPE / WordPiece / WordLevel (`tokenizer.py` 120–122).
+/// Unigram reads `unk_id` from `tokenizer.json`; this checkpoint is BPE.
+fn model_unk_piece(tokenizer: &tokenizers::Tokenizer) -> Option<String> {
+    match tokenizer.get_model() {
+        tokenizers::ModelWrapper::BPE(model) => model.unk_token.clone(),
+        tokenizers::ModelWrapper::WordPiece(model) => Some(model.unk_token.clone()),
+        tokenizers::ModelWrapper::WordLevel(model) => Some(model.unk_token.clone()),
+        tokenizers::ModelWrapper::Unigram(_) => None,
+    }
+}
+
+/// `get_default_token_id` plus the bos/eos insert (`tokenizer.py` 129–201).
+fn push_resolved_control(
+    ids: &mut Vec<u32>,
+    src: &ControlSrc<'_>,
+    tok_key: &str,
+    model_keys: &[&str],
+    fallback: Option<u32>,
+) -> Result<()> {
+    let from_model = src
+        .model_cfg
+        .and_then(|cfg| first_present(cfg, model_keys))
+        .map(|value| config_token_id(value, tok_key))
+        .transpose()?
+        .flatten();
+    // A resolved model id wins. Null / absent falls through to the tokenizer
+    // config, and only a missing key there uses `fallback` (`tokenizer.py` 129–148).
+    let id = if let Some(id) = from_model {
+        Some(id)
+    } else {
+        match control_id_from_tokenizer_config(src.tok_cfg, src.tokenizer, tok_key)? {
+            Some(resolved) => Some(resolved),
+            None if tokenizer_key_absent(src.tok_cfg, tok_key) => fallback,
+            None => None,
+        }
+    };
+    let Some(id) = id else {
+        return Ok(());
+    };
+    let piece = src
+        .id_to_piece
+        .get(&id)
+        .cloned()
+        .or_else(|| src.tokenizer.id_to_token(id));
+    if piece.as_deref().is_some_and(|text| !text.is_empty()) {
+        ids.push(id);
+    }
+    Ok(())
+}
+
+/// A list uses its first element, as `Config.__init__` does for `eos_token_id`.
+/// Null or an empty list leaves the id unresolved.
+fn config_token_id(value: &serde_json::Value, what: &str) -> Result<Option<u32>> {
+    match value {
+        serde_json::Value::Array(items) => match items.first() {
+            Some(item) if !item.is_null() => Ok(Some(json_u32(item, what)?)),
+            _ => Ok(None),
+        },
+        serde_json::Value::Null => Ok(None),
+        other => Ok(Some(json_u32(other, what)?)),
+    }
+}
+
+fn tokenizer_key_absent(config: Option<&serde_json::Value>, key: &str) -> bool {
+    match config {
+        None => true,
+        Some(value) => !value.as_object().is_some_and(|map| map.contains_key(key)),
+    }
+}
+
+fn control_id_from_tokenizer_config(
+    config: Option<&serde_json::Value>,
+    tokenizer: &tokenizers::Tokenizer,
+    key: &str,
+) -> Result<Option<u32>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    if !config.as_object().is_some_and(|map| map.contains_key(key)) {
+        return Ok(None);
+    }
+    let Some(value) = config.get(key).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let piece = match value {
+        serde_json::Value::String(text) => Some(text.as_str()),
+        serde_json::Value::Object(map) => map.get("content").and_then(serde_json::Value::as_str),
+        _ => None,
+    };
+    let Some(piece) = piece else {
+        return Ok(None);
+    };
+    Ok(tokenizer.token_to_id(piece))
+}
+
 fn read_optional_json(path: &Path) -> Result<Option<serde_json::Value>> {
     match std::fs::read(path) {
         Ok(bytes) => {
@@ -1387,5 +1738,42 @@ mod tests {
             return;
         }
         assert_eq!(stops(&dir), vec![248_044, 248_046]);
+    }
+
+    #[test]
+    fn qwen38_27b_dry_breakers_match_mtp_meta() {
+        let dir = std::env::var_os("BERTH_27B_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from("/home/sam/qwen38-exl3-dflash2/models/qwen38-27b-exl3")
+            });
+        if !dir.join("tokenizer.json").is_file() {
+            eprintln!("skipping: {} has no tokenizer.json", dir.display());
+            return;
+        }
+        let got = dry_default_breaker_ids(&dir).unwrap();
+        for name in ["meta_N4.json", "meta_N2.json"] {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata/mtp_ref")
+                .join(name);
+            let bytes = std::fs::read(&path).unwrap();
+            let meta: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let expect: Vec<u32> = meta["samplers"]["sample"]["dry_breaker_token_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_u64().unwrap() as u32)
+                .collect();
+            let got_set: std::collections::BTreeSet<u32> = got.iter().copied().collect();
+            let expect_set: std::collections::BTreeSet<u32> = expect.iter().copied().collect();
+            let missing: Vec<u32> = expect_set.difference(&got_set).copied().take(16).collect();
+            let extra: Vec<u32> = got_set.difference(&expect_set).copied().take(16).collect();
+            assert!(
+                missing.is_empty() && extra.is_empty() && got.len() == expect.len(),
+                "{name}: got {} expect {} missing {missing:?} extra {extra:?}",
+                got.len(),
+                expect.len()
+            );
+        }
     }
 }

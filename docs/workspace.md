@@ -202,7 +202,15 @@ MTP（P2）加了 `Model::prefill_mtp` 和 `Model::set_max_history`。沒開 MTP
 
 `--mtp-steps`（P3）預設 0。開著時多一份 draft cache、MTP 權重，以及約 5 倍的 GDN recurrent state，建議把 `--cache-tokens` 調小，否則 24 GiB 可能放不下；放不下就在載入時回 OOM。
 
-P4 第一段是 `Engine::generate_traced`（`MtpTrace`，預設不啟用）和 `tests/mtp_ref.rs`。`generate` 在 `mtp_steps > 0` 時用同一個迴圈、不複製狀態。`mtp_steps == 0` 不呼叫 trace。GPU 對照逐輪比 digest，第一個不一致就停，不改數值路徑。N=4 `A_greedy` 第 0 輪（q_len 1）欄位和 `logits_A_N4_greedy_round0.bin` 一致（max abs diff 0）。下一輪 verify 的 n 列 `lm_head`（K=6、mul1）走 `Exl3Linear::forward_n`，prefill shim 只連結 K=4，launch 前丟錯。`100_greedy` 的最後一個 prefill chunk 要和第一次 verify 合成同一輪，所以第 0 輪還沒寫進 trace 就停在同一個 launch。
+P4 接了 `Engine::generate_traced`（`MtpTrace`，預設不啟用）和 `tests/mtp_ref.rs`。`generate` 在 `mtp_steps > 0` 時用同一個迴圈。`mtp_steps == 0` 不呼叫 trace。
+
+P5 讓這支 GPU 對照和 fork 逐位元一致。N=2 和 N=4 的 16 個 case（prompt A / 100 / 1500 / 8190，greedy 和 temperature 0.7）全部通過，每輪 digest 一致，logit 第 0 列 max abs diff 是 0。三處對齊：
+
+- n 列 `lm_head`（K=6、mul1）在 `Exl3Linear::forward_n` 改走 decode shim 的 `berth_kernels::exl3_linear`（`size_m = rows`，`a_had` 用呼叫端的 n 列）。int8 只收 K≤5、QTIP 只收 K=2..4，所以是 coop GEMM，autotune key `max(m, 2)`（`exllamav3_ext/quant/exl3_gemm.cu` 255）。沒有新 kernel。
+- 視窗裡的 EOS / `max_new_tokens` 不呼叫 `reject_remainder`（cache 長度留在整窗），`rejected` 維持 0，所以仍 `rewind(0)`（`generator.py` 1192–1202、1244–1246）。`accepted_length > 1` 時仍 refresh（1301–1333）。
+- 只有 `mtp_steps > 0` 的載入會裝上 `SS_DRY` 預設 sequence breaker（`custom.py` 883–890，抽樣時 1008–1010 才解析）。`mtp_steps == 0` 仍是 null mask。
+
+`mtp_steps == 0` 的 prefill / decode / generate、launch 參數、cubin、block table 寬度沒改。
 
 實測在 `127.0.0.1:18889`，`max_tokens` 20、溫度 0、串流。TTFT 從送出請求算到第一個 reasoning token（角色那一包不算）。載入後、還沒送請求是 22255 MiB。
 
