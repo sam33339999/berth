@@ -100,6 +100,9 @@ const _: fn(&Engine) = assert_engine_send;
 
 fn assert_engine_send<T: Send>(_: &T) {}
 
+/// Host copy of one fp16 logit row. [`None`] copies nothing.
+type LogitObserver<'a> = Option<&'a mut dyn FnMut(&[u8])>;
+
 /// Observer for one MTP generate. `held` is the last prefill chunk, which
 /// shares an iterate with the verify that follows it.
 struct TraceObs<'a> {
@@ -130,23 +133,19 @@ impl Engine {
             )));
         }
         let stop_tokens = read_default_stop_tokens(model_dir)?;
-        // Fork's `SS_DRY` with no explicit breaker set resolves the tokenizer
-        // default at sample time (`custom.py` 1008–1010). Only the MTP load
-        // installs that mask. `mtp_steps == 0` leaves the sampler's null mask.
-        let dry_breakers = if mtp_steps == 0 {
-            None
-        } else {
-            Some(dry_default_breaker_ids(model_dir)?)
-        };
+        // Serve builds `SS_DRY` with no breaker list and no tokenizer
+        // (`serve_openai.py`), so `default_breakers` stays true (`custom.py`
+        // 987). `Job.receive_logits` always passes the generator tokenizer,
+        // and the mask is the tokenizer default (`custom.py` 1008–1010).
+        // Every load installs that mask, including `mtp_steps == 0`.
+        let dry_breakers = dry_default_breaker_ids(model_dir)?;
         let ckpt = Checkpoint::open(model_dir)?;
         let shape = model_shape(&ckpt.config).map_err(|err| Error::Weights(err.to_string()))?;
         let plan = build_plan(&shape).map_err(|err| Error::Weights(err.to_string()))?;
         let gpu = Gpu::new()?;
         let mut model = Model::load_with_cubins(&gpu, &ckpt, &plan, max_tokens, cubin_dir)?;
         let mut sampler = Sampler::new(&gpu, plan.vocab_size, max_tokens)?;
-        if let Some(ids) = &dry_breakers {
-            sampler.set_sequence_breakers(&gpu, ids)?;
-        }
+        sampler.set_sequence_breakers(&gpu, &dry_breakers)?;
         let (head, mtp_hidden, mtp_refresh) = if mtp_steps == 0 {
             (None, None, None)
         } else {
@@ -211,10 +210,35 @@ impl Engine {
         on_token: &mut dyn FnMut(u32) -> Flow,
     ) -> Result<(Finish, Usage)> {
         if self.mtp_steps == 0 {
-            return self.generate_plain(request, on_token);
+            return self.generate_plain(request, on_token, None);
         }
         let mut trace = NopTrace;
         self.generate_traced(request, on_token, &mut trace)
+    }
+
+    /// [`Self::generate`] with a per-step logit observer. Plain loop only.
+    ///
+    /// Before each sample, the fp16 logit row is copied to the host and
+    /// passed to `on_logits`. The copy happens after the decode has been
+    /// synchronized and before [`Sampler::sample`] overwrites the row.
+    /// [`Self::generate`] does not copy it. `mtp_steps > 0` is rejected:
+    /// that path has its own trace.
+    ///
+    /// # Errors
+    ///
+    /// The same errors as [`Self::generate`], or this engine loaded MTP.
+    pub fn generate_observed(
+        &mut self,
+        request: &GenerateRequest,
+        on_token: &mut dyn FnMut(u32) -> Flow,
+        on_logits: &mut dyn FnMut(&[u8]),
+    ) -> Result<(Finish, Usage)> {
+        if self.mtp_steps != 0 {
+            return Err(Error::Input(
+                "generate_observed is the plain loop; this engine loaded MTP".into(),
+            ));
+        }
+        self.generate_plain(request, on_token, Some(on_logits))
     }
 
     /// [`Self::generate`] with an MTP observer.
@@ -234,7 +258,7 @@ impl Engine {
         trace: &mut dyn MtpTrace,
     ) -> Result<(Finish, Usage)> {
         if self.mtp_steps == 0 {
-            return self.generate_plain(request, on_token);
+            return self.generate_plain(request, on_token, None);
         }
         let prompt_len = self.check_request(request)?;
         self.model.reset_sequence(&self.gpu)?;
@@ -249,18 +273,18 @@ impl Engine {
         self.generate_mtp(request, on_token, prompt_len, trace)
     }
 
-    /// The `mtp_steps == 0` loop. No trace parameter, so it cannot copy for one.
+    /// The `mtp_steps == 0` loop.
+    ///
+    /// `on_logits` copies the fp16 row before each sample. [`Self::generate`]
+    /// passes [`None`] and does not copy.
     fn generate_plain(
         &mut self,
         request: &GenerateRequest,
         on_token: &mut dyn FnMut(u32) -> Flow,
+        mut on_logits: LogitObserver<'_>,
     ) -> Result<(Finish, Usage)> {
         let prompt_len = self.check_request(request)?;
         self.model.reset_sequence(&self.gpu)?;
-        // The fork sizes the decode block table from the job's whole length
-        // (`Job.get_max_seq_len`: prompt plus max_new_tokens).
-        self.model
-            .set_decode_width(prompt_len.saturating_add(request.max_new_tokens));
         // Prefill sees the job's allocated pages, not the pages written so
         // far and not the 16-padded decode width. `max_rq_tokens` is
         // `max_new_tokens + 1` when the generator has no draft.
@@ -280,6 +304,10 @@ impl Engine {
 
         let mut completion = 0u32;
         loop {
+            if let Some(hook) = on_logits.as_mut() {
+                let row = host_logit_row(gpu, model)?;
+                hook(&row);
+            }
             let token = sampler.sample(gpu, model.logits_mut()?)?;
             completion += 1;
             let usage = Usage {
@@ -305,6 +333,11 @@ impl Engine {
             if next_pos >= max_tokens {
                 return Ok((Finish::ContextFull, usage));
             }
+            // `next_pos + 1` is the live `len(sequence_ids)`, including the
+            // token this step decodes. The fork recomputes the block-table
+            // width from that length on every `iterate_gen`.
+            let width = next_pos.checked_add(1).expect("sequence length fits u32");
+            model.set_decode_width(width);
             model.decode_step(gpu, token, next_pos)?;
             model.synchronize(gpu)?;
         }
@@ -999,6 +1032,14 @@ fn copy_row(
     Ok(())
 }
 
+/// fp16 logit row of the last decode, after the stream has finished it.
+fn host_logit_row(gpu: &Gpu, model: &Model) -> Result<Vec<u8>> {
+    let logits = model.logits()?;
+    let mut bytes = vec![0u8; logits.num_bytes()];
+    logits.copy_to_host(&gpu.stream, &mut bytes)?;
+    Ok(bytes)
+}
+
 /// Prompt tokens at positions `0..prompt.len()`.
 ///
 /// A longer prompt is `Job.prefill` (`generator/job.py`): [`Model::prefill`]
@@ -1011,6 +1052,10 @@ fn feed_prompt(model: &mut Model, gpu: &Gpu, prompt: &[u32]) -> Result<()> {
     }
     let last = *prompt.last().expect("prompt is non-empty");
     let position = u32::try_from(prompt.len() - 1).expect("prompt length fits u32");
+    // `position + 1` is the prompt length: this token is already in
+    // `sequence_ids` and not yet in the cache (`Job.get_max_seq_len`).
+    let width = position.checked_add(1).expect("sequence length fits u32");
+    model.set_decode_width(width);
     model.decode_step(gpu, last, position)?;
     model.synchronize(gpu)?;
     Ok(())

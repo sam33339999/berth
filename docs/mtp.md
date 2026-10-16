@@ -487,6 +487,8 @@ P5 修了三處，N=2 和 N=4 的 16 個 case 和 fork 逐位元一致（logit �
 - EOS / `max_new_tokens` 不呼叫 `reject_remainder`，但仍 `rewind(0)`，`accepted > 1` 時 refresh，見第 5 節。
 - `Engine::load` 在 `mtp_steps > 0` 時裝上 `dry_default_sequence_breaker_tokens`（`custom.py` 883–890）。`mtp_steps == 0` 維持 null mask。
 
+P5 之後的非 MTP 對齊：`Engine::load` 不論 `mtp_steps` 都裝上同一份預設 breaker。`mtp_steps == 0` 的 decode 寬度改成每步 `position + 1`（fork 的當下 `len(sequence_ids)`），不再用整段 `prompt + max_new_tokens`。prefill 頁數與 MTP 分支的寬度沒改。
+
 單 token prompt 的第一個 `decode_step` 沿用既有 1-token quant：`blocks_per_seq` 是 `num_pages`，split 用 `decode_width`。cache 剛好只有 `prompt + max_new` 時，投機窗 `K + 1` 可能在 `max_new_tokens` 之前回 `ContextFull`，不會退回 1-token decode。
 
 **P4，參考和 GPU 測試。** 檔案：`scripts/dump_27b_mtp_reference.py`、`crates/berth-engine/tests/mtp_ref.rs`、`crates/berth-kernels/tests/` 裡第 9 節的三支。CPU：新測試在沒設 `BERTH_GPU_TESTS` 時直接成功；腳本能被 Python 語法檢查（`python3 -m py_compile`，不 import torch）。不跑 dump，不跑 GPU。

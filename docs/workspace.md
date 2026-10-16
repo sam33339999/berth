@@ -186,7 +186,7 @@ greedy 299 步和 fork 的 argmax 完全一樣（`crates/berth-engine/tests/gene
 
 prompt 走 prefill（`Model::prefill`），照 fork 的規則切段：只 prefill `prompt[..len-1]`，段落對齊到 256，最後一個 prompt token 走 decode 拿 logits；第 63 層在 prefill 時只跑 mixer。100、1500、8190、8400 token 的 prompt 和 fork 逐位元一致：每段每層的殘差、所有 attention cache 和 GDN state、第一個 token 的 logits（`crates/berth-engine/tests/prefill_ref.rs`，四個 argmax 都是 561）。2223 token 的 prompt 約 2.3 秒出第一個 token，逐 token 送要約 58 秒。
 
-decode 的 block table 寬度（以及 attention 的 split 數）照 fork 依每個請求算：`ceil((prompt + max_new_tokens) / 256)` 頁，補到 16 的倍數（`generator.py` `iterate_gen`），不是整個 cache 的頁數。用 cache 的頁數，長 context 的 logits 會和服務不一樣。
+decode 的 block table 寬度（以及 attention 的 split 數）照 fork 用當下序列長度：`ceil((position + 1) / 256)` 頁，補到 16 的倍數（`generator.py` `iterate_gen` 的 `job.get_max_seq_len()`，也就是 `len(sequence_ids)`，含還沒進 cache 的那個 token）。不是整個 cache 的頁數。`prompt + max_new_tokens` 只在請求沒跨過 16 頁邊界時和這個寬度一樣。用 cache 的頁數，長 context 的 logits 會和服務不一樣。
 
 prefill 的 cuBLAS 連結的是 torch 的 `libcublas.so.13`（13.1），不是 CUDA 13.3 工具包的（13.6），兩者結果不同。`berth-kernels` 的 `build.rs` 在 `target/cublas-torch/` 放符號連結，`.cargo/config.toml` 的 `$ORIGIN` rpath 讓所有執行檔在執行時找到它。所以 berth 要 `~/openwebui/.venv` 那份 torch 在。
 
@@ -196,7 +196,7 @@ Triton 依整數參數的值特化 kernel（等於 1、能被 16 整除、其他
 
 prefill 的 split 已接上，跟 fork 的 `paged_attn_triton_prefill` 同一條路。`bound_kv = 頁數 × 256 + q_len ≥ 8192` 才拆：候選是 2、3、4、5、6、8，先挑 `ceil(programs × cand / sms) / cand + 0.03 × (cand − 1)` 最小的，平手留前面那個，再把 fp32 partial 壓在 128 MiB 以內。split kernel 的 grid 是 `(q_blocks, n_q_heads, num_splits)`，combine 在 `mul_sigmoid` 之前跑。partial 放在各層共用的 prefill scratch，第一次用到才配，高水位不超過 128 MiB，不跟 decode 的 partial 共用。
 
-prefill 的 block table 寬度是整份 job 的配置，每個 chunk 都一樣：`ceil((prompt_len + max_new_tokens + 1) / 256)` 頁，不補到 16 的倍數。fork 在 `Job.prepare_for_queue`（`generator/job.py` 1118–1120）沒有明示 `max_rq_tokens` 時設 `max_rq_tokens = max_new_tokens + 1 + num_draft_tokens`。berth 還沒有草稿，對齊的是 fork 不開草稿的情況（`generator.py` 171 把 `num_draft_tokens` 設成 0）。正式服務開了 DFlash2，寬度會再多 `num_draft_tokens`，接 DFlash2 時要跟著加。`Sequence.prepare`（`generator/pagetable.py` 235–238）用這個預算算出 `total_pages`，prefill 每個 chunk 都傳整張 `seq.block_index_tensor`（`job.py` 1398）。之前 berth 用該段結尾的 `end.div_ceil(256)`，長 prompt 的前段頁數少一截，過了 8192 之後 split 數會和 fork 不同。100 兩種算法都是 1 頁。1500 的第一段舊寬度是 5 頁、fork 是 6 頁，兩種都還低於 8192，頁數類別都是 other，kernel 不讀多出來的那一頁，所以 digest 不變。一個 prompt 只有一種頁數類別：8190 是 32 頁（div16），8400 是 33 頁（other）。decode 的寬度沒改，還是 `ceil((prompt + max_new_tokens) / 256)` 頁補到 16 的倍數。
+prefill 的 block table 寬度是整份 job 的配置，每個 chunk 都一樣：`ceil((prompt_len + max_new_tokens + 1) / 256)` 頁，不補到 16 的倍數。fork 在 `Job.prepare_for_queue`（`generator/job.py` 1118–1120）沒有明示 `max_rq_tokens` 時設 `max_rq_tokens = max_new_tokens + 1 + num_draft_tokens`。berth 還沒有草稿，對齊的是 fork 不開草稿的情況（`generator.py` 171 把 `num_draft_tokens` 設成 0）。正式服務開了 DFlash2，寬度會再多 `num_draft_tokens`，接 DFlash2 時要跟著加。`Sequence.prepare`（`generator/pagetable.py` 235–238）用這個預算算出 `total_pages`，prefill 每個 chunk 都傳整張 `seq.block_index_tensor`（`job.py` 1398）。之前 berth 用該段結尾的 `end.div_ceil(256)`，長 prompt 的前段頁數少一截，過了 8192 之後 split 數會和 fork 不同。100 兩種算法都是 1 頁。1500 的第一段舊寬度是 5 頁、fork 是 6 頁，兩種都還低於 8192，頁數類別都是 other，kernel 不讀多出來的那一頁，所以 digest 不變。一個 prompt 只有一種頁數類別：8190 是 32 頁（div16），8400 是 33 頁（other）。decode 的寬度每一步用當下序列長度 `position + 1`，再補到 16 的倍數。`prompt + max_new_tokens` 只在沒跨過 16 頁邊界時一樣。
 
 MTP（P2）加了 `Model::prefill_mtp` 和 `Model::set_max_history`。沒開 MTP 的 prefill 還是同一條路：第 63 層只跑 mixer，`prefill_block_pages` 不變（8190 仍是 32 頁）。`prefill_block_pages_mtp` 把草稿 token 加進 `max_new_tokens`，N = 2 時 8190 是 33 頁，不補到 16。GDN 在 `max_history == 0`（載入預設）時 launch 參數和 state 形狀跟以前一樣；`set_max_history` 才把 conv 加寬 `n`、recurrent 的 history 軸改成 `n + 1`。GPU 對照是 P4。
 
@@ -208,9 +208,9 @@ P5 讓這支 GPU 對照和 fork 逐位元一致。N=2 和 N=4 的 16 個 case（
 
 - n 列 `lm_head`（K=6、mul1）在 `Exl3Linear::forward_n` 改走 decode shim 的 `berth_kernels::exl3_linear`（`size_m = rows`，`a_had` 用呼叫端的 n 列）。int8 只收 K≤5、QTIP 只收 K=2..4，所以是 coop GEMM，autotune key `max(m, 2)`（`exllamav3_ext/quant/exl3_gemm.cu` 255）。沒有新 kernel。
 - 視窗裡的 EOS / `max_new_tokens` 不呼叫 `reject_remainder`（cache 長度留在整窗），`rejected` 維持 0，所以仍 `rewind(0)`（`generator.py` 1192–1202、1244–1246）。`accepted_length > 1` 時仍 refresh（1301–1333）。
-- 只有 `mtp_steps > 0` 的載入會裝上 `SS_DRY` 預設 sequence breaker（`custom.py` 883–890，抽樣時 1008–1010 才解析）。`mtp_steps == 0` 仍是 null mask。
+- P5 當時只有 `mtp_steps > 0` 的載入會裝上 `SS_DRY` 預設 sequence breaker（`custom.py` 883–890，抽樣時 1008–1010 才解析）。後來每次 `Engine::load` 都裝同一份：fork 的 `SS_DRY` 不傳 breaker、不傳 tokenizer，`default_breakers` 為真，`receive_logits` 一定傳 generator 的 tokenizer。
 
-`mtp_steps == 0` 的 prefill / decode / generate、launch 參數、cubin、block table 寬度沒改。
+`mtp_steps == 0` 的 prefill、launch 參數、cubin 沒改。decode 的 block table 寬度後來改成每步用當下序列長度（見上面），不再是整段 `prompt + max_new_tokens`。prefill 的頁數沒改。
 
 實測在 `127.0.0.1:18889`，`max_tokens` 20、溫度 0、串流。TTFT 從送出請求算到第一個 reasoning token（角色那一包不算）。載入後、還沒送請求是 22255 MiB。
 

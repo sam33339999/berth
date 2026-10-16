@@ -46,7 +46,7 @@ Triton kernel 不在 `build.rs` 產生，要先用服務那份 Python 預編到 
   - `.cargo/config.toml` 的 `BINDGEN_EXTRA_CLANG_ARGS` 是這台 libclang 缺標頭的 workaround。
 - **berth-engine**：`Model::decode_step`（eager，不捕捉 graph）、`Model::prefill`、`Sampler`、`Engine::generate`。27B 是 GDN（linear attention）和 full attention 交錯的 64 層。要和 fork 一致的規則（細節在 `docs/workspace.md`）：
   - prefill 只跑 `prompt[..len-1]`，段落對齊 256、最多 2048、recurrent 模型切在最後一個頁邊界；最後一個 prompt token 走 decode。第 63 層 prefill 只跑 mixer。
-  - decode 的 block table 寬度照每個請求算（`set_decode_width`：`ceil((prompt+max_new)/256)` 頁補到 16 的倍數），不是 cache 頁數；attention split 數由它決定。
+  - decode 的 block table 寬度照每一步的當下序列長度算（`set_decode_width(position + 1)`：`ceil((position + 1) / 256)` 頁補到 16 的倍數）。`prompt + max_new_tokens` 只在沒跨 16 頁邊界時一致。不是 cache 頁數；attention split 數由寬度決定。
   - EXL3 linear 依列數走不同路徑：m=1 int8 GEMV、≤144 列協作式 GEMM、更多列 reconstruct 成 fp16 再走 cuBLAS 或 fork 的 f16acc GEMM。
   - Triton 依整數參數值特化（==1、%16==0、其他），每個組合都要預編 cubin，執行時照同規則挑。
 - **berth**：OpenAI 相容 HTTP（`/v1/chat/completions` 含 SSE、`/v1/completions`），一次一個 GPU job。
